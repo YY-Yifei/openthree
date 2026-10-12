@@ -1,0 +1,15 @@
+# 统一按 LF 存储，避免 Windows/Linux 协作时的换行抖动
+* text=auto eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.whl binary
+*.zip binary
+
+# 快照文件不做 diff
+.openthree/logs/** linguist-generated=true
+.openthree/three-report.html linguist-generated=true

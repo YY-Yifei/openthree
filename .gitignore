@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# 测试 / 试验产物
+_sandbox*/
+_live/
+
+# ---------------------------------------------------------------------------
+# .openthree 工作区：演化成果入库，运行时状态不入库
+#
+#   入库    functions/            模型自造的能力（这是项目的成果，务必入库）
+#           memory/               模型学到的经验
+#           prompts/system-prompts.md   它的自我认知
+#   不入库  config.yaml           含 api_key
+#           logs/                 工作记录，每次运行都变
+#           three-report.html     由 openthree --report 生成
+#           prompts/user-prompts.md     每次任务的任务书
+# ---------------------------------------------------------------------------
+.openthree/config.yaml
+.openthree/logs/
+.openthree/three-report.html
+.openthree/prompts/user-prompts.md
