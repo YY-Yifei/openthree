@@ -16,7 +16,7 @@
 多轮对话：
     每轮都是新 Agent，历史不继承。为了让模型跨轮记得住用户说过什么，
     run() 收尾把本轮 (user, answer) 追加进 append-only 的
-    .openthree/prompts/history/transcript.md，开跑前再读回最近 N 轮
+    .openthree/prompts/history/transcript.jsonl，开跑前再读回最近 N 轮
     播种进 Agent.history（`--turns N`，默认 4，0 关闭，-1 全部）。
     用户的**完整原始输入**因此永不丢失。
 """
@@ -216,6 +216,68 @@ class Runtime:
         self.say(f"记录 {self.recorder.session_file}")
         return doc
 
+    def run_auto(self, user_input: Optional[str] = None, *, rounds: int = 5,
+                 append: bool = False, session_id: Optional[str] = None,
+                 images: Optional[Sequence[Union[str, Path]]] = None) -> Dict[str, Any]:
+        """长任务自主推进：跑一轮，若计划里还有未完成项，就自动接力下一轮。
+
+        `rounds` 是自动接力的**总轮数上限**（含首轮）。每轮都是一次完整的
+        ReAct 循环；轮与轮之间靠三样东西自然接续：
+
+          * transcript 的跨轮记忆（模型记得住用户说过什么）；
+          * 每轮重新组装的 system（含模型自己维护的 plan.md 待办）；
+          * 模型自己写进文件的进度（不随上下文折叠而丢失）。
+
+        停下条件（任一）：计划已无 `- [ ]` 未完成项 / 某轮出错或被中断 /
+        达到轮数上限。于是「一个长任务」会自己跑到做完，而不是跑一轮就停。
+
+        Returns:
+            最后一轮的会话文档，额外带 `auto_rounds` 与 `auto_answers` 两个字段。
+        """
+        rounds = max(1, int(rounds or 1))
+        docs: List[Dict[str, Any]] = []
+        for i in range(rounds):
+            first = (i == 0)
+            try:
+                doc = self.run(
+                    user_input if first else None,
+                    append=append if first else False,
+                    session_id=session_id,
+                    images=images if first else None,
+                )
+            except RuntimeError as exc:
+                self.say(f"[auto] 第 {i + 1} 轮启动失败：{exc}")
+                break
+            docs.append(doc)
+
+            status = str(doc.get("status") or "")
+            open_items = self.ws.plan_open_items()
+            if status in ("error", "interrupted"):
+                self.say(f"[auto] 第 {i + 1} 轮 {status}，停止自动接力。")
+                break
+            # 还有未完成项，或本轮被迭代上限截断（unfinished）——都算「没做完」。
+            if open_items <= 0 and status != "unfinished":
+                self.say(f"[auto] 计划已无未完成项，收工（共 {i + 1} 轮）。")
+                break
+            if i + 1 >= rounds:
+                why = (f"计划还剩 {open_items} 项未完成" if open_items
+                       else "上一轮被步数上限截断（unfinished）")
+                self.say(f"[auto] 已达轮数上限 {rounds}，{why}；"
+                         "再跑请加大 --auto 或用 openthree 继续。")
+                break
+            nxt = i + 2
+            why = (f"计划还有 {open_items} 项未完成" if open_items
+                   else "上一轮未跑完（unfinished）")
+            self.say(f"[auto] {why} → 自动开始第 {nxt} 轮")
+
+        if not docs:
+            return {"status": "error", "answer": "[auto] 一轮都没跑起来",
+                    "auto_rounds": 0, "auto_answers": []}
+        last = dict(docs[-1])
+        last["auto_rounds"] = len(docs)
+        last["auto_answers"] = [d.get("answer", "") for d in docs]
+        return last
+
     def report(self) -> Path:
         return write_report(self.ws)
 
@@ -227,6 +289,9 @@ class Runtime:
             f"工作区   {self.ws.dir}",
             f"系统提示词 {self.ws.system_prompt_file} ({len(self.ws.read_system_prompt())} 字符)",
             f"任务     {self.ws.user_prompt_file}",
+            f"计划     {self.ws.plan_file}"
+            f"（未完成 {self.ws.plan_open_items()} 项 / 历史版本 "
+            f"{len(self.ws.list_prompt_versions())} 份）",
             f"对话档案 {self.ws.transcript_file}"
             f"（{len(self.ws.read_turns(-1))} 轮）",
             f"工具     {len(reg)} 个（内置 {len(reg.builtins)} / 自造 {len(reg.user_tools())}）",

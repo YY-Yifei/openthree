@@ -3,6 +3,7 @@
 「一」=  .openthree/prompts/system-prompts.md        （世界观，模型可自改）
 「二」=  .openthree/functions/*.py  → 工具清单        （能力，模型可自造）
 「三」=  运行期事实：工作目录、时间、演化史、上次结果  （处境，模型该知道）
+         + .openthree/prompts/plan.md                 （计划，模型自己维护的待办）
          + .openthree/prompts/user-prompts.md        （任务，模型可自改）
 
 整个 run() 每一轮都重新组装，所以模型的自我修改下一轮立即生效。
@@ -30,6 +31,10 @@ RUNTIME_TEMPLATE = """\
 # 你的工具（二）
 
 {digest}
+
+# 你的计划（长任务的待办）
+
+{plan}
 
 # 你上次的行动
 
@@ -65,10 +70,31 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         iteration=iteration,
         fold_range=fold_range or "（暂无）",
         digest=reg.digest(),
+        plan=_plan_block(ws),
         last_action=last_action or "（这是第一步）",
         evolution=evolution,
         user_prompt=ws.read_user_prompt().strip() or "（空）",
     )
+
+
+def _plan_block(ws: Workspace) -> str:
+    """把模型的待办清单摆到它眼前，并给长任务一点方向。
+
+    计划是模型自己写的文件（plan.md），每轮都读、都展示 —— 于是「上一轮的
+    进度」跨轮、跨上下文折叠地活了下来。没有未完成项时给一句安心的话，
+    免得模型为了「有事做」而硬编任务。
+    """
+    try:
+        text = ws.read_plan().strip()
+    except Exception:  # noqa: BLE001
+        text = ""
+    if not text:
+        return "（还没有计划。长任务请先用 write_plan 写下待办。）"
+    open_items = ws.plan_open_items()
+    tail = (f"\n（还有 {open_items} 项未完成 —— 继续推进；"
+            "全部勾完后就可以 finish 了。）" if open_items
+            else "\n（所有条目都已勾选。若任务确实完成，用 finish 收尾。）")
+    return text + tail
 
 
 def _recent_evolution(ws: Workspace, limit: int = 10) -> str:

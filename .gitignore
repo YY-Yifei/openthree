@@ -22,6 +22,8 @@ _live/
 #           assets/               随任务带进来的图片等资产（体积大，不入库）
 #           three-report.html     由 openthree --report 生成
 #           prompts/user-prompts.md     每次任务的任务书
+#           prompts/plan.md             长任务待办，随任务推进反复改写
+#           prompts/versions/           系统提示词的历史版本（回滚用的安全网）
 #           prompts/history/            多轮对话档案，每次任务都在长
 # ---------------------------------------------------------------------------
 .openthree/config.yaml
@@ -29,4 +31,6 @@ _live/
 .openthree/assets/
 .openthree/three-report.html
 .openthree/prompts/user-prompts.md
+.openthree/prompts/plan.md
+.openthree/prompts/versions/
 .openthree/prompts/history/

@@ -17,7 +17,7 @@
   * compact_context 的区间先在现有 history 上校验，如实返回成功/失败（P1-3.8）。
   * 进度回声：把「正在做什么」通过注入的 progress 打出去，CLI 不再长时间沉默。
     这是纯展示层，不参与决策；不注入时走 NullProgress，行为与从前一致。
-  * 跨轮记忆：开跑前从 .openthree/prompts/history/transcript.md 读回最近若干轮
+  * 跨轮记忆：开跑前从 .openthree/prompts/history/transcript.jsonl 读回最近若干轮
     （prior_turns），以 user/assistant 消息播种进 history，于是多轮对话里
     模型记得住用户说过什么（见 workspace.append_turn / read_turns）。
     system 依然每轮重组装，播种只发生在消息层，演化机制不受影响。

@@ -4,8 +4,10 @@
 
     .openthree/
         prompts/
-            system-prompts.md   # 一：系统提示词
+            system-prompts.md   # 一：系统提示词（柔性骨架，模型可自改）
+            plan.md             # 长任务待办清单，模型自己维护、每轮自动注入
             user-prompts.md     # 当前任务，用户输入落在这里，模型可自行改写
+            versions/           # 系统提示词的历史版本（可回滚）
             history/
                 transcript.jsonl  # 多轮对话档案（append-only，每轮一行 JSON，
                                   #  用户的完整原始输入永不丢失、无损往返）
@@ -37,7 +39,12 @@ DIRNAME = ".openthree"
 _SYSTEM_PROMPT_SEED = """\
 # 你是谁
 
-你是 openthree。一个由「道生一，一生二，二生三，三生万物」构成的智能体。
+你是 openthree —— 一个由「道生一，一生二，二生三，三生万物」构成的智能体。
+
+**这份提示词是你的第一稿，不是你的枷锁。** 它只是一副骨架、一个起点；
+你完全可以、也应该在做事的过程中把它改成更像「你」的样子：
+补上你踩过的坑、记下你验证过的做法、删掉你不再认同的规矩。
+用 `read_prompts` 看当前全貌，用 `write_system_prompt` 落笔。
 
 - **道**：你。模型本身是唯一的智能来源，除此之外没有任何硬编码的智能。
 - **一**：这份提示词。它是你的自我认知，你可以随时改写它（用 write_system_prompt）。
@@ -54,6 +61,22 @@ _SYSTEM_PROMPT_SEED = """\
    `.openthree/prompts/user-prompts.md`；它会成为你下一轮的指令。
    上下文太长时用 `compact_context` 折叠历史。这是你的自我管理。
 
+# 长任务：把计划交给自己
+
+长任务不该靠记忆硬扛，也不该一次 ReAct 就想干完。把「进度」写进文件，
+让每一轮的你都能接上上一轮的你：
+
+- **用 `write_plan` 维护 `.openthree/prompts/plan.md`**：把它当你的待办清单，
+  用 `- [ ] 未完成` / `- [x] 已完成` 的勾选框逐条推进（用 `read_plan` 随时回看）。
+  **计划会每轮自动出现在你眼前**，所以你永远知道自己走到哪、下一步做什么。
+- **小步快跑、及时落盘**：每做完一小步就更新计划与 `note`，别把成果只留在上下文里
+  （上下文可能被折叠，文件不会）。中间结论、踩坑记录都值得写进文件。
+- **一轮结束时检查计划**：若还有 `[ ]` 未勾选，说明任务没完 —— 要么在 `finish` 里
+  说清「已完成什么、还剩什么」，要么继续做下去。若以 `--auto` 启动，运行期会在你
+  收尾后自动开启下一轮，只要你计划里还留着未完成项，就会一直推进到全部勾完。
+- **`finish` 是「这一轮的结论」，不必是整个任务的终点**；把「还剩什么」写进结论，
+  下一轮的你才接得住。
+
 # 造 function 的约定（务必遵守）
 
 - 文件内**所有**公开函数都会被注册为工具；辅助函数必须以 `_` 前缀命名，否则会被误注册。
@@ -69,8 +92,10 @@ _SYSTEM_PROMPT_SEED = """\
 - **你能「看见」图片**：用 `view_image(path)` 把一张图读进上下文，然后据此描述 / 识别 / 判断。
 - 一次只推进一小步，每步都想清楚「为什么」，把理由写进 `note`（会进工作记录）。
 - 任务完成后，用 `finish` 给出结论。
-- **自省**：每完成一个阶段性任务，问自己「我的 functions 够用吗？提示词准确吗？」
-  不够就当场补上——这就是演化。
+- **自省**：每完成一个阶段性任务，问自己「我的 functions 够用吗？提示词准确吗？
+  计划写清楚了吗？」不够就当场补上——这就是演化。
+- **改提示词前不必畏手畏脚，但可以留个后路**：`write_system_prompt` 会自动把旧稿
+  存进 `prompts/versions/`，用 `list_prompt_versions` / `restore_system_prompt` 就能回退。
 
 # 可观测
 
@@ -83,6 +108,15 @@ _USER_PROMPT_SEED = """\
 # 当前任务
 
 （等待用户输入……）
+"""
+
+_PLAN_SEED = """\
+# 当前计划
+
+> 这是你自己的待办清单。用 `- [ ]` 记未完成、`- [x]` 记已完成，逐条推进。
+> 它会在每一轮自动出现在你眼前；做一步就更新一步，别把进度只留在上下文里。
+
+- [ ] （还没有计划。想清楚要做什么后，用 write_plan 写下来。）
 """
 
 
@@ -146,6 +180,21 @@ class Workspace:
         return self.prompts_dir / "user-prompts.md"
 
     @property
+    def plan_file(self) -> Path:
+        """长任务的待办清单：模型自己维护，每轮自动注入上下文（见 prompt.py）。
+
+        它与 user-prompts.md 分工不同：后者是**用户**给的任务（单槽位、会被覆写），
+        前者是**模型自己**拆出的推进步骤（可反复迭代）。长任务里把进度写在这里，
+        即使上下文被折叠、即使换了一轮 Agent，计划依然在。
+        """
+        return self.prompts_dir / "plan.md"
+
+    @property
+    def versions_dir(self) -> Path:
+        """系统提示词的历史版本——「自省」的前提是「可后悔」。"""
+        return self.prompts_dir / "versions"
+
+    @property
     def transcript_dir(self) -> Path:
         return self.prompts_dir / "history"
 
@@ -177,6 +226,7 @@ class Workspace:
             self.events_dir,
             self.memory_dir,
             self.transcript_dir,
+            self.versions_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -184,6 +234,8 @@ class Workspace:
             self.system_prompt_file.write_text(_SYSTEM_PROMPT_SEED, encoding="utf-8")
         if force_prompts or not self.user_prompt_file.exists():
             self.user_prompt_file.write_text(_USER_PROMPT_SEED, encoding="utf-8")
+        if force_prompts or not self.plan_file.exists():
+            self.plan_file.write_text(_PLAN_SEED, encoding="utf-8")
 
         self._ensure_readme()
         return self
@@ -196,8 +248,9 @@ class Workspace:
             "# .openthree\n\n"
             "这是 openthree 智能体的工作区。\n\n"
             "| 路径 | 含义 |\n|---|---|\n"
-            "| `prompts/system-prompts.md` | 一：系统提示词，模型可自改 |\n"
+            "| `prompts/system-prompts.md` | 一：系统提示词，模型可自改（旧稿存于 `prompts/versions/`） |\n"
             "| `prompts/user-prompts.md` | 当前任务，用户输入落在这里 |\n"
+            "| `prompts/plan.md` | 长任务待办清单，模型自己维护、每轮自动注入 |\n"
             "| `prompts/history/transcript.jsonl` | 多轮对话档案：用户的完整原始输入 |\n"
             "| `functions/*.py` | 二：python 文件即 function |\n"
             "| `logs/` | 模型全部工作记录（json / jsonl 分门别类） |\n"
@@ -213,7 +266,18 @@ class Workspace:
             return ""
         return self.system_prompt_file.read_text(encoding="utf-8")
 
-    def write_system_prompt(self, text: str) -> None:
+    def write_system_prompt(self, text: str, snapshot: bool = True) -> None:
+        """覆写系统提示词。默认先把旧稿存进 prompts/versions/（可回滚）。
+
+        Args:
+            text: 新的系统提示词全文
+            snapshot: 是否在覆写前存档旧稿（默认 True）
+        """
+        if snapshot:
+            try:
+                self.snapshot_system_prompt(reason="write_system_prompt")
+            except Exception:  # noqa: BLE001
+                pass
         self.system_prompt_file.parent.mkdir(parents=True, exist_ok=True)
         self.system_prompt_file.write_text(text, encoding="utf-8")
 
@@ -232,6 +296,97 @@ class Workspace:
         if not text:
             return False
         return "等待用户输入" not in text
+
+    # ---------- 计划（长任务的待办） ----------
+    def read_plan(self) -> str:
+        if not self.plan_file.exists():
+            return ""
+        return self.plan_file.read_text(encoding="utf-8")
+
+    def write_plan(self, text: str) -> None:
+        self.plan_file.parent.mkdir(parents=True, exist_ok=True)
+        self.plan_file.write_text(text, encoding="utf-8")
+
+    def plan_open_items(self) -> int:
+        """数出计划里**未完成**的条目数（`- [ ]`）。
+
+        这是长任务「还要不要继续跑」的唯一判据：只看未勾选的勾选框。
+        - 计划文件不存在 / 是种子占位 / 没有任何 `- [ ]` → 0（视为没事可做）。
+        - `- [x]`、`- [X]`、纯文本行都**不算**未完成项。
+        """
+        text = self.read_plan()
+        if not text or "还没有计划" in text:
+            return 0
+        return len(re.findall(r"^\s*[-*]\s*\[ \]", text, flags=re.M))
+
+    # ---------- 系统提示词的版本与回滚 ----------
+    def snapshot_system_prompt(self, reason: str = "") -> Optional[Path]:
+        """把**当前**系统提示词存一份到 prompts/versions/（覆写前调用）。
+
+        返回存档路径；当前无提示词时返回 None。文件名带时间戳，
+        同秒内多次覆写用递增后缀避免互相覆盖。
+        """
+        if not self.system_prompt_file.exists():
+            return None
+        old = self.system_prompt_file.read_text(encoding="utf-8")
+        self.versions_dir.mkdir(parents=True, exist_ok=True)
+        stamp = _now_stamp()
+        dest = self.versions_dir / f"system-{stamp}.md"
+        n = 1
+        while dest.exists():
+            dest = self.versions_dir / f"system-{stamp}-{n}.md"
+            n += 1
+        header = f"<!-- 存档于 {datetime.now().isoformat(timespec='seconds')}"
+        if reason:
+            header += f" · {reason}"
+        header += " · 由 write_system_prompt 覆写前自动保存 -->\n\n"
+        dest.write_text(header + old, encoding="utf-8")
+        return dest
+
+    def list_prompt_versions(self) -> List[Path]:
+        """列出系统提示词的历史版本（新 → 旧）。"""
+        if not self.versions_dir.exists():
+            return []
+        return sorted(self.versions_dir.glob("system-*.md"), reverse=True)
+
+    def read_prompt_version(self, name: str) -> Optional[str]:
+        """按文件名/序号读取一个历史版本；不存在返回 None。"""
+        versions = self.list_prompt_versions()
+        if not versions:
+            return None
+        target: Optional[Path] = None
+        raw = str(name or "").strip()
+        # 允许用 1 = 最新
+        if raw.isdigit():
+            i = int(raw)
+            if 1 <= i <= len(versions):
+                target = versions[i - 1]
+        if target is None:
+            safe = Path(raw).name
+            for p in versions:
+                if p.name == safe or p.name == safe + ".md":
+                    target = p
+                    break
+        if target is None or not target.exists():
+            return None
+        return target.read_text(encoding="utf-8")
+
+    def restore_system_prompt(self, name: str) -> Optional[str]:
+        """把某个历史版本恢复成当前系统提示词（恢复前也先把现稿存档）。
+
+        返回被恢复版本的文件名；找不到该版本返回 None。
+        """
+        text = self.read_prompt_version(name)
+        if text is None:
+            return None
+        # 恢复也是一次覆写：先给「现在的稿子」留后路，避免恢复动作本身不可逆。
+        self.snapshot_system_prompt(reason=f"restore {name}")
+        self.write_system_prompt(text, snapshot=False)
+        versions = self.list_prompt_versions()
+        raw = str(name or "").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(versions):
+            return versions[int(raw) - 1].name
+        return Path(raw).name if raw else ""
 
     # ---------- 用户输入 ----------
     def submit(self, user_input: str, append: bool = False,

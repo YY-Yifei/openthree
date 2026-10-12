@@ -5,6 +5,8 @@
     看世界      read_file / list_dir / view_image / write_file / run_shell
     改自己      write_function / reload_functions / delete_function
     改提示词    read_prompts / write_system_prompt / write_user_prompt
+    长任务      read_plan / write_plan（待办清单）
+                list_prompt_versions / restore_system_prompt（提示词回滚）
     管上下文    compact_context / note
     收尾        finish
 
@@ -381,17 +383,23 @@ def read_prompts() -> str:
 def write_system_prompt(content: str) -> str:
     """改写系统提示词 —— 你对「我是谁、我该怎么做」的定义，下一轮即刻生效。
 
+    覆写前会自动把旧稿存进 `prompts/versions/`，因此改坏了可以用
+    `restore_system_prompt` 回退，不必怕失手。
+
     Args:
         content: 完整的系统提示词 markdown
     """
     ws = KERNEL.workspace
     if ws is None:
         return "[错误] 内核未就绪"
-    ws.write_system_prompt(content)
+    snapshot = ws.snapshot_system_prompt(reason="write_system_prompt")
+    ws.write_system_prompt(content, snapshot=False)
     if KERNEL.recorder is not None:
         KERNEL.recorder.record("evolution", summary="改写系统提示词",
-                               data={"action": "write_system_prompt", "content": content})
-    return f"[ok] 系统提示词已更新（{len(content)} 字符），下一轮生效。"
+                               data={"action": "write_system_prompt", "content": content,
+                                     "snapshot": snapshot.name if snapshot else ""})
+    saved = f"，旧稿存档 {snapshot.name}" if snapshot else ""
+    return f"[ok] 系统提示词已更新（{len(content)} 字符{saved}），下一轮生效。"
 
 
 def write_user_prompt(content: str) -> str:
@@ -408,6 +416,78 @@ def write_user_prompt(content: str) -> str:
         KERNEL.recorder.record("evolution", summary="改写用户提示词（任务）",
                                data={"action": "write_user_prompt", "content": content})
     return f"[ok] 任务已更新（{len(content)} 字符），下一轮生效。"
+
+
+def read_plan() -> str:
+    """读取你自己的计划（`.openthree/prompts/plan.md`）—— 长任务的待办清单。"""
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    text = ws.read_plan().strip()
+    items = ws.plan_open_items()
+    if not text:
+        return "（还没有计划。用 write_plan 写下待办。）"
+    return f"# 计划（{ws.plan_file}）\n\n{text}\n\n未完成条目：{items}"
+
+
+def write_plan(content: str) -> str:
+    """写下/更新你的计划——长任务的推进清单，它会每轮自动出现在你眼前。
+
+    用 markdown 勾选框逐条推进：`- [ ] 未完成`、`- [x] 已完成`。
+    长任务请把「已完成什么、还剩什么」写在这里，别只留在上下文里
+    （上下文会被折叠，这个文件不会）。收尾时运行期就靠未勾选项判断是否续跑。
+
+    Args:
+        content: 完整的计划 markdown（含勾选框）
+    """
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    ws.write_plan(content)
+    open_items = ws.plan_open_items()
+    if KERNEL.recorder is not None:
+        KERNEL.recorder.record("evolution", summary=f"更新计划（未完成 {open_items} 项）",
+                               data={"action": "write_plan", "content": content,
+                                     "open_items": open_items})
+    return f"[ok] 计划已更新（{len(content)} 字符，未完成 {open_items} 项），下一轮生效。"
+
+
+def list_prompt_versions() -> str:
+    """列出系统提示词的历史版本——写坏了可以回退（自省的前提是可后悔）。"""
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    versions = ws.list_prompt_versions()
+    if not versions:
+        return "（还没有历史版本。每次 write_system_prompt 都会自动存一版。）"
+    rows = [f"# 系统提示词历史版本（{len(versions)}，新 → 旧）", ""]
+    for i, p in enumerate(versions, 1):
+        try:
+            size = p.stat().st_size
+        except OSError:
+            size = 0
+        rows.append(f"- {i}. `{p.name}`（{size}B）")
+    rows.append("\n用 restore_system_prompt(<序号或文件名>) 回退到某一版。")
+    return "\n".join(rows)
+
+
+def restore_system_prompt(version: str) -> str:
+    """把系统提示词回退到某个历史版本（恢复前也会先把现稿存一版）。
+
+    Args:
+        version: 版本序号（1 = 最新）或文件名，见 list_prompt_versions
+    """
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    name = ws.restore_system_prompt(version)
+    if name is None:
+        return (f"[错误] 找不到版本：{version}。"
+                "用 list_prompt_versions 看有哪些。")
+    if KERNEL.recorder is not None:
+        KERNEL.recorder.record("evolution", summary=f"回退系统提示词到 {name}",
+                               data={"action": "restore_system_prompt", "version": version})
+    return f"[ok] 系统提示词已回退到 {name}，下一轮生效。"
 
 
 # ---------------------------------------------------------------- 管上下文
@@ -564,6 +644,10 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "read_prompts": read_prompts,
     "write_system_prompt": write_system_prompt,
     "write_user_prompt": write_user_prompt,
+    "read_plan": read_plan,
+    "write_plan": write_plan,
+    "list_prompt_versions": list_prompt_versions,
+    "restore_system_prompt": restore_system_prompt,
     "note": note,
     "remember": remember,
     "compact_context": compact_context,
