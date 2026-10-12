@@ -175,3 +175,22 @@ def test_run_auto_produces_multiturn_memory(tmp_path):
     turns = rt.ws.read_turns(-1)
     assert len(turns) == 2
     assert turns[0]["answer"] == "第1轮结论"
+
+
+def test_run_auto_uses_and_discards_its_own_session(tmp_path):
+    """一次 --auto = 一个进程内会话：接力中累积，收尾后即弃。"""
+    rt = _rt(tmp_path, ["- [ ] 甲", "- [x] 甲"])
+    doc = rt.run_auto("长任务", rounds=3)
+    assert doc["auto_rounds"] == 2
+    assert rt._session_active is False          # 自己开的会话已关闭
+    assert rt._session_turns == []              # 记忆不残留
+    assert len(rt.ws.read_turns(-1)) == 2       # 但档案照写
+
+
+def test_run_auto_keeps_caller_session_open(tmp_path):
+    """-i 里调用：沿用已有会话，接力结束后它继续存在（跨命令记忆）。"""
+    rt = _rt(tmp_path, ["- [x] 一次就好"])
+    rt.begin_session()
+    rt.run_auto("长任务", rounds=2)
+    assert rt._session_active is True                    # 未被 run_auto 关掉
+    assert any("长任务" in t["user"] for t in rt._session_turns)
