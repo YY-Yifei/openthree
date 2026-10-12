@@ -150,7 +150,63 @@ def test_tool_messages_balance_tool_calls(make_agent):
     assert ag.history[0]["role"] == "tool" and ag.history[0]["tool_call_id"] == "c1"
 
 
-# ---------------------------------------------------------------- 其他
+# ---------------------------------------------------------------- 截断可恢复
+def _stub_llm(results):
+    """返回一个按顺序吐出预设结果的假 LLM（记录收到的 messages）。"""
+    calls = {"n": 0, "messages": []}
+
+    class Stub:
+        class config:
+            model = "stub"
+            context_window_tokens = 1_000_000
+            max_tokens = 8192
+
+        def chat(self, messages, tools=None, tool_choice="auto"):
+            calls["messages"].append(messages)
+            r = results[min(calls["n"], len(results) - 1)]
+            calls["n"] += 1
+            return r
+
+    return Stub(), calls
+
+
+def test_truncation_is_retried_not_fatal(make_agent):
+    """finish_reason=length 可恢复：应要求模型重发，而不是整场任务失败。"""
+    from openthree.agent import _is_truncation
+    trunc = {"message": {"role": "assistant", "content": "半截"},
+             "error": "截断", "error_kind": "truncated", "finish_reason": "length"}
+    ok = {"message": {"role": "assistant", "content": "好的",
+                      "tool_calls": [{"id": "c1", "type": "function",
+                                      "function": {"name": "finish",
+                                                   "arguments": '{"answer": "done"}'}}]},
+          "error": None, "finish_reason": "stop"}
+    assert _is_truncation(trunc) and not _is_truncation(ok)
+
+    ag = make_agent()
+    stub, calls = _stub_llm([trunc, ok])
+    ag.llm = stub
+    ag.max_truncations = 2
+    answer = ag.run()
+    assert ag.finished and answer == "done"
+    assert ag.truncations == 1
+    assert calls["n"] == 2                       # 截断后重发了一次
+    # 重发时的 system 里带上了「被截断、请重发」的提示
+    sys_text = calls["messages"][1][0]["content"]
+    assert "截断" in sys_text
+    # 被截断的那条回复不该污染 history
+    assert all(m.get("content") != "半截" for m in ag.history)
+
+
+def test_truncation_gives_up_after_limit(make_agent):
+    trunc = {"message": {"role": "assistant", "content": "半截"},
+             "error": "截断", "error_kind": "truncated", "finish_reason": "length"}
+    ag = make_agent()
+    stub, calls = _stub_llm([trunc])
+    ag.llm = stub
+    ag.max_truncations = 1
+    answer = ag.run()
+    assert "max_tokens" in answer
+    assert calls["n"] == 2                        # 1 次原发 + 1 次重发
 def test_parse_args_handles_junk():
     assert _parse_args({"a": 1}) == {"a": 1}
     assert _parse_args("") == {}

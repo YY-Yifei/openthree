@@ -223,9 +223,11 @@ class LLM:
         # 上下文被 max_tokens 截断：tool_calls 极可能是不完整的非法 JSON，
         # 直接交给模型续写会得到半截参数。这里如实反馈，让 agent 知道要重来。
         error = None
+        error_kind = None
         if finish_reason == "length":
             error = (f"模型输出因 max_tokens={self.config.max_tokens} 被截断"
                      f"（finish_reason=length）")
+            error_kind = "truncated"
 
         return {
             "message": message,
@@ -234,6 +236,7 @@ class LLM:
             "raw_request": _redact(payload),
             "raw_response": data,
             "error": error,
+            "error_kind": error_kind,
             "finish_reason": finish_reason,
         }
 

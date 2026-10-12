@@ -81,7 +81,8 @@ class Agent:
                  tool_result_limit: int = TOOL_RESULT_LIMIT,
                  context_budget_chars: Optional[int] = None,
                  seed_turns: Optional[Sequence[Dict[str, Any]]] = None,
-                 progress: Optional[Any] = None) -> None:
+                 progress: Optional[Any] = None,
+                 max_truncations: int = 2) -> None:
         self.ws = workspace
         self.reg = registry
         self.llm = llm
@@ -111,6 +112,9 @@ class Agent:
         self.iteration = 0
         self.last_action = ""
         self._compact_marks: List[Tuple[int, int, str]] = []
+        # 输出被 max_tokens 截断时的重发次数（截断可恢复，不该杀死整场任务）
+        self.max_truncations = max(0, int(max_truncations))
+        self.truncations = 0
 
     # ---------------------------------------------------------------- 跨轮记忆
     def _seed_history(self) -> List[Dict[str, Any]]:
@@ -175,6 +179,26 @@ class Agent:
                                 result.get("error"))
 
             if result.get("error"):
+                # 被 max_tokens 截断：这是**可恢复**的 —— tool_calls 极可能是半截
+                # 非法 JSON，但模型的思路还在。温和地让它重发本条消息（而非杀死
+                # 整场任务，那会白烧掉前面所有步的成本）。
+                if _is_truncation(result):
+                    self.truncations += 1
+                    self.rec.record("error", summary="模型输出被截断，请重发",
+                                    data={"error": result["error"],
+                                          "attempt": self.truncations,
+                                          "max": self.max_truncations})
+                    if self.truncations <= self.max_truncations:
+                        self.last_action = (
+                            f"你上一条回复被 max_tokens={self.llm.config.max_tokens} 截断了"
+                            f"（finish_reason=length），tool_calls 可能是半截非法 JSON。"
+                            f"请**重发同样的一条消息**，但更精简：只调用最必要的一个工具，"
+                            f"或把长内容拆成几步；不要重复已完成的步骤。")
+                        self.progress.note(f"输出被截断，已要求重发（{self.truncations}/{self.max_truncations}）")
+                        continue
+                    self.answer = (f"[未能完成] 模型连续 {self.truncations} 次因 max_tokens 截断输出，"
+                                   f"请调大 max_tokens（config.yaml 的 llm.max_tokens）后重试。")
+                    break
                 self.rec.record("error", summary="LLM 调用失败", data={"error": result["error"]})
                 self.answer = f"[未能完成] 模型调用失败：{result['error']}"
                 break
@@ -482,6 +506,20 @@ def _clip(text: str, limit: int = 4000) -> str:
 
 def _safe_name(name: str) -> str:
     return re.sub(r"[^0-9A-Za-z_.-]+", "_", name or "call")[:120] or "call"
+
+
+def _is_truncation(result: Dict[str, Any]) -> bool:
+    """判断这次 LLM 结果是不是「被 max_tokens 截断」——这是可恢复的错误。
+
+    优先用 llm 层给的 error_kind（明确信号）；退回看 finish_reason / 错误文本，
+    好让 agent 在旧版 LLM 返回上也能识别。
+    """
+    if result.get("error_kind") == "truncated":
+        return True
+    if result.get("finish_reason") == "length":
+        return True
+    err = str(result.get("error") or "").lower()
+    return "finish_reason=length" in err or "被截断" in err
 
 
 def _estimate_chars(history: List[Dict[str, Any]]) -> int:
