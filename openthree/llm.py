@@ -7,7 +7,6 @@
     1. 环境变量                OPENAI_API_KEY / OPENAI_BASE_URL / OPENTHREE_MODEL
     2. 用户级                  ~/.openthree/config.yaml
     3. 项目级                  ./.openthree/config.yaml
-    4. 复用 local-llm 配置       ~/.local-llm/config.yaml 的 llm 节（若存在）
 
 只要有任何一层给了 base_url + api_key + model 就能跑。
 """
@@ -55,7 +54,7 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
 
 
 def _pick_llm_section(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """支持 openthree 自己的 `llm:` 节，也支持 local-llm 的顶层 llm 节。"""
+    """取出配置文件里的 `llm:` 节（缺失或类型不对时返回空 dict）。"""
     sec = doc.get("llm")
     return sec if isinstance(sec, dict) else {}
 
@@ -82,9 +81,6 @@ def load_config(project_dir: Optional[Path] = None, model_override: Optional[str
         layers.append(_pick_llm_section(_load_yaml(proj)))
         # 也允许放在工作区根
         layers.append(_pick_llm_section(_load_yaml(Path(project_dir) / "openthree.yaml")))
-
-    # 4. local-llm 兜底（纯粹为了本机便利，缺省无害）
-    layers.append(_pick_llm_section(_load_yaml(Path.home() / ".local-llm" / "config.yaml")))
 
     merged: Dict[str, Any] = {}
     for layer in layers:

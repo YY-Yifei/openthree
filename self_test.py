@@ -7,6 +7,7 @@
   4. 自我演化（模型写 function → reload → 新工具可用）
   5. 可观测（logs/ 各类 json 落盘）
   6. three-report.html 生成
+  7. 配置分层（env < 用户级 < 项目级；不再复用 local-llm 兜底）
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 from openthree.kernel import KERNEL          # noqa: E402
 from openthree.runtime import Runtime        # noqa: E402
+from openthree.llm import load_config        # noqa: E402
 
 SANDBOX = ROOT / "_sandbox"
 
@@ -181,6 +183,22 @@ def main() -> int:
     html = report.read_text(encoding="utf-8")
     check("报告含演化代码", "def fib" in html or "fib(n) = " in html or "write_function" in html)
     check("报告含时间线", "timeline" in html and "三生万物" in html)
+
+    # 6 配置分层：不再复用 local-llm 的 ~/.local-llm/config.yaml 兜底
+    #    （空项目 + 无用户级配置时，任何一层都不该给出 api_key）
+    import os
+    for _k in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENTHREE_MODEL", "OPENAI_MODEL"):
+        os.environ.pop(_k, None)
+    empty = SANDBOX / "_cfg_empty"
+    empty.mkdir(parents=True, exist_ok=True)
+    local-llm_cfg = Path.home() / ".local-llm" / "config.yaml"
+    isolated = load_config(empty)
+    check("配置不从 local-llm 兜底（api_key 为空）",
+          isolated.api_key == "", f"api_key={isolated.api_key!r} local-llm存在={local-llm_cfg.exists()}")
+    check("配置 model 回落内置默认", isolated.model == "deepseek-chat", isolated.model)
+    check("配置不可用（usable=False）", isolated.usable is False)
+    check("llm.py 不含 local-llm 字样",
+          "local-llm" not in (ROOT / "openthree" / "llm.py").read_text(encoding="utf-8"))
 
     ok = all(c[1] for c in checks)
     print(f"\n===== {'全部通过' if ok else '有失败'} ({sum(c[1] for c in checks)}/{len(checks)}) =====")
