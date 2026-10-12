@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 
-from openthree.agent import _estimate_chars, _index_steps, _parse_args, _safe_name
+from openthree.agent import (_estimate_chars, _index_steps, _parse_args, _safe_name,
+                             resolve_context_budget)
 from openthree.workspace import Workspace
 
 from conftest import step
@@ -61,6 +62,34 @@ def test_auto_compact_disabled(make_agent):
     n = len(ag.history)
     ag._auto_compact()
     assert len(ag.history) == n
+
+
+# ---------------------------------------------------------------- 预算默认值
+def test_default_budget_follows_context_window():
+    """默认预算按上下文窗口推导：1M 窗口 → 100 万字符。"""
+    assert resolve_context_budget(None, 1_000_000) == 1_000_000
+    assert resolve_context_budget(None, 128_000) == 128_000
+    # 超长窗口被硬上限兜住
+    assert resolve_context_budget(None, 10_000_000_000) == 1_000_000
+
+
+def test_default_budget_is_1m_without_window():
+    assert resolve_context_budget(None, None) == 1_000_000
+
+
+def test_explicit_budget_wins_and_zero_disables():
+    assert resolve_context_budget(1234, 100_000_000) == 1234
+    assert resolve_context_budget(0, 100_000_000) == 0
+
+
+def test_agent_default_budget_derives_from_llm_config(make_agent):
+    """Agent 缺省 context_budget_chars 时，从 llm.config.context_window_tokens 推导。"""
+    ag = make_agent()
+    ag.llm.config.context_window_tokens = 128_000
+    # 重新构造以读取新的窗口值
+    from openthree.agent import Agent
+    ag2 = Agent(ag.ws, ag.reg, ag.llm, ag.rec)
+    assert ag2.context_budget_chars == 128_000
 
 
 # ---------------------------------------------------------------- 折叠校验

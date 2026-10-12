@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .multimodal import sanitize_for_log
 from .workspace import Workspace
 
 
@@ -36,7 +37,8 @@ FLUSH_INTERVAL = 2.0   # 至少间隔多少秒
 
 def _jsonable(obj: Any) -> Any:
     if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
+        # 字符串过一道日志脱敏：图片 base64 绝不能进 logs/
+        return sanitize_for_log(obj) if isinstance(obj, str) else obj
     if isinstance(obj, dict):
         return {str(k): _jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
@@ -178,6 +180,11 @@ class Recorder:
                    error: Optional[str] = None) -> Event:
         self._llm_count += 1
         idx = self._llm_count
+        # 请求/响应原文过一道日志脱敏：图片 base64 折叠成占位符，
+        # 否则一次多模态调用的日志动辄几百 KB。
+        request = _jsonable(request)
+        response = _jsonable(response)
+        usage = _jsonable(usage or {})
         payload = {
             "index": idx,
             "ts": _now(),

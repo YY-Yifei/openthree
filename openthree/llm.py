@@ -24,8 +24,18 @@ try:
 except ImportError:  # pragma: no cover
     yaml = None
 
+from .multimodal import sanitize_for_log
+
 
 DEFAULT_MODEL = "deepseek-v4.1-flash"
+
+# 模型上下文窗口的默认值（单位 token）。
+# 默认按 1M 上下文对待 —— 上下文预算由此推导，见 agent.resolve_context_budget。
+# 换更大/更小的窗口时，请在 config.yaml 里写 context_window_tokens（如 "128k" / "4m"）。
+DEFAULT_CONTEXT_WINDOW_TOKENS = 1_000_000
+
+# token ↔ 字符 的粗略换算：1 token ≈ 2 字符，够用且不依赖具体 tokenizer。
+CHARS_PER_TOKEN = 2
 
 
 @dataclass
@@ -34,6 +44,8 @@ class LLMConfig:
     base_url: str = ""
     model: str = DEFAULT_MODEL
     max_tokens: int = 8192
+    # 模型上下文窗口（token）。上下文预算的默认值的来源。
+    context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     temperature: float = 0.3
     timeout: float = 600.0
     retries: int = 3
@@ -43,6 +55,32 @@ class LLMConfig:
     @property
     def usable(self) -> bool:
         return bool(self.api_key and self.base_url and self.model)
+
+
+def parse_token_count(value: Any) -> Optional[int]:
+    """把 "1M" / "128k" / "1,000,000" / 1000000 这类写法解析成整数 token 数。
+
+    解析不出来时返回 None（由调用方决定回退到默认值）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):  # bool 是 int 的子类，先挡掉
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip().replace(",", "").replace("_", "").lower()
+    if not text:
+        return None
+    scale = 1
+    for suffix, mult in (("k", 1_000), ("m", 1_000_000), ("g", 1_000_000_000)):
+        if text.endswith(suffix):
+            scale = mult
+            text = text[:-1]
+            break
+    try:
+        return int(float(text) * scale)
+    except ValueError:
+        return None
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -91,11 +129,18 @@ def load_config(project_dir: Optional[Path] = None, model_override: Optional[str
                 continue
             merged[k] = v
 
+    # 上下文窗口：支持 "1M" / "128k" / 1000000 等写法；缺省按 DEFAULT_CONTEXT_WINDOW_TOKENS。
+    window = (parse_token_count(merged.get("context_window_tokens"))
+              or parse_token_count(merged.get("context_window"))
+              or parse_token_count(merged.get("context_window_size"))
+              or DEFAULT_CONTEXT_WINDOW_TOKENS)
+
     cfg = LLMConfig(
         api_key=str(merged.get("api_key", "") or ""),
         base_url=str(merged.get("base_url", "") or ""),
         model=str(model_override or merged.get("model") or DEFAULT_MODEL),
-        max_tokens=int(merged.get("max_tokens", 8192) or 8192),
+        max_tokens=int(parse_token_count(merged.get("max_tokens")) or 8192),
+        context_window_tokens=int(window),
         temperature=float(merged.get("temperature", 0.3) or 0.3),
         timeout=float(merged.get("timeout", 600) or 600),
         retries=int(merged.get("retries", 3) or 0),
@@ -213,7 +258,7 @@ def _backoff(attempt: int) -> float:
 
 
 def _redact(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """日志里不留 api_key。"""
+    """日志里不留 api_key；图片 base64 折叠成占位符，避免日志被撑爆。"""
     out = dict(payload)
     out.pop("api_key", None)
-    return out
+    return sanitize_for_log(out)

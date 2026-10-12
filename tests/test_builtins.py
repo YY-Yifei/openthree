@@ -3,10 +3,32 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from openthree.builtins import _decode, _syntax_error, run_shell
+from openthree.builtins import _decode, _split_tags, _syntax_error, run_shell
 from openthree.registry import Registry
 
 from conftest import *  # noqa: F401,F403  复用夹具
+
+
+# ---------------------------------------------------------------- tags 归一
+def test_split_tags_handles_list_and_str():
+    assert _split_tags("a, b") == ["a", "b"]
+    assert _split_tags(["x", "y"]) == ["x", "y"]      # 模型误传 JSON 数组
+    assert _split_tags("中文，标签") == ["中文", "标签"]  # 全角逗号
+    assert _split_tags(None) == []
+    assert _split_tags("") == []
+
+
+def test_note_accepts_list_tags(make_agent):
+    from openthree.builtins import note
+    make_agent()
+    assert note("想了一下", ["a", "b"]).startswith("[ok]")
+
+
+def test_remember_accepts_list_tags(make_agent, ws):
+    from openthree.builtins import remember
+    make_agent()
+    assert remember("记住了", ["x", "y"]).startswith("[ok]")
+    assert (ws.memory_dir / "memory.jsonl").exists()
 
 
 # ---------------------------------------------------------------- run_shell 编码
@@ -26,6 +48,55 @@ def test_decode_none():
 def test_run_shell_reports_exit_code():
     out = run_shell("python -c \"print('hello')\"")
     assert "exit=0" in out and "hello" in out
+
+
+# ------------------------------------------------------- run_shell 超时（防挂死）
+# 回归背景：旧实现用 subprocess.run(shell=True, capture_output=True, timeout=N)。
+# Windows 下 shell=True 会起 cmd.exe，真实命令是它的「孙进程」；超时时
+# subprocess.run 只杀 cmd.exe，随后内部 communicate() 等 stdout/stderr 读到 EOF，
+# 而孙进程仍攥着管道写端 -> EOF 永不到来 -> 连同 timeout 设置一起永久挂住。
+# 实测：timeout=4 的命令会卡到 60.1s；孙进程若常驻则永久卡死。
+
+
+def _wall(fn, *a, **kw):
+    import time
+    t = time.time()
+    out = fn(*a, **kw)
+    return time.time() - t, out
+
+
+def test_run_shell_timeout_returns_promptly():
+    """直接子进程超时：应在 timeout 附近返回，而不是拖到进程自然结束。"""
+    elapsed, out = _wall(run_shell, "ping -n 30 127.0.0.1", timeout=3)
+    assert elapsed < 12, f"超时未被及时处理，耗时 {elapsed:.1f}s"
+    assert "超时" in out
+
+
+def test_run_shell_kills_grandchild():
+    """孙进程（常驻）持有输出管道：旧实现会永久挂住，必须被杀掉整棵树。"""
+    elapsed, out = _wall(
+        run_shell, 'python -c "import time;time.sleep(3600)"', timeout=3)
+    assert elapsed < 12, f"被孙进程挂住，耗时 {elapsed:.1f}s"
+    assert "超时" in out and "强杀" in out
+
+
+def test_run_shell_interactive_gets_eof_not_hang():
+    """交互式命令等输入时，stdin 接 DEVNULL，应立刻 EOF 退出而不是挂住。"""
+    elapsed, out = _wall(run_shell, 'python -c "input()"', timeout=5)
+    assert elapsed < 8, f"交互式命令挂住，耗时 {elapsed:.1f}s"
+    assert "EOF" in out or "exit=" in out
+
+
+def test_run_shell_bad_timeout_does_not_crash():
+    """模型可能把 timeout 传成非数字，不能因此抛异常。"""
+    out = run_shell('python -c "print(1)"', timeout="abc")
+    assert "exit=0" in out
+
+
+def test_run_shell_clamps_huge_timeout():
+    """离谱的超时值被截到上限，避免一条命令占住整个循环几小时。"""
+    from openthree.builtins import _SHELL_TIMEOUT_MAX
+    assert _SHELL_TIMEOUT_MAX == 3600
 
 
 # ---------------------------------------------------------------- write_function

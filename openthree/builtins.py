@@ -2,7 +2,7 @@
 
 它们少而必需，且**每一个都在为自我演化铺路**：
 
-    看世界      read_file / list_dir / write_file / run_shell
+    看世界      read_file / list_dir / view_image / write_file / run_shell
     改自己      write_function / reload_functions / delete_function
     改提示词    read_prompts / write_system_prompt / write_user_prompt
     管上下文    compact_context / note
@@ -10,6 +10,10 @@
 
 真正的魔法在于：模型用 write_function 写出的新 py 文件，
 reload_functions 之后就成了它手上的新工具 —— 能力从此自生长。
+
+多模态：view_image 返回 ImageResult，Agent 会把图片注入上下文，
+模型因此能「看见」图；自造工具只要返回 `openthree.ImageResult`（或
+`images=[...]`）也能回传图片。
 """
 from __future__ import annotations
 
@@ -21,8 +25,26 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .kernel import KERNEL
+from .multimodal import ImageResult
 
 # ---------------------------------------------------------------- 看世界
+
+
+def view_image(path: str, detail: str = "auto") -> ImageResult:
+    """查看一张图片（多模态）。返回的图片会被放进上下文，你就能「看见」它。
+
+    本地路径（相对/绝对）或 http(s) 链接均可。图片进入上下文后即可描述、
+    识别、做 OCR 判断等。一次只看一张，避免上下文被图片塞满。
+
+    Args:
+        path: 图片路径或 http(s) 链接
+        detail: 传给模型的清晰度 auto / low / high；low 更省 token
+    """
+    src = (path or "").strip()
+    if not src:
+        return ImageResult(text="[错误] path 为空")
+    return ImageResult(text=f"已加载图片：{src}", images=[src],
+                       detail=detail or "auto")
 
 
 def read_file(path: str, offset: int = 0, limit: int = 2000) -> str:
@@ -102,26 +124,118 @@ def write_file(path: str, content: str) -> str:
     return f"[ok] 已写入 {p} （{len(content)} 字符）"
 
 
+_KILL_GRACE = 5.0           # 超时后强杀进程树，再给管道收尾的宽限秒数
+_SHELL_TIMEOUT_MAX = 3600   # 单条命令超时上限，防止模型传入离谱数值
+
+
+def _popen_kwargs(work: str) -> Dict[str, Any]:
+    """构造一个「能整树杀死」的 Popen 参数。
+
+    两个关键点，缺一都会导致挂死：
+      * stdin 接 DEVNULL —— 交互式命令（等输入）立刻拿到 EOF 退出，
+        而不是继承终端读走用户输入、把自己的 stdin 挂死在这里。
+      * Windows 起新进程组、POSIX 起新会话 —— 之后才能把整棵进程树
+        （cmd.exe 及其孙进程）一次性清理干净。
+    """
+    kwargs: Dict[str, Any] = {
+        "shell": True,
+        "cwd": work,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:  # pragma: no cover - Windows 环境下不覆盖
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _kill_tree(proc: Any) -> str:
+    """强杀进程及其全部后代，返回所用手段（便于排障）。"""
+    if proc.poll() is not None:
+        return "already-exited"
+    if os.name == "nt":
+        try:
+            r = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10,
+            )
+            if r.returncode == 0 or proc.poll() is not None:
+                return "taskkill"
+        except Exception:  # noqa: BLE001
+            pass
+    else:  # pragma: no cover - Windows 环境下不覆盖
+        try:
+            import signal
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return "killpg"
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        proc.kill()
+        return "kill"
+    except Exception as exc:  # noqa: BLE001
+        return f"kill-failed({type(exc).__name__})"
+
+
 def run_shell(command: str, cwd: str = "", timeout: int = 60) -> str:
     """执行 shell 命令并返回输出。
+
+    超时后会**连同子孙进程一起强杀**，所以绝不会因为某个后台子进程仍攥着
+    输出管道而永久挂住（旧实现 subprocess.run 的缺陷）。stdin 不继承终端，
+    交互式命令会立刻得到 EOF 而退出。
 
     Args:
         command: 要执行的命令
         cwd: 工作目录（默认当前目录）
-        timeout: 超时秒数
+        timeout: 超时秒数（1~3600，越界会被截到边界）
     """
     work = cwd or str(Path.cwd())
     try:
-        proc = subprocess.run(
-            command, shell=True, cwd=work, capture_output=True, timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return f"[错误] 命令超时（{timeout}s）: {command}"
+        limit = int(timeout or 60)
+    except (TypeError, ValueError):
+        limit = 60
+    limit = max(1, min(limit, _SHELL_TIMEOUT_MAX))
+
+    try:
+        proc = subprocess.Popen(command, **_popen_kwargs(work))
     except Exception as exc:  # noqa: BLE001
         return f"[错误] 执行失败: {type(exc).__name__}: {exc}"
-    out = _decode(proc.stdout).strip()
-    err = _decode(proc.stderr).strip()
-    parts = [f"$ {command}", f"exit={proc.returncode}"]
+
+    timed_out = False
+    killed = ""
+    stream_cut = False
+    try:
+        out_b, err_b = proc.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        killed = _kill_tree(proc)
+        try:
+            out_b, err_b = proc.communicate(timeout=_KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            # 极端兜底：仍有进程攥着管道。放弃读取、立刻返回，绝不无限等待。
+            stream_cut = True
+            out_b, err_b = b"", b""
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception as exc:  # noqa: BLE001
+        _kill_tree(proc)
+        return f"[错误] 执行失败: {type(exc).__name__}: {exc}"
+
+    code = proc.returncode if proc.returncode is not None else proc.poll()
+    out = _decode(out_b).strip()
+    err = _decode(err_b).strip()
+    parts = [f"$ {command}", f"exit={code}"]
+    if timed_out:
+        tail = f"[错误] 命令超时（{limit}s），已强杀进程树（{killed}）"
+        if stream_cut:
+            tail += "；输出管道未能收尾，已放弃读取"
+        parts.append(tail)
     if out:
         parts.append("--- stdout ---\n" + out[:20000])
     if err:
@@ -299,6 +413,17 @@ def write_user_prompt(content: str) -> str:
 # ---------------------------------------------------------------- 管上下文
 
 
+def _split_tags(tags) -> list:
+    """把标签归一成字符串列表。容忍 None / list / "a, b" 三种输入。"""
+    if tags is None:
+        return []
+    if isinstance(tags, (list, tuple, set)):
+        items = list(tags)
+    else:
+        items = str(tags).replace("，", ",").split(",")
+    return [str(t).strip() for t in items if str(t).strip()]
+
+
 def note(thought: str, tags: str = "") -> str:
     """把你的思考显式写进工作记录（会出现在 three-report.html 里）。
 
@@ -309,7 +434,7 @@ def note(thought: str, tags: str = "") -> str:
     if KERNEL.recorder is not None:
         KERNEL.recorder.record("note", summary=thought[:200],
                                data={"thought": thought,
-                                     "tags": [t.strip() for t in tags.split(",") if t.strip()]})
+                                     "tags": _split_tags(tags)})
     return "[ok] 已记录。"
 
 
@@ -326,7 +451,7 @@ def remember(content: str, tags: str = "") -> str:
     from datetime import datetime
     ws.memory_dir.mkdir(parents=True, exist_ok=True)
     entry = {"ts": datetime.now().isoformat(timespec="seconds"), "content": content,
-             "tags": [t.strip() for t in tags.split(",") if t.strip()]}
+             "tags": _split_tags(tags)}
     path = ws.memory_dir / "memory.jsonl"
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -427,6 +552,7 @@ def _syntax_error(code: str) -> str:
 
 
 BUILTIN_FUNCTIONS: Dict[str, Any] = {
+    "view_image": view_image,
     "read_file": read_file,
     "write_file": write_file,
     "list_dir": list_dir,

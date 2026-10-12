@@ -23,12 +23,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence, Union
 
-from .agent import Agent
+from .agent import Agent, resolve_context_budget
 from .builtins import BUILTIN_FUNCTIONS
 from .kernel import KERNEL
-from .llm import LLM, LLMConfig, load_config
+from .llm import (DEFAULT_CONTEXT_WINDOW_TOKENS, LLM, LLMConfig, load_config,
+                  parse_token_count)
 from .progress import Progress
 from .recorder import Recorder
 from .registry import Registry
@@ -43,20 +44,34 @@ class Runtime:
                  force_prompts: bool = False,
                  quiet: bool = False,
                  tool_result_limit: int = 4000,
-                 context_budget_chars: int = 120_000,
+                 context_budget_chars: Optional[int] = None,
+                 context_window_tokens: Optional[int] = None,
                  heartbeat: float = 15.0,
                  prior_turns: Optional[int] = None) -> None:
         self.project_dir = Path(project_dir or Path.cwd()).resolve()
         self.quiet = quiet
         self.max_iterations = max_iterations
         self.tool_result_limit = tool_result_limit
-        self.context_budget_chars = context_budget_chars
+        # 先记住是否显式给了预算/窗口，等 config 读出来后再统一解析。
+        self._context_budget_arg = context_budget_chars
+        self._context_window_arg = context_window_tokens
         self.heartbeat = heartbeat
         # 多轮对话：播种最近多少轮（None = Agent 默认 4，0 = 关闭，负数 = 全部）
         self.prior_turns = None if prior_turns is None else int(prior_turns)
 
         self.ws = Workspace(self.project_dir).init(force_prompts=force_prompts)
         self.config: LLMConfig = load_config(self.project_dir, model_override=model)
+        # CLI 显式给的上下文窗口覆盖 config 里的值（config 已在 load_config 里兜过底）。
+        if self._context_window_arg is not None:
+            parsed_window = parse_token_count(self._context_window_arg)
+            if parsed_window:
+                self.config.context_window_tokens = int(parsed_window)
+        self.context_window_tokens = int(self.config.context_window_tokens)
+        # 预算来源只有这里一处：显式 --context-budget 优先，否则按窗口推导。
+        budget_arg = (None if self._context_budget_arg is None
+                      else parse_token_count(self._context_budget_arg))
+        self.context_budget_chars = resolve_context_budget(
+            budget_arg, self.context_window_tokens)
         self.registry = Registry(self.ws)
         for name, fn in BUILTIN_FUNCTIONS.items():
             self.registry.register_builtin(name, fn)
@@ -67,6 +82,7 @@ class Runtime:
         self.recorder: Optional[Recorder] = None
         self.agent: Optional[Agent] = None
         self.user_input: str = ""
+        self.user_text: str = ""
 
         # 挂进内核，用户写的 function 就能拿到
         KERNEL.workspace = self.ws
@@ -93,21 +109,44 @@ class Runtime:
         return None
 
     def run(self, user_input: Optional[str] = None, *,
-            append: bool = False, session_id: Optional[str] = None) -> Dict[str, Any]:
-        """跑一轮任务。user_input 为 None 时沿用已有的 user-prompts.md。"""
+            append: bool = False, session_id: Optional[str] = None,
+            images: Optional[Sequence[Union[str, Path]]] = None) -> Dict[str, Any]:
+        """跑一轮任务。user_input 为 None 时沿用已有的 user-prompts.md。
+
+        images 是本轮携带的图片（本地路径或 http/data URL）。本地文件会先
+        复制进 .openthree/assets/ 去重归档，再交给 Agent 注入进 user 消息。
+        """
         problem = self.check()
         if problem:
             raise RuntimeError(problem)
 
+        # 图片先归置成本地绝对路径 / URL（本地文件复制进 assets 去重）
+        image_refs: List[str] = []
+        if images:
+            image_refs = self.ws.stage_images([str(i) for i in images if str(i).strip()])
+            if self.ws._last_image_error:
+                self.say(f"[提示] 有图片未能归档：{self.ws._last_image_error}")
+
         if user_input is not None:
-            self.ws.submit(user_input, append=append)
+            self.ws.submit(user_input, append=append, images=image_refs or None)
+        elif image_refs:
+            # 沿用已有任务但补了图：把图片标记挂到当前 user-prompts.md 上
+            base = self.ws.read_user_prompt()
+            marker = self.ws.images_marker(image_refs)
+            if marker and marker.strip() not in base:
+                self.ws.write_user_prompt(base.rstrip() + "\n" + marker)
 
         # 本轮用户输入：显式传入就用原文（完整保留），否则沿用 user-prompts.md
         self.user_input = (user_input if user_input is not None
                            else self.ws.read_user_prompt())
+        # 图片清单：显式传入优先；否则从 user-prompts.md 的标记里还原
+        if not image_refs:
+            image_refs = self.ws.parse_images_from_prompt(self.user_input)
+        # 入档用的用户原文：剥掉图片标记（图片单独落在 transcript 的 images 字段）
+        self.user_text = self.ws.strip_images_marker(self.user_input)
 
         self.recorder = Recorder(self.ws, session_id=session_id,
-                                 user_input=self.user_input,
+                                 user_input=self.user_text or self.user_input,
                                  model=self.config.model)
         KERNEL.recorder = self.recorder
 
@@ -120,12 +159,18 @@ class Runtime:
                            context_budget_chars=self.context_budget_chars,
                            prior_turns=self.prior_turns,
                            progress=progress)
+        self.agent.current_images = list(image_refs)
+        self.agent.task_text = self.user_text
         KERNEL.agent = self.agent
 
         self.say(f"道生一  工作区 {self.ws.dir}")
         self.say(f"一生二  {len(self.registry)} 个工具"
                  f"（内置 {len(self.registry.builtins)} / 自造 {len(self.registry.user_tools())}）")
         self.say(f"二生三  ReAct 循环开始（上限 {self.max_iterations} 步，模型 {self.config.model}）")
+        if image_refs:
+            self.say(f"       本轮输入含 {len(image_refs)} 张图片（多模态）")
+        self.say(f"       上下文窗口 {_fmt_tokens(self.context_window_tokens)} token"
+                 f" → 预算 {_fmt_chars(self.context_budget_chars)} 字符后自动折叠")
         if self.heartbeat > 0 and not self.quiet:
             self.say(f"       每 {self.heartbeat:g}s 打一次心跳，长任务不会看起来卡死")
 
@@ -150,7 +195,7 @@ class Runtime:
         # 本轮对话入档：用户的完整原始输入 append 进 transcript，永不丢失。
         # 下一轮开跑时会被读回，播种进新 Agent 的历史（跨轮记忆）。
         try:
-            self.ws.append_turn(self.user_input, answer)
+            self.ws.append_turn(self.user_text, answer, images=image_refs or None)
         except Exception as exc:  # noqa: BLE001
             if self.recorder:
                 self.recorder.record("error", summary="对话记录写入失败",
@@ -185,6 +230,9 @@ class Runtime:
             f"对话档案 {self.ws.transcript_file}"
             f"（{len(self.ws.read_turns(-1))} 轮）",
             f"工具     {len(reg)} 个（内置 {len(reg.builtins)} / 自造 {len(reg.user_tools())}）",
+            f"上下文   窗口 {_fmt_tokens(self.context_window_tokens)} token"
+            f" → 预算 {_fmt_chars(self.context_budget_chars)} 字符"
+            + ("（已关闭自动折叠）" if self.context_budget_chars <= 0 else ""),
         ]
         for t in reg.user_tools():
             lines.append(f"         ↳ {t.name}  ← {Path(t.source_file or '').name}")
@@ -193,3 +241,25 @@ class Runtime:
             for e in reg.load_errors:
                 lines.append(f"         ↳ {Path(e.file).name}: {e.error}")
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 格式化助手
+def _fmt_tokens(n: int) -> str:
+    """把 token 数写成易读形式：100000000 → 100M。"""
+    n = int(n)
+    for unit, mult in (("G", 1_000_000_000), ("M", 1_000_000), ("k", 1_000)):
+        if n >= mult:
+            val = n / mult
+            return f"{val:g}{unit}"
+    return str(n)
+
+
+def _fmt_chars(n: int) -> str:
+    """把字符数写成易读形式：100000000 → 100M。"""
+    n = int(n)
+    if n <= 0:
+        return f"{n}"
+    for unit, mult in (("亿", 100_000_000), ("万", 10_000)):
+        if n >= mult:
+            return f"{n / mult:g}{unit}"
+    return str(n)

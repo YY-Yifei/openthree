@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
 from . import __version__
 from .kernel import KERNEL
@@ -48,9 +49,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("task", nargs="*", help="任务描述；留空则沿用 .openthree/prompts/user-prompts.md")
     p.add_argument("-C", "--dir", default=".", help="项目目录（.openthree 会建在这里），默认当前目录")
     p.add_argument("-m", "--model", default=None, help="覆盖模型名")
+    p.add_argument("--image", action="append", default=None, metavar="PATH_OR_URL",
+                   help="随任务附一张图片（多模态）：本地路径或 http(s) 链接；可重复。")
+    p.add_argument("--images", default=None, metavar="A,B,C",
+                   help="随任务附图片，逗号分隔（等价于多个 --image）。")
     p.add_argument("-n", "--max-iterations", type=int, default=200, help="ReAct 最大步数，默认 200")
-    p.add_argument("--context-budget", type=int, default=120000,
-                   help="历史累计字符数超此值自动折叠早期步骤，0 表示关闭，默认 120000")
+    p.add_argument("--context-window", default=None,
+                   help="模型上下文窗口（token）。支持 1M/128k/200000 写法；"
+                        "默认取 config 里的 context_window_tokens，再退回 1M")
+    p.add_argument("--context-budget", type=int, default=None,
+                   help="历史累计字符数超此值自动折叠早期步骤，0 表示关闭；"
+                        "默认按上下文窗口推导（1M 窗口 → 100 万字符）")
     p.add_argument("--tool-result-limit", type=int, default=4000,
                    help="单个工具结果进入历史的字符上限，超出落盘，默认 4000")
     p.add_argument("--heartbeat", type=float, default=15.0,
@@ -82,6 +91,7 @@ def main(argv=None) -> int:
         force_prompts=args.force_prompts,
         quiet=args.quiet,
         context_budget_chars=args.context_budget,
+        context_window_tokens=args.context_window,
         tool_result_limit=args.tool_result_limit,
         heartbeat=args.heartbeat,
         prior_turns=args.turns,
@@ -106,18 +116,19 @@ def main(argv=None) -> int:
         return 0
 
     task = " ".join(args.task).strip()
+    images = _collect_images(args)
 
     if args.interactive:
-        return _interactive(rt, task, args.append)
+        return _interactive(rt, task, args.append, images)
 
-    if not task and not rt.ws.has_task():
+    if not task and not rt.ws.has_task() and not images:
         _print_banner()
         print("没有任务。用法：openthree \"你的任务\"   或   openthree -i")
         return 1
 
     _print_banner()
     try:
-        doc = rt.run(task or None, append=args.append)
+        doc = rt.run(task or None, append=args.append, images=images or None)
     except RuntimeError as exc:
         print(f"[错误] {exc}", file=sys.stderr)
         return 2
@@ -128,24 +139,48 @@ def main(argv=None) -> int:
     return 0 if doc.get("status") == "done" else 1
 
 
-def _interactive(rt: Runtime, first_task: str, append: bool) -> int:
+def _collect_images(args) -> list[str]:
+    """从 --image / --images 收集图片引用（顺序保留，去重）。"""
+    out: list[str] = []
+    for x in (getattr(args, "image", None) or []):
+        if x:
+            out.append(x)
+    raw = getattr(args, "images", None)
+    if raw:
+        for x in str(raw).split(","):
+            x = x.strip()
+            if x:
+                out.append(x)
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
+def _interactive(rt: Runtime, first_task: str, append: bool,
+                 first_images: Optional[list] = None) -> int:
     _force_utf8()
     _print_banner()
     memory = ("关闭" if rt.prior_turns == 0
               else "全部" if (rt.prior_turns or 0) < 0
               else f"最近 {rt.prior_turns if rt.prior_turns is not None else 4} 轮")
     print(f"交互模式。工作区 {rt.ws.dir}")
-    print(f"输入 :q 退出，:r 重建报告，:i 自省；跨轮记忆：{memory}")
+    print(f"输入 :q 退出，:r 重建报告，:i 自省，:img 附图片；跨轮记忆：{memory}")
     print(f"对话原文：{rt.ws.transcript_file}\n")
     pending = first_task
+    pending_images = list(first_images or [])
     while True:
+        prompt = "你 ▸ " if not pending_images else f"你(+{len(pending_images)}图) ▸ "
         try:
-            text = pending or input("你 ▸ ").strip()
+            text = pending or input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
         pending = ""
-        if not text:
+        if not text and not pending_images:
             continue
         if text in (":q", ":quit", ":exit"):
             return 0
@@ -155,13 +190,32 @@ def _interactive(rt: Runtime, first_task: str, append: bool) -> int:
         if text == ":i":
             print(rt.self_inspect())
             continue
+        if text == ":img" or text.startswith(":img "):
+            extra = text[len(":img"):].strip()
+            if not extra:
+                print("用法：:img <路径或URL>[,...]")
+                continue
+            pending_images.extend(_split_image_arg(extra))
+            print(f"[ok] 已附加 {len(pending_images)} 张图片，随下一条消息发出")
+            continue
+        images = pending_images or None
+        pending_images = []
         try:
-            doc = rt.run(text, append=append)
+            doc = rt.run(text or None, append=append, images=images)
             print("\n" + "─" * 60)
             print(doc.get("answer", ""))
             print("─" * 60 + "\n")
         except RuntimeError as exc:
             print(f"[错误] {exc}", file=sys.stderr)
+
+
+def _split_image_arg(raw: str) -> list:
+    out = []
+    for x in str(raw).replace("，", ",").split(","):
+        x = x.strip()
+        if x:
+            out.append(x)
+    return out
 
 
 if __name__ == "__main__":  # pragma: no cover

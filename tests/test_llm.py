@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import time
 
-from openthree.llm import LLM, LLMConfig, _backoff, _retryable
+from openthree.llm import (LLM, LLMConfig, _backoff, _retryable, parse_token_count,
+                           load_config)
 
 
 class _Resp:
@@ -83,3 +84,28 @@ def test_backoff_is_capped_and_jittered():
     assert 1.0 <= _backoff(0) <= 1.5
     assert 2.0 <= _backoff(1) <= 2.5
     assert _backoff(99) <= 30.5
+
+
+# ---------------------------------------------------------------- 上下文窗口
+def test_parse_token_count_units():
+    assert parse_token_count("100M") == 100_000_000
+    assert parse_token_count("128k") == 128_000
+    assert parse_token_count(200000) == 200000
+    assert parse_token_count("1,000,000") == 1_000_000
+    assert parse_token_count("2g") == 2_000_000_000
+    assert parse_token_count("abc") is None
+    assert parse_token_count(None) is None
+    assert parse_token_count(True) is None
+
+
+def test_config_default_context_window_is_1m():
+    assert LLMConfig().context_window_tokens == 1_000_000
+
+
+def test_config_reads_context_window(tmp_path):
+    (tmp_path / ".openthree").mkdir()
+    (tmp_path / ".openthree" / "config.yaml").write_text(
+        "llm:\n  api_key: k\n  base_url: u\n  context_window_tokens: 128k\n",
+        encoding="utf-8")
+    cfg = load_config(tmp_path)
+    assert cfg.context_window_tokens == 128_000

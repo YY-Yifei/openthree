@@ -24,8 +24,15 @@
 """
 
 from .kernel import KERNEL, Kernel
+from .multimodal import (ImageError, ImageResult, content_text, image_result,
+                         to_data_url)
 from .tool import Tool, tool
 
 __version__ = "0.1.0"
 
-__all__ = ["tool", "Tool", "KERNEL", "Kernel", "__version__"]
+__all__ = [
+    "tool", "Tool", "KERNEL", "Kernel",
+    # 多模态：工具返回图片用 ImageResult
+    "ImageResult", "ImageError", "image_result", "to_data_url", "content_text",
+    "__version__",
+]

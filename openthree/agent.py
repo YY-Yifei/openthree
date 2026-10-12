@@ -30,7 +30,9 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .kernel import KERNEL
-from .llm import LLM
+from .llm import CHARS_PER_TOKEN, DEFAULT_CONTEXT_WINDOW_TOKENS, LLM
+from .multimodal import (DEFAULT_DETAIL, ImageResult, build_content,
+                         content_text, count_images, estimate_content_chars)
 from .progress import NullProgress
 from .prompt import build_messages
 from .recorder import Recorder
@@ -39,17 +41,45 @@ from .workspace import Workspace
 
 # 单个工具结果进入 history 的字符上限；超出则落盘、history 留预览。
 TOOL_RESULT_LIMIT = 4000
-# 对话历史（估算字符数）超过该值就自动折叠最老的 step；<=0 关闭。
-DEFAULT_CONTEXT_BUDGET_CHARS = 120_000
+# 上下文预算（历史累计字符数）默认由「模型上下文窗口」推导，见 resolve_context_budget。
+# 预算 ≈ min(窗口 token 数, MAX_CONTEXT_BUDGET_CHARS)：窗口越大给越多，但兜个上限。
+#   窗口 = 1M token（默认）→ 预算 = 1_000_000 字符（约 50 万 token 的历史）
+# 这里的 1_000_000 同时也是「不显式给窗口时」的等效默认预算。
+DEFAULT_CONTEXT_BUDGET_CHARS = 1_000_000
+# 预算的硬上限（= 默认窗口的推导值）：窗口更大时不再线性放大，避免阈值离谱。
+# 想放开就调大这里，或用 --context-budget 显式给。
+MAX_CONTEXT_BUDGET_CHARS = 1_000_000
+# 历史至多占用上下文窗口的比例（留一半给 system/工具 schema/模型输出）。
+CONTEXT_BUDGET_RATIO = 0.5
 # 多轮对话默认播种最近多少轮（0 关闭，负数表示全部）。
 DEFAULT_PRIOR_TURNS = 4
+
+
+def resolve_context_budget(context_budget_chars: Optional[int],
+                           context_window_tokens: Optional[int]) -> int:
+    """算出本轮的历史字符预算。
+
+    优先用显式传入的 `context_budget_chars`（0 = 关闭自动折叠）；否则按模型
+    上下文窗口推导：budget = min(窗口 token 数, MAX_CONTEXT_BUDGET_CHARS)。
+    推导用到 CHARS_PER_TOKEN（1 token ≈ 2 字符）与 RATIO（历史至多占用窗口的一半），
+    两者相乘、相消后「窗口 token 数」恰好等值于「字符预算」。
+
+    Args:
+        context_budget_chars: 显式预算（字符）；None 表示按窗口推导，0 表示关闭。
+        context_window_tokens: 模型上下文窗口（token）；None 表示用默认窗口。
+    """
+    if context_budget_chars is not None:
+        return int(context_budget_chars)
+    window = int(context_window_tokens or DEFAULT_CONTEXT_WINDOW_TOKENS)
+    derived = int(window * CHARS_PER_TOKEN * CONTEXT_BUDGET_RATIO)
+    return int(min(derived, MAX_CONTEXT_BUDGET_CHARS))
 
 
 class Agent:
     def __init__(self, workspace: Workspace, registry: Registry, llm: LLM,
                  recorder: Recorder, *, max_iterations: int = 200,
                  tool_result_limit: int = TOOL_RESULT_LIMIT,
-                 context_budget_chars: int = DEFAULT_CONTEXT_BUDGET_CHARS,
+                 context_budget_chars: Optional[int] = None,
                  prior_turns: Optional[int] = None,
                  progress: Optional[Any] = None) -> None:
         self.ws = workspace
@@ -58,7 +88,16 @@ class Agent:
         self.rec = recorder
         self.max_iterations = max_iterations
         self.tool_result_limit = max(0, int(tool_result_limit))
-        self.context_budget_chars = int(context_budget_chars)
+        # 本轮用户输入携带的图片（绝对路径或 http/data URL）。
+        # 在第一步注入成一条独立的 user 消息（与任务文本配对），供跨轮还原。
+        self.current_images: List[str] = []
+        self.task_text: str = ""
+        self._images_injected = False
+        # 预算默认从模型上下文窗口推导（100M 窗口 → 1 亿字符）；
+        # 显式传值优先，0 表示关闭自动折叠。
+        self.context_budget_chars = resolve_context_budget(
+            context_budget_chars, getattr(getattr(llm, "config", None),
+                                          "context_window_tokens", None))
         # 跨轮记忆：播种最近多少轮对话（None = 默认值，0 = 关闭，负数 = 全部）
         self.prior_turns = (DEFAULT_PRIOR_TURNS if prior_turns is None
                             else int(prior_turns))
@@ -91,8 +130,11 @@ class Agent:
         for turn in turns:
             user = (turn.get("user") or "").strip()
             answer = (turn.get("answer") or "").strip()
-            if user:
-                history.append({"role": "user", "content": user})
+            imgs = [x for x in (turn.get("images") or []) if x]
+            if user or imgs:
+                history.append({"role": "user",
+                                "content": build_content(user, imgs,
+                                                         base_dir=self.ws.root)})
             if answer:
                 history.append({"role": "assistant", "content": answer})
         if history:
@@ -111,6 +153,7 @@ class Agent:
             self.progress.step(self.iteration, self.max_iterations)
             self._apply_pending_compactions()
             self._auto_compact()
+            self._inject_images()
 
             steps = _index_steps(self.history)
             fold_range = f"{min(steps)}-{max(steps)}" if steps else ""
@@ -136,7 +179,7 @@ class Agent:
                 self.answer = f"[未能完成] 模型调用失败：{result['error']}"
                 break
 
-            content = (msg.get("content") or "").strip()
+            content = content_text(msg.get("content")).strip()
             tool_calls = msg.get("tool_calls") or []
 
             # 记下模型说的话（reasoning 也是工作记录的一部分）
@@ -170,6 +213,7 @@ class Agent:
     # ---------------------------------------------------------------- 执行工具
     def _run_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> None:
         summaries = []
+        pending_images: List[Dict[str, Any]] = []
         for call in tool_calls:
             fn = call.get("function") or {}
             name = fn.get("name") or call.get("name") or ""
@@ -193,13 +237,26 @@ class Agent:
             self.progress.tool_start(name, args)
             output, error = self._execute(name, args)
             elapsed = (time.time() - started) * 1000
-            self.progress.tool_done(name, elapsed, len(output or ""), error)
+
+            # 工具返回带图结果：tool 消息只能承载文本，图片另补一条 user 消息。
+            # 先归一化成 (文本, 图片清单)，后续一切按文本处理。
+            # 先登记，等本批全部 tool 消息补齐后再统一追加（保持 assistant → tool* 的合法序列）。
+            call_images: List[str] = []
+            if isinstance(output, ImageResult):
+                call_images = list(output.images)
+                if call_images:
+                    pending_images.append({"text": output.brief(), "images": call_images,
+                                           "detail": output.detail})
+                output = output.brief()
+            output = output if isinstance(output, str) else str(output or "")
+
+            self.progress.tool_done(name, elapsed, len(output), error)
 
             self.rec.record(
                 "tool",
                 summary=f"{name}({_short_args(args)})",
                 data={"name": name, "arguments": args, "output": _clip(output),
-                      "error": error, "call_id": call_id},
+                      "error": error, "call_id": call_id, "images": call_images},
                 elapsed_ms=elapsed,
             )
             summaries.append(f"{name} → {_clip(output, 160)}")
@@ -213,6 +270,43 @@ class Agent:
             })
 
         self.last_action = "\n".join(summaries)
+        for item in pending_images:
+            self._append_image_message(item["text"], item["images"], item["detail"])
+
+    def _append_image_message(self, text: str, images: List[str],
+                              detail: str = DEFAULT_DETAIL) -> None:
+        """把一批图片作为一条 user 消息追加进 history —— 这是模型「看见」的唯一通道。"""
+        if not images:
+            return
+        content = build_content(
+            (text or "").strip() or "以下是图片（工具刚生成的）：", images,
+            detail=detail or DEFAULT_DETAIL, base_dir=self.ws.root)
+        self.history.append({"role": "user", "content": content})
+        n = count_images(content)
+        self.rec.record("note", summary=f"注入 {n} 张图片供模型查看",
+                        data={"action": "inject_images", "count": n,
+                              "sources": images, "detail": detail or DEFAULT_DETAIL})
+        self.progress.note(f"注入 {n} 张图片供模型查看")
+
+    def _inject_images(self) -> None:
+        """把本轮的「任务文本 + 图片」作为一条 user 消息注入 history（只注入一次）。
+
+        刻意**不复用**跨轮播种的旧 user 消息：那些是历史轮次，本轮任务
+        与它们不是同一条。注入放在 history 末尾 —— 它才是「当前这一问」。
+        """
+        if self._images_injected or not self.current_images:
+            return
+        text = (self.task_text or "").strip() or "（图片输入）"
+        self.history.append({
+            "role": "user",
+            "content": build_content(text, self.current_images, base_dir=self.ws.root),
+        })
+        self._images_injected = True
+        n = len(self.current_images)
+        self.rec.record("note", summary=f"本轮输入含 {n} 张图片",
+                        data={"action": "seed_images", "count": n,
+                              "sources": self.current_images})
+        self.progress.note(f"本轮输入含 {n} 张图片")
 
     def _spill(self, call_id: str, name: str, text: str) -> str:
         """工具结果进入 history 前统一截断；超长部分落盘，history 只留预览 + 路径。"""
@@ -246,6 +340,8 @@ class Agent:
             return "", f"执行异常 {type(exc).__name__}: {exc}\n{traceback.format_exc()[-800:]}"
         if out is None:
             return "[ok]（无返回值）", None
+        if isinstance(out, ImageResult):
+            return out, None      # 保住类型：上层要拆出图片另发 user 消息
         return str(out), None
 
     # ---------------------------------------------------------------- 上下文压缩
@@ -385,15 +481,14 @@ def _safe_name(name: str) -> str:
 
 
 def _estimate_chars(history: List[Dict[str, Any]]) -> int:
-    """粗略估算一条 messages 的字符体量（1 token ≈ 2 字符就够了）。"""
+    """粗略估算一条 messages 的字符体量（1 token ≈ 2 字符就够了）。
+
+    多模态 content（list）由 multimodal.estimate_content_chars 折算：
+    图片按固定成本计，**不**按 base64 实际长度 —— 否则一张图就撑爆预算。
+    """
     total = 0
     for m in history:
-        c = m.get("content")
-        if isinstance(c, str):
-            total += len(c)
-            total += 20
-        elif c:
-            total += len(str(c))
+        total += estimate_content_chars(m.get("content"))
         for tc in (m.get("tool_calls") or []):
             try:
                 total += len(json.dumps(tc, ensure_ascii=False))

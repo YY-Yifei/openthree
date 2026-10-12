@@ -10,6 +10,7 @@
                 transcript.jsonl  # 多轮对话档案（append-only，每轮一行 JSON，
                                   #  用户的完整原始输入永不丢失、无损往返）
         functions/              # 二：python 文件即 function
+        assets/                 # 用户/工具带入的图片（按内容 sha1 去重）
         logs/                   # 可观测：模型全部工作记录
             session-*.json
             trace.jsonl
@@ -27,6 +28,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from .multimodal import (IMAGE_EXTS, ImageError, is_remote, resolve_path,
+                         save_asset)
 
 DIRNAME = ".openthree"
 
@@ -62,6 +66,7 @@ _SYSTEM_PROMPT_SEED = """\
 # 工作方式
 
 - 先看再用：不确定环境就调用 function 去看（读文件、列目录、跑命令）。
+- **你能「看见」图片**：用 `view_image(path)` 把一张图读进上下文，然后据此描述 / 识别 / 判断。
 - 一次只推进一小步，每步都想清楚「为什么」，把理由写进 `note`（会进工作记录）。
 - 任务完成后，用 `finish` 给出结论。
 - **自省**：每完成一个阶段性任务，问自己「我的 functions 够用吗？提示词准确吗？」
@@ -95,6 +100,8 @@ class Workspace:
     def __post_init__(self) -> None:
         self.root = Path(self.root).resolve()
         self.dir = self.root / DIRNAME
+        # 最近一次 stage_images 里单张图片装载失败的原因（供 CLI/自省提示）
+        self._last_image_error: str = ""
 
     # ---------- 子路径 ----------
     @property
@@ -104,6 +111,15 @@ class Workspace:
     @property
     def functions_dir(self) -> Path:
         return self.dir / "functions"
+
+    @property
+    def assets_dir(self) -> Path:
+        """带进来的图片等资产，按内容 sha1 去重（append-only，不自动清理）。
+
+        之所以不清：transcript.jsonl 里记的是这里的相对路径，清掉会让
+        历史轮次的图片无法回放。需要腾空间时用 reset_assets() 手动清。
+        """
+        return self.dir / "assets"
 
     @property
     def logs_dir(self) -> Path:
@@ -155,6 +171,7 @@ class Workspace:
             self.dir,
             self.prompts_dir,
             self.functions_dir,
+            self.assets_dir,
             self.logs_dir,
             self.steps_dir,
             self.events_dir,
@@ -217,31 +234,117 @@ class Workspace:
         return "等待用户输入" not in text
 
     # ---------- 用户输入 ----------
-    def submit(self, user_input: str, append: bool = False) -> Path:
-        """把用户输入写进 user-prompts.md，开启 ReAct。"""
+    def submit(self, user_input: str, append: bool = False,
+               images: Optional[List[str]] = None) -> Path:
+        """把用户输入写进 user-prompts.md，开启 ReAct。
+
+        Args:
+            user_input: 任务描述
+            append: True 时追加到已有任务之后，而不是覆盖
+            images: 本轮携带的图片路径 / URL；以 HTML 注释形式附在文末，
+                    既不影响人读，又能被 parse_images_from_prompt 还原。
+        """
         text = user_input.strip()
         block = f"# 当前任务\n\n{text}\n\n_提交于 {datetime.now().isoformat(timespec='seconds')}_\n"
         if append:
             old = self.read_user_prompt()
             if "等待用户输入" in old:      # 种子占位符不算历史任务
                 old = ""
+            # 旧任务里的图片标记属于上一轮，剥掉，避免图片越滚越多
+            old = re.sub(re.escape(self._IMAGES_MARK) + r":\s*\[.*?\]\s*-->", "", old, flags=re.S)
             if old.strip():
                 block = old.rstrip() + "\n\n---\n\n" + block
+        block += self.images_marker(images or [])
         self.write_user_prompt(block)
         return self.user_prompt_file
 
+    # ---------- 图片资产 ----------
+    _IMAGES_MARK = "<!-- openthree:images"
+
+    def stage_images(self, sources: List[str]) -> List[str]:
+        """把本轮的图片引用归置起来，返回可传给模型的路径/URL 列表。
+
+        本地文件**复制**进 `.openthree/assets/`（按内容去重），
+        http(s) / data: 引用原样保留。复制进 assets 是为了让
+        transcript 里记下的相对路径在后续轮次里依然可解析。
+
+        单个来源失败只影响它自己（记一句说明），不拖垮整批。
+        """
+        out: List[str] = []
+        for src in sources:
+            if not src:
+                continue
+            if is_remote(src):
+                out.append(str(src))
+                continue
+            try:
+                dest = save_asset(self.assets_dir, src)
+                out.append(str(dest))
+            except ImageError as exc:
+                # 保留原引用，让 build_content 再报一次（也便于用户看到原始路径）
+                out.append(str(src))
+                self._last_image_error = str(exc)
+        return out
+
+    def reset_assets(self) -> None:
+        """每轮任务开始前清空 assets —— 新任务不背上一轮图片的包袱。"""
+        if not self.assets_dir.exists():
+            return
+        for p in self.assets_dir.iterdir():
+            try:
+                if p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
+
+    def images_marker(self, images: List[str]) -> str:
+        """把图片清单编码成一段 HTML 注释，附在 user-prompts.md 末尾。"""
+        if not images:
+            return ""
+        return f"\n\n{self._IMAGES_MARK}: {json.dumps(list(images), ensure_ascii=False)} -->\n"
+
+    def parse_images_from_prompt(self, text: str) -> List[str]:
+        """从 user-prompts.md 的正文里解析出图片清单（注释形式）。"""
+        out: List[str] = []
+        for m in re.finditer(re.escape(self._IMAGES_MARK) + r":\s*(\[.*?\])\s*-->", text, re.S):
+            try:
+                items = json.loads(m.group(1))
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(items, list):
+                out.extend(str(x) for x in items if x)
+        return out
+
+    def strip_images_marker(self, text: str) -> str:
+        """剥掉 user-prompts.md 里的图片标记，得到干净的任务原文。"""
+        cleaned = re.sub(re.escape(self._IMAGES_MARK) + r":\s*\[.*?\]\s*-->", "", text or "",
+                         flags=re.S)
+        return cleaned.strip()
+
+    def scan_image_paths(self, text: str) -> List[str]:
+        """从一段文本里找出看起来是图片的路径 / URL（用于 CLI 的便利解析）。"""
+        out: List[str] = []
+        for token in re.findall(r"[^\s\"']+", text or ""):
+            low = token.split("?")[0].lower()
+            if is_remote(token) or any(low.endswith(ext) for ext in IMAGE_EXTS):
+                out.append(token)
+        return out
+
     # ---------- 多轮对话档案 ----------
     def append_turn(self, user_input: str, answer: str = "", *,
+                    images: Optional[List[str]] = None,
                     ts: Optional[datetime] = None) -> Path:
         """**追加**一轮对话到 transcript.jsonl（append-only，永不覆写）。
 
         用户的原始输入按原样落盘 —— 多轮对话里「用户说过什么」不会被任何
         后续轮次冲掉，这正是 user-prompts.md（单槽位、会被覆写）做不到的事。
         每轮一行 JSON，对任意字符都无损（换行在 JSON 里被转义）。
+        图片只记**路径/URL**，绝不记 base64 —— 档案要小、要能读。
 
         Args:
             user_input: 用户的完整原始输入
             answer: 本轮 openthree 给出的结论
+            images: 本轮用户输入携带的图片路径 / URL（可选）
             ts: 轮次时间戳，默认现在
         """
         self.transcript_dir.mkdir(parents=True, exist_ok=True)
@@ -250,6 +353,9 @@ class Workspace:
             "user": user_input if isinstance(user_input, str) else str(user_input),
             "answer": answer if isinstance(answer, str) else str(answer or ""),
         }
+        imgs = [str(x) for x in (images or []) if x]
+        if imgs:
+            doc["images"] = imgs
         line = json.dumps(doc, ensure_ascii=False)
         with self.transcript_file.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -281,10 +387,12 @@ class Workspace:
                 continue          # 半截行 / 损坏行：跳过，不影响其余轮次
             if not isinstance(doc, dict):
                 continue
+            imgs = doc.get("images")
             turns.append({
                 "ts": str(doc.get("ts") or ""),
                 "user": str(doc.get("user") or ""),
                 "answer": str(doc.get("answer") or ""),
+                "images": [str(x) for x in imgs] if isinstance(imgs, list) else [],
             })
         return turns if n < 0 else turns[-n:]
 

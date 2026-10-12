@@ -36,6 +36,7 @@ llm:
   base_url: https://api.deepseek.com
   model: deepseek-v4.1-flash
   max_tokens: 8192
+  context_window_tokens: 128k   # 上下文窗口，决定自动折叠预算；可写 1M/128k/1000000，缺省 1M
 ```
 
 ## 使用
@@ -49,6 +50,56 @@ openthree --init                            # 只建工作区
 openthree --inspect                         # 看一眼自己当前的样子（不调模型）
 openthree --functions                       # 列出所有工具
 openthree --report                          # 重建 three-report.html
+openthree "这张报错什么意思" --image err.png # 多模态：随任务附一张图片
+openthree "对比这两张图" --images a.png,b.png
+```
+
+## 多模态（看图）
+
+openthree 能「看见」图片。图片走 OpenAI 协议的 content parts，**不改 ReAct 循环**：
+
+```bash
+openthree "这张报错截图是什么意思" --image ./err.png      # 本地路径
+openthree "描述这张图" --image https://x/y.png            # http(s) 链接
+openthree --images a.png,b.png "对比这两张图"             # 多张
+openthree -i                                             # 交互模式里用 :img a.png 附图
+```
+
+三条图片进上下文的路，都通：
+
+1. **用户输入**：`--image` / `:img` → 本轮 user 消息带上图片。
+2. **工具返回**：模型调用内置 `view_image(path)`，或任何自造工具返回
+   `openthree.ImageResult(text=..., images=[...])` → Agent 补一条带图片的 user 消息。
+3. **多轮记忆**：图片路径记进 `transcript.jsonl`，下一轮播种时自动还原。
+
+几条刻意的设计（都是为了让多模态不把系统搞坏）：
+
+- **图片不按 base64 计费**。上下文估算里一张图按固定成本折算，
+  否则一张 500KB 的图会让预算瞬间爆掉、触发无谓折叠。
+- **日志不留 base64**。写进 `logs/` 的请求里，图片被替换成
+  `data:image/png;base64,<省略 N 字节图片>`。
+- **本地图归档去重**。本地文件复制进 `.openthree/assets/`（按内容 sha1 命名），
+  transcript 记的是那里的路径，所以历史轮次的图片始终能回放。
+- **坏图不致命**。单张图读不动只在消息里留一句「图片加载失败」，
+  不会中断整轮任务。
+- **依赖是可选的**。核心路径不依赖 Pillow —— 大小/类型靠字节头判断。
+  只有你的自造工具需要缩放、转码时才装。
+- 单张图默认上限 **10MB**，用环境变量 `OPENTHREE_MAX_IMAGE_BYTES` 调整（0 = 不限）。
+
+自造一个「看图」工具的写法：
+
+```python
+from openthree import ImageResult
+
+@tool
+def screenshot(url: str) -> ImageResult:
+    """截一张网页图。
+
+    Args:
+        url: 网页地址
+    """
+    path = _capture(url)                 # 你自己的截图逻辑
+    return ImageResult(text=f"已截图 {url}", images=[path])
 ```
 
 **跑起来不会沉默。** 每一步、每次模型调用、每次工具执行都会在终端留下回声：
@@ -104,13 +155,24 @@ openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已
 
 - **工具结果有界入上下文。** 单个工具输出超过 4000 字符时，完整内容落盘到
   `logs/tool-output/`，history 只保留预览 + 文件路径。同一份大输出不会被每轮重发。
-- **上下文自动折叠。** 历史累计超过预算（默认 12 万字符）时，runtime 自动把最老的
-  若干 step 折叠成摘要——不依赖模型自觉调用 `compact_context`。
+- **上下文自动折叠。** 历史累计超过**预算**时，runtime 自动把最老的若干 step 折叠成
+  摘要——不依赖模型自觉调用 `compact_context`。预算不再写死：默认按**模型上下文窗口**
+  推导（窗口 × 50% × 2 字符/token）。默认窗口 **1M token → 预算 100 万字符**。
+  按你的模型调整窗口：`config.yaml` 里写 `llm.context_window_tokens: 4m`
+  （支持 `1M` / `128k` / `1000000`），或用 `--context-window` / `--context-budget` 覆盖；
+  `--context-budget 0` 关闭自动折叠。启动时会打印「窗口 → 预算」一行。
 - **LLM 调用会重试。** 网络抖动 / 限流 / 5xx 自动指数退避重试（默认 3 次）；
   参数错误、鉴权失败立即返回，不空转。
 - **输出被截断会被告知。** `finish_reason=length` 时如实报错，而不是把半截
   `tool_calls` 当成正常回复。
-- **`run_shell` 跨平台。** Windows 中文环境（GBK）下的输出不再乱码。
+- **`run_shell` 跨平台，且不会挂死。** Windows 中文环境（GBK）下的输出不再乱码；
+  命令超时后**连同子孙进程一起强杀**（Windows `taskkill /T`、POSIX `killpg`），
+  再给 5s 管道收尾宽限，仍收不回就直接放弃读取返回——所以绝不会因为某个后台
+  子进程攥着输出管道而永久卡住。`stdin` 接 `DEVNULL`，交互式命令立刻 EOF 退出。
+  `timeout` 被截到 `1~3600` 秒。
+- **LLM 调用有上界。** 单次请求默认 600s 超时、最多重试 3 次、退避上限 30s，
+  最坏约 3×(600+30)≈32 分钟——**这也会表现为「很久没结果」**，
+  可用 `config.yaml: llm.timeout / llm.retries` 调小。
 - **`finish` 之后不再执行多余的调用。** 同批剩余 tool_calls 一律跳过。
 - **多轮对话不会失忆。** 每轮的 (用户原文, 结论) 追加进 append-only 的
   `prompts/history/transcript.jsonl`；下一轮开跑前读回最近 N 轮播种进上下文
@@ -160,6 +222,8 @@ openthree -i
 **openthree 会以你的用户权限执行模型决定的一切操作。** 这不是夸张：
 
 - `run_shell` 用 `shell=True` 执行任意命令，无沙箱、无审批；
+  它只保证「超时后一定返回」（整树强杀），**不保证命令不产生副作用**——
+  被 kill 前它已经做过的事不会撤销。
 - `read_file` / `write_file` 可读写进程权限范围内的任意路径；
 - `write_function` 写出的 `.py` 会被直接导入执行；
 - `write_system_prompt` 可以改写它自己的提示词。
