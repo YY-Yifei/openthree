@@ -334,7 +334,11 @@ class Agent:
         try:
             out = tool.func(**call_args)
         except TypeError as exc:
-            return "", f"参数不匹配（{exc}）。函数签名：{tool.signature_hint()}"
+            # 参数不匹配是最常见的模型失误：**一步**把正确签名回给模型，
+            # 别让它再多调一次 list_functions 才知道自己错在哪。
+            return "", (f"参数不匹配：{exc}\n正确签名：{tool.signature_hint()}\n"
+                        f"（可用参数：{', '.join(tool.parameters) or '无'}；"
+                        f"必填：{', '.join(tool.required) or '无'}）")
         except Exception as exc:  # noqa: BLE001
             import traceback
             return "", f"执行异常 {type(exc).__name__}: {exc}\n{traceback.format_exc()[-800:]}"

@@ -183,9 +183,11 @@ openthree -i --auto 8 "把项目里的重复代码抽干净"
 
 停下的条件：计划已无未完成项 / 某轮出错或被中断 / 达到轮数上限。任一满足即停。
 
-**3) 改提示词可后悔（版本 + 回滚）。** `write_system_prompt` 覆写前会把旧稿
-自动存进 `prompts/versions/`；`list_prompt_versions` 看历史，`restore_system_prompt`
+**3) 改提示词可后悔（版本 + 回看 + 回滚）。** `write_system_prompt` 覆写前会把旧稿
+自动存进 `prompts/history/`；`list_prompt_versions` 列历史、`read_prompt_version("-5")`
+回看最近 5 版（概览）或 `read_prompt_version("1")` 读全文、`restore_system_prompt`
 一键回退（回退动作本身也会先存一版现稿）。自省的前提是**可后悔**。
+`read_prompts` 还会在开头先给出系统提示词的**章节索引**，一眼看清结构再决定改哪节。
 
 ## 长任务的健壮性
 
@@ -222,8 +224,19 @@ openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已
   触到上限。改提示词会先存档，能回滚。
 - **过程可观测。** 终端有 step / 思考 / 工具 / 心跳的实时回声，磁盘有完整日志——
   「它现在在干什么」和「它曾经干过什么」都有答案。
-- **自查**：`write_function` 落盘前先做 AST 语法检查；工具重名会记入 `load_errors`；
-  `compact_context` 的区间会先校验，折不动就如实告诉你，不会假报成功。
+- **自查（写完先验收，再上岗）。** `write_function` 落盘时先做**纯静态审计**：
+  语法、有没有可注册的公开函数、是否**覆盖了内置工具**（那会砍掉你自己的感知通道）、
+  有没有高危调用（`os.system`/`eval`/`subprocess`…）。通过后**必须**再
+  `reload_functions()` 并用 `list_functions()` 确认它真在清单里——文件写成功 ≠ 工具注册成功。
+  想更稳还可先 `verify_tool(name)`：它在**子进程**里真正 import 一次并按注册器的同一路径
+  构造工具，把「语法没错但一 import 就炸」提前暴露，且**零污染**（子进程死掉不影响内核）。
+  工具重名会记入 `load_errors`；`compact_context` 的区间会先校验，折不动就如实告诉你，
+  不会假报成功。
+- **看代码有感知带宽。** `search_files`（grep 式，先定位后精读）与
+  `code_outline`（ast 大纲，只解析不执行，对大文件安全且快）——先看结构、先搜再读，
+  别硬啃整份文件。
+- **失败信息一步到位。** 工具参数不匹配时，错误里直接回给你**正确签名**与必填项，
+  不必再查一次工具清单。
 
 ```bash
 python self_test.py          # 端到端自测（桩模型，不联网）

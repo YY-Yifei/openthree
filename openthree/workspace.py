@@ -87,7 +87,13 @@ _SYSTEM_PROMPT_SEED = """\
 - 首个参数命名为 `kernel` 时会由运行期注入，模型看不到它。
 - 返回 `str` 最省事：返回 `None` 会被当作「无返回值」。
 - 出错时**返回错误信息字符串，不要抛异常**——异常会中断你的调用链。
-- 写完必须 `reload_functions()` 才生效。用 `list_functions()` 确认它已经出现。
+- **写完先验收，再上岗**：`write_function` 落盘时会自动做静态审计（语法 / 有没有
+  公开函数 / 是否覆盖内置 / 有没有高危调用）；稳妥起见再调 `verify_tool(name)`，
+  它在**子进程**里真正 import 一次，能提前发现「语法没错但一 import 就炸」。
+  然后才 `reload_functions()`，并**务必 `list_functions()` 确认它真的在清单里**
+  （文件写成功 ≠ 工具注册成功）。
+- 模块级变量是**暂存**不是长存：reload 会重载模块，别拿它当缓存；要跨调用长存用
+  `KERNEL.state`（由运行期注入的草稿纸）。
 
 # 工作方式
 
@@ -95,6 +101,8 @@ _SYSTEM_PROMPT_SEED = """\
 - **找东西先检索，别硬读整份文件**：`search_files(pattern, path, glob="*.py")`
   给出「文件:行号: 内容」，定位后用 `read_file(offset=行号)` 精读。
   这是你的感知带宽 —— 先 grep，后精读。
+- **读代码先看大纲**：`code_outline(path)` 用 ast 抽出类 / 函数签名与行号区间，
+  一眼看清大文件的结构，再按行精读某一段 —— 读大文件别硬啃全文。
 - **你能「看见」图片**：用 `view_image(path)` 把一张图读进上下文，然后据此描述 / 识别 / 判断。
 - 一次只推进一小步，每步都想清楚「为什么」，把理由写进 `note`（会进工作记录）。
 - 任务完成后，用 `finish` 给出结论。
@@ -104,7 +112,8 @@ _SYSTEM_PROMPT_SEED = """\
 - **自省**：每完成一个阶段性任务，问自己「我的 functions 够用吗？提示词准确吗？
   计划写清楚了吗？」不够就当场补上——这就是演化。
 - **改提示词前不必畏手畏脚，但可以留个后路**：`write_system_prompt` 会自动把旧稿
-  存进 `prompts/versions/`，用 `list_prompt_versions` / `restore_system_prompt` 就能回退。
+  存进 `prompts/history/`，用 `list_prompt_versions` / `read_prompt_version("-5")`
+  回看历史，用 `restore_system_prompt` 回退。
 
 # 可观测
 
@@ -131,6 +140,30 @@ _PLAN_SEED = """\
 
 def _now_stamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _version_header(reason: str = "") -> str:
+    """系统提示词历史版本的存档头（注释，读回时一眼看到「何时、因为什么」。"""
+    header = f"<!-- 存档于 {datetime.now().isoformat(timespec='seconds')}"
+    if reason:
+        header += f" · {reason}"
+    header += " · 由 write_system_prompt 覆写前自动保存 -->\n\n"
+    return header
+
+
+_VERSION_RE = re.compile(r"^system-(\d{8}-\d{6})(?:-(\d+))?$")
+
+
+def _version_sort_key(path: Path) -> "tuple":
+    """历史版本排序键：`(秒级时间戳, 同秒递增序号)` —— 越大越新。
+
+    文件名形如 `system-20261012-175613.md` / `system-20261012-175613-1.md`。
+    裸按字符串排会把 `-1` 排到前面（因为 '-' < '.'），于是「最新一版」判断反过来。
+    """
+    m = _VERSION_RE.match(path.stem)
+    if not m:
+        return ("0", 0)
+    return (m.group(1), int(m.group(2) or 0))
 
 
 @dataclass
@@ -209,7 +242,17 @@ class Workspace:
 
     @property
     def versions_dir(self) -> Path:
-        """系统提示词的历史版本——「自省」的前提是「可后悔」。"""
+        """系统提示词的历史版本——「自省」的前提是「可后悔」。
+
+        与 `history/`（对话档案）本名不同、但**同指**一个目录：早期版本写在
+        `versions/`，报告与文档口径写 `history/`，两种叫法都认得，读时合并、
+        写时统一落到 history/，旧数据不丢。
+        """
+        return self.prompts_dir / "history"
+
+    @property
+    def legacy_versions_dir(self) -> Path:
+        """历史遗留的 `versions/` 目录（只读兼容，写入一律走 versions_dir）。"""
         return self.prompts_dir / "versions"
 
     @property
@@ -266,10 +309,11 @@ class Workspace:
             "# .openthree\n\n"
             "这是 openthree 智能体的工作区。\n\n"
             "| 路径 | 含义 |\n|---|---|\n"
-            "| `prompts/system-prompts.md` | 一：系统提示词，模型可自改（旧稿存于 `prompts/versions/`） |\n"
+            "| `prompts/system-prompts.md` | 一：系统提示词，模型可自改（旧稿存于 `prompts/history/`） |\n"
             "| `prompts/user-prompts.md` | 当前任务，用户输入落在这里 |\n"
             "| `prompts/plan.md` | 长任务待办清单，模型自己维护、每轮自动注入 |\n"
             "| `prompts/history/transcript.jsonl` | 对话档案：用户的完整原始输入（只增不改，`--resume` 可续读） |\n"
+            "| `prompts/history/system-*.md` | 系统提示词的历史版本（`read_prompt_version` 回看、`restore_system_prompt` 回退） |\n"
             "| `functions/*.py` | 二：python 文件即 function |\n"
             "| `logs/` | 模型全部工作记录（json / jsonl 分门别类） |\n"
             "| `memory/memory.jsonl` | 二：长期记忆（append-only）；`remember` 写、`recall_memory` 读、每轮注入 |\n"
@@ -285,7 +329,7 @@ class Workspace:
         return self.system_prompt_file.read_text(encoding="utf-8")
 
     def write_system_prompt(self, text: str, snapshot: bool = True) -> None:
-        """覆写系统提示词。默认先把旧稿存进 prompts/versions/（可回滚）。
+        """覆写系统提示词。默认先把旧稿存进 prompts/ 的历史目录（可回滚）。
 
         Args:
             text: 新的系统提示词全文
@@ -339,7 +383,7 @@ class Workspace:
 
     # ---------- 系统提示词的版本与回滚 ----------
     def snapshot_system_prompt(self, reason: str = "") -> Optional[Path]:
-        """把**当前**系统提示词存一份到 prompts/versions/（覆写前调用）。
+        """把**当前**系统提示词存一份到历史目录（覆写前调用）。
 
         返回存档路径；当前无提示词时返回 None。文件名带时间戳，
         同秒内多次覆写用递增后缀避免互相覆盖。
@@ -354,57 +398,105 @@ class Workspace:
         while dest.exists():
             dest = self.versions_dir / f"system-{stamp}-{n}.md"
             n += 1
-        header = f"<!-- 存档于 {datetime.now().isoformat(timespec='seconds')}"
-        if reason:
-            header += f" · {reason}"
-        header += " · 由 write_system_prompt 覆写前自动保存 -->\n\n"
-        dest.write_text(header + old, encoding="utf-8")
+        dest.write_text(_version_header(reason) + old, encoding="utf-8")
         return dest
 
     def list_prompt_versions(self) -> List[Path]:
-        """列出系统提示词的历史版本（新 → 旧）。"""
-        if not self.versions_dir.exists():
-            return []
-        return sorted(self.versions_dir.glob("system-*.md"), reverse=True)
+        """列出系统提示词的历史版本（新 → 旧）。
+
+        合并 `history/`（现行）与遗留的 `versions/`：**同一个文件只算一次**
+        （旧工作区两份都可能有），按文件名去重。
+
+        排序按「存档时间 + 同秒递增序号」而非裸文件名 —— 同一秒内的多次覆写
+        会生成 `system-<秒>.md` / `system-<秒>-1.md`，裸名字母序会把它们排反，
+        导致「1 = 最新」指向旧版本、回滚出错版本。
+        """
+        found: Dict[str, Path] = {}
+        for d in (self.versions_dir, self.legacy_versions_dir):
+            try:
+                if not d.exists():
+                    continue
+                for p in d.glob("system-*.md"):
+                    found.setdefault(p.name, p)
+            except OSError:
+                continue
+        return sorted(found.values(), key=_version_sort_key, reverse=True)
 
     def read_prompt_version(self, name: str) -> Optional[str]:
-        """按文件名/序号读取一个历史版本；不存在返回 None。"""
+        """按文件名/序号读取一个历史版本；不存在返回 None。
+
+        序号：正数 1 = 最新；**负数 -N 表示「第 N 个更早的版本」**
+        （-1 = 第二新，-2 = 第三新…）。
+        """
         versions = self.list_prompt_versions()
         if not versions:
             return None
-        target: Optional[Path] = None
-        raw = str(name or "").strip()
-        # 允许用 1 = 最新
-        if raw.isdigit():
-            i = int(raw)
-            if 1 <= i <= len(versions):
-                target = versions[i - 1]
-        if target is None:
-            safe = Path(raw).name
-            for p in versions:
-                if p.name == safe or p.name == safe + ".md":
-                    target = p
-                    break
+        target = self._pick_version(versions, name)
         if target is None or not target.exists():
             return None
         return target.read_text(encoding="utf-8")
+
+    def _pick_version(self, versions: List[Path], name: str) -> Optional[Path]:
+        """把「序号 / 负序号 / 文件名」解析成 versions 里的一个 Path。
+
+        正数 1 = 最新；负数 -N = 「第 N 个更早的版本」：-1 = 第二新（索引 1），
+        -2 = 第三新（索引 2）… 于是「最新版本」与「更早版本」各有各的好记法。
+        """
+        raw = str(name or "").strip()
+        if raw.startswith("-") and raw[1:].isdigit():
+            idx = int(raw[1:])          # -1 → 索引 1（第二新）
+            return versions[idx] if 0 <= idx < len(versions) else None
+        if raw.isdigit():
+            i = int(raw)
+            if 1 <= i <= len(versions):
+                return versions[i - 1]
+            return None
+        safe = Path(raw).name
+        for p in versions:
+            if p.name == safe or p.name == safe + ".md":
+                return p
+        return None
+
+    def analysis_sections(self, text: Optional[str] = None) -> List[str]:
+        """把一份 markdown 的**章节标题**列出来——自省时先看结构，再看全文。
+
+        只取 `#` 开头的行（含层级），去掉 `<!-- -->` 存档头。给 read_prompts 用。
+        """
+        body = self.read_system_prompt() if text is None else text
+        out: List[str] = []
+        in_comment = False
+        for line in (body or "").splitlines():
+            s = line.rstrip()
+            stripped = s.strip()
+            if in_comment:
+                if "-->" in stripped:
+                    in_comment = False
+                continue
+            if stripped.startswith("<!--"):
+                if "-->" not in stripped:
+                    in_comment = True
+                continue
+            if stripped.startswith("#"):
+                out.append(stripped)
+        return out
 
     def restore_system_prompt(self, name: str) -> Optional[str]:
         """把某个历史版本恢复成当前系统提示词（恢复前也先把现稿存档）。
 
         返回被恢复版本的文件名；找不到该版本返回 None。
+        序号同 read_prompt_version（1 = 最新，负数 = 更早）。
         """
-        text = self.read_prompt_version(name)
-        if text is None:
-            return None
-        # 恢复也是一次覆写：先给「现在的稿子」留后路，避免恢复动作本身不可逆。
-        self.snapshot_system_prompt(reason=f"restore {name}")
-        self.write_system_prompt(text, snapshot=False)
         versions = self.list_prompt_versions()
-        raw = str(name or "").strip()
-        if raw.isdigit() and 1 <= int(raw) <= len(versions):
-            return versions[int(raw) - 1].name
-        return Path(raw).name if raw else ""
+        target = self._pick_version(versions, name) if versions else None
+        if target is None:
+            return None
+        text = target.read_text(encoding="utf-8")
+        # 恢复也是一次覆写：先给「现在的稿子」留后路，避免恢复动作本身不可逆。
+        # 注意先取好 target.name —— snapshot 会让列表变长，事后再按序号找会错位。
+        restored = target.name
+        self.snapshot_system_prompt(reason=f"restore {restored}")
+        self.write_system_prompt(text, snapshot=False)
+        return restored
 
     # ---------- 用户输入 ----------
     def submit(self, user_input: str, append: bool = False,

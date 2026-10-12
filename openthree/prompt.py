@@ -148,6 +148,9 @@ def _plan_block(ws: Workspace) -> str:
 
 
 def _recent_evolution(ws: Workspace, limit: int = 10) -> str:
+    """最近若干条演化史。**只给最近 10 条**，是为了让模型知道「怎么回看更多」——
+    完整历史在 evolution.jsonl 与 prompts/history/，不必也不必全部塞进每一轮上下文。
+    """
     path = ws.logs_dir / "evolution.jsonl"
     if not path.exists():
         return "（还没有。你没改造过自己。）"
@@ -163,7 +166,13 @@ def _recent_evolution(ws: Workspace, limit: int = 10) -> str:
         except Exception:  # noqa: BLE001
             continue
         rows.append(f"- [{ev.get('ts', '')[:19]}] {ev.get('summary', '')}")
-    return "\n".join(rows) if rows else "（还没有。你没改造过自己。）"
+    if not rows:
+        return "（还没有。你没改造过自己。）"
+    total = len(lines)
+    if total > limit:
+        rows.append(f"（共 {total} 条，这里只显示最近 {limit} 条；"
+                    "更早的用 search_files(pattern, path='.openthree/logs/evolution.jsonl') 翻看）")
+    return "\n".join(rows)
 
 
 def build_messages(ws: Workspace, reg: Registry, history: List[Dict[str, Any]], *,

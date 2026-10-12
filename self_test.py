@@ -186,15 +186,35 @@ def main() -> int:
 
     # 6 配置分层：不再复用 local-llm 的 ~/.local-llm/config.yaml 兜底
     #    （空项目 + 无用户级配置时，任何一层都不该给出 api_key）
+    #
+    #    注意：只清环境变量不够 —— 本机若存在用户级 ~/.openthree/config.yaml，
+    #    它仍是合法的一层，断言会失败。这里把 HOME / USERPROFILE 指向空目录，
+    #    真正隔离掉「用户级」这一层，测的才是「没有配置就不该有 key」。
     import os
-    for _k in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENTHREE_MODEL", "OPENAI_MODEL"):
-        os.environ.pop(_k, None)
+    _saved_env = {k: os.environ.pop(k, None)
+                  for k in ("OPENAI_API_KEY", "OPENAI_BASE_URL",
+                            "OPENTHREE_MODEL", "OPENAI_MODEL")}
+    _saved_home = {k: os.environ.get(k)
+                   for k in ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH")}
     empty = SANDBOX / "_cfg_empty"
     empty.mkdir(parents=True, exist_ok=True)
-    local-llm_cfg = Path.home() / ".local-llm" / "config.yaml"
-    isolated = load_config(empty)
-    check("配置不从 local-llm 兜底（api_key 为空）",
-          isolated.api_key == "", f"api_key={isolated.api_key!r} local-llm存在={local-llm_cfg.exists()}")
+    fake_home = SANDBOX / "_cfg_home"
+    fake_home.mkdir(parents=True, exist_ok=True)
+    try:
+        os.environ["HOME"] = str(fake_home)
+        os.environ["USERPROFILE"] = str(fake_home)
+        isolated = load_config(empty)
+    finally:
+        for k, v in _saved_env.items():
+            if v is not None:
+                os.environ[k] = v
+        for k, v in _saved_home.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    check("配置不从 local-llm 兜底（api_key 为空）", isolated.api_key == "",
+          f"api_key={isolated.api_key!r}")
     check("配置 model 回落内置默认", isolated.model == "deepseek-v4.1-flash", isolated.model)
     check("配置不可用（usable=False）", isolated.usable is False)
     check("llm.py 不含 local-llm 字样",

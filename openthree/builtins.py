@@ -2,11 +2,14 @@
 
 它们少而必需，且**每一个都在为自我演化铺路**：
 
-    看世界      read_file / list_dir / search_files / view_image / write_file / run_shell
-    改自己      write_function / reload_functions / delete_function
+    看世界      read_file / list_dir / search_files / code_outline
+                view_image / write_file / run_shell
+    改自己      write_function（写入即静态审计）
+                verify_tool（子进程验收：先证明它能跑，再 reload）
+                reload_functions / delete_function
     改提示词    read_prompts / write_system_prompt / write_user_prompt
+    自省        list_prompt_versions / read_prompt_version / restore_system_prompt
     长任务      read_plan / write_plan（待办清单）
-                list_prompt_versions / restore_system_prompt（提示词回滚）
     管记忆      remember（写下）/ recall_memory（读回）
     管上下文    compact_context / note
     收尾        finish
@@ -14,12 +17,18 @@
 真正的魔法在于：模型用 write_function 写出的新 py 文件，
 reload_functions 之后就成了它手上的新工具 —— 能力从此自生长。
 
+「验收闭环」是「能力自生长」的护栏：write_function 落盘时先做**纯静态**审计
+（语法 / 公开函数 / 是否覆盖内置 / 危险调用），verify_tool 再在**子进程**里做一次
+与主进程隔离的 import + 签名检查。于是「写错了」在写入那一刻就被告知，
+而不是等 reload 把内核弄脏之后。
+
 多模态：view_image 返回 ImageResult，Agent 会把图片注入上下文，
 模型因此能「看见」图；自造工具只要返回 `openthree.ImageResult`（或
 `images=[...]`）也能回传图片。
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -269,6 +278,183 @@ def search_files(pattern: str, path: str = ".", glob: str = "",
     return head + "\n" + body
 
 
+def code_outline(path: str, include_private: bool = True, docstrings: bool = True,
+                 max_items: int = 400) -> str:
+    """用 ast 提取一个 .py 文件的类与函数签名大纲（含 docstring 首行、行号范围）。
+
+    只解析、不导入、不执行，所以对任意大文件都安全且快。
+    输出里带行号，可直接配合 read_file(offset=..., limit=...) 精读。
+
+    Args:
+        path: .py 文件路径（绝对，或相对当前工作目录）
+        include_private: 是否包含 _ 开头的私有函数/方法（双下划线 dunder 始终包含）
+        docstrings: 是否显示 docstring 首行
+        max_items: 最多列出多少个节点，防止超大文件刷屏
+    """
+    try:
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        if not p.exists():
+            return f"[错误] 文件不存在：{p}"
+        if p.is_dir():
+            return f"[错误] 这是目录不是文件：{p}（试试 list_dir）"
+        src = p.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(src, filename=str(p))
+    except SyntaxError as exc:
+        return f"[错误] 语法解析失败 {path}:{exc.lineno}: {exc.msg}"
+    except Exception as exc:  # noqa: BLE001
+        return f"[错误] {type(exc).__name__}: {exc}"
+
+    n_lines = src.count("\n") + 1
+    out: List[str] = [f"# {p.name} — {n_lines} 行  (ast 大纲)"]
+
+    mod_doc = _outline_first_doc(tree)
+    if mod_doc:
+        out.append(f'"""{mod_doc}"""')
+
+    mods: List[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            mods.extend(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            mods.append(node.module or ".")
+    if mods:
+        out.append("# imports: " + ", ".join(sorted(set(mods))))
+
+    counter = {"class": 0, "func": 0}
+    lines: List[str] = []
+
+    def emit(node: ast.AST, depth: int) -> None:
+        pad = "    " * depth
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not _outline_keep(node.name, include_private):
+                return
+            counter["func"] += 1
+            if counter["func"] + counter["class"] > max_items:
+                return
+            kind = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            deco = _outline_decorators(node)
+            prefix = (deco + " ") if deco else ""
+            span = f"L{node.lineno}-{node.end_lineno}"
+            lines.append(f"{pad}{prefix}{kind} {node.name}({_outline_args(node.args)})"
+                         f"{_outline_returns(node)}  @{span}")
+            doc = _outline_first_doc(node) if docstrings else ""
+            if doc:
+                lines.append(f'{pad}    """{doc}"""')
+        elif isinstance(node, ast.ClassDef):
+            if not _outline_keep(node.name, include_private):
+                return
+            counter["class"] += 1
+            if counter["func"] + counter["class"] > max_items:
+                return
+            bases = ", ".join(_outline_unparse(b) for b in node.bases)
+            deco = _outline_decorators(node)
+            prefix = (deco + " ") if deco else ""
+            span = f"L{node.lineno}-{node.end_lineno}"
+            head = f"{pad}{prefix}class {node.name}"
+            if bases:
+                head += f"({bases})"
+            lines.append(f"{head}  @{span}")
+            doc = _outline_first_doc(node) if docstrings else ""
+            if doc:
+                lines.append(f'{pad}    """{doc}"""')
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    emit(child, depth + 1)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            emit(node, 0)
+
+    out.append(f"# 类 {counter['class']} 个 / 函数 {counter['func']} 个")
+    out.append("")
+    out.extend(lines)
+
+    truncated = counter["func"] + counter["class"] > max_items
+    if truncated:
+        out.append(f"... [超过 max_items={max_items}，已截断]")
+    if not lines:
+        out.append("（没有类或函数定义）")
+    return "\n".join(out)
+
+
+# code_outline 的私有辅助（原名带下划线，注册器会自动忽略）
+def _outline_keep(name: str, include_private: bool) -> bool:
+    if include_private:
+        return True
+    if name.startswith("__") and name.endswith("__"):
+        return True  # dunder 始终保留
+    return not name.startswith("_")
+
+
+def _outline_first_doc(node: ast.AST) -> str:
+    try:
+        doc = ast.get_docstring(node) or ""
+    except Exception:  # noqa: BLE001
+        return ""
+    for line in doc.strip().splitlines():
+        line = line.strip()
+        if line:
+            return line[:160]
+    return ""
+
+
+def _outline_decorators(node: ast.AST) -> str:
+    decos = getattr(node, "decorator_list", None) or []
+    parts = []
+    for d in decos:
+        try:
+            parts.append("@" + ast.unparse(d))
+        except Exception:  # noqa: BLE001
+            parts.append("@?")
+    return " ".join(parts)
+
+
+def _outline_args(a: ast.arguments) -> str:
+    parts: List[str] = []
+    pos = list(getattr(a, "posonlyargs", [])) + list(a.args)
+    defaults = list(a.defaults)
+    pad = len(pos) - len(defaults)
+    for i, arg in enumerate(pos):
+        s = arg.arg + _outline_ann(arg.annotation)
+        if i >= pad:
+            s += " = " + _outline_unparse(defaults[i - pad])
+        parts.append(s)
+        if getattr(a, "posonlyargs", None) and i == len(a.posonlyargs) - 1:
+            parts.append("/")
+    if a.vararg is not None:
+        parts.append("*" + a.vararg.arg + _outline_ann(a.vararg.annotation))
+    elif a.kwonlyargs:
+        parts.append("*")
+    for arg, default in zip(a.kwonlyargs, a.kw_defaults):
+        s = arg.arg + _outline_ann(arg.annotation)
+        if default is not None:
+            s += " = " + _outline_unparse(default)
+        parts.append(s)
+    if a.kwarg is not None:
+        parts.append("**" + a.kwarg.arg + _outline_ann(a.kwarg.annotation))
+    return ", ".join(parts)
+
+
+def _outline_ann(annotation: Any) -> str:
+    if annotation is None:
+        return ""
+    return ": " + _outline_unparse(annotation)
+
+
+def _outline_returns(node: Any) -> str:
+    r = getattr(node, "returns", None)
+    return (" -> " + _outline_unparse(r)) if r is not None else ""
+
+
+def _outline_unparse(node: Any) -> str:
+    try:
+        return ast.unparse(node)
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
 def write_file(path: str, content: str) -> str:
     """写入文本文件（必要时创建父目录）。
 
@@ -412,13 +598,21 @@ def run_shell(command: str, cwd: str = "", timeout: int = 60) -> str:
 def write_function(name: str, code: str, overwrite: bool = True) -> str:
     """写出一个新的 function：把 python 代码存为 .openthree/functions/<name>.py。
 
-    写完后必须调用 reload_functions，新工具才会生效。
+    落盘时会先做一次**纯静态审计**（不执行代码）：语法、有没有可注册的公开函数、
+    是否覆盖了内置工具、有没有高危调用。通过后**必须**调用 reload_functions
+    才会生效，并**务必用 list_functions 确认它真的出现在工具清单里**——
+    文件写成功 ≠ 工具注册成功。
 
     文件里所有公开函数（不以 _ 开头）都会注册为工具。规范：
       * 写类型注解 —— 它会变成 JSON Schema
       * 写 docstring（Args 段写参数说明）—— 它会变成工具描述
       * 首个参数若命名为 kernel，会由运行期注入，模型看不到
       * 可 `from openthree import tool, KERNEL`
+      * 模块级变量是**暂存**而非长存：reload 会重载模块，别拿它当缓存
+        （要长存就用 KERNEL.state）
+
+    写完想更稳，可以再调 `verify_tool(name)`：它在子进程里真正 import 一次，
+    能提前发现「语法没错但一 import 就炸」的问题。
 
     Args:
         name: 文件名（不含 .py），也是这次演化的名字
@@ -434,28 +628,108 @@ def write_function(name: str, code: str, overwrite: bool = True) -> str:
     existed = path.exists()
     path.write_text(code, encoding="utf-8")
 
-    syntax_error = _syntax_error(code)
-    if syntax_error:
+    builtin_names = set(KERNEL.registry.builtins) if KERNEL.registry is not None else None
+    audit = _static_audit(code, builtin_names=builtin_names)
+    if audit["syntax_error"]:
         if KERNEL.recorder is not None:
             KERNEL.recorder.record(
                 "error", summary=f"写 function 语法错误: {path.name}",
-                data={"action": "write_function", "name": name, "error": syntax_error},
+                data={"action": "write_function", "name": name, "error": audit["syntax_error"]},
             )
         return (f"[错误] {path} 已写入，但语法检查未通过（尚未生效）。"
-                f"请修正后重新 write_function：\n{syntax_error}")
+                f"请修正后重新 write_function：\n{audit['syntax_error']}")
 
     if KERNEL.recorder is not None:
         KERNEL.recorder.record(
             "evolution",
             summary=f"{'改写' if existed else '新造'} function: {path.name}",
             data={"action": "write_function", "name": name, "file": str(path),
-                  "code": code, "overwrite": existed},
+                  "code": code, "overwrite": existed,
+                  "tools": audit["functions"], "shadows": audit["shadows"]},
         )
-    warning = _public_function_warning(code)
-    if warning:
-        return (f"[ok] 已写入 {path}\n⚠ {warning}"
-                f"\n下一步：调用 reload_functions 让它变成可用的工具。")
-    return f"[ok] 已写入 {path}\n下一步：调用 reload_functions 让它变成可用的工具。"
+
+    notes = _audit_notes(audit)
+    head = f"[ok] 已写入 {path}"
+    body = ("\n" + "\n".join(notes)) if notes else ""
+    return (f"{head}{body}"
+            f"\n下一步：reload_functions() 生效，然后 list_functions() **确认它真的在清单里**"
+            f"（或用 verify_tool('{name}') 先在子进程里验收 import 与签名）。")
+
+
+def verify_tool(name: str) -> str:
+    """在**子进程**里验收一个自造 function —— 先证明它能跑，再让它上岗。
+
+    与主进程隔离地真正 import 一次目标文件，然后按注册器**同一条构造路径**
+    （openthree.tool.build_tool）检查每个公开函数能不能被建成工具、签名长什么样。
+
+    为什么需要它：write_function 的静态审计只保证「语法没错」，而注册器用的是
+    exec_module —— 模块级 import 失败、顶层代码抛错、签名与 Schema 不合约（默认
+    参数取不到默认值就会 TypeError）都要等到 reload 才炸，而那时内核已被污染。
+    本工具把这个错误提前到 reload 之前，且**零污染**（子进程死掉不影响内核）。
+
+    Args:
+        name: 文件名（不含 .py），或任意 .py 路径
+    """
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    path = _resolve_function_path(ws, name)
+    if path is None:
+        try:
+            files = [p.name for p in ws.list_function_files()]
+        except Exception:  # noqa: BLE001
+            files = []
+        listing = "、".join(files) if files else "（空）"
+        return f"[错误] 找不到 {name}。.openthree/functions/ 下现有：{listing}"
+
+    env = dict(os.environ)
+    prev = env.get("PYTHONPATH", "")
+    # 让子进程无论如何都能 import 到 openthree（未安装、只在源码树里跑的场景）
+    pkg_parent = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join(
+        [x for x in (str(ws.root), pkg_parent, prev) if x]
+    )
+    code, out, err = _run_capture(
+        [sys.executable, "-c", _VERIFY_SCRIPT, str(path)],
+        work=str(ws.root), timeout=60, env=env,
+    )
+    if code is None:                       # 连进程都起不来
+        return f"[错误] 验收进程无法启动：{out or err}"
+
+    report = _parse_verify_report(out)
+    rel = _rel_to(ws.root, path)
+    if report is None:
+        detail = (err or out).strip()[:1500]
+        return (f"[错误] 验收输出无法解析（进程 exit={code}）。原始输出：\n{detail}\n"
+                f"这通常意味着它连 import 都过不去。")
+
+    if not report.get("ok"):
+        return (f"[错误] 验收未通过：{rel}\n  import 阶段失败：{report.get('error')}\n"
+                f"  → 常见原因：模块顶部 import 了不存在的包、顶层代码抛异常、"
+                f"或 `from openthree import ...` 写错。修正后再 write_function。")
+
+    tools = report.get("tools") or []
+    lines = [f"[ok] 验收通过：{rel}（已能 import）"]
+    if report.get("classes"):
+        lines.append(f"  （另有类 {', '.join(report['classes'])} —— 类不会被注册为工具）")
+    if tools:
+        lines.append(f"  reload 后会得到 {len(tools)} 个工具：")
+        for t in tools:
+            mark = "  ⚠ " if t.get("error") else "    - "
+            sig = t.get("signature") or t.get("name")
+            kernel_note = "（首参 kernel：运行期注入）" if t.get("needs_kernel") else ""
+            lines.append(f"{mark}`{sig}`{kernel_note}"
+                         + (f"  构造失败：{t['error']}" if t.get("error") else ""))
+    else:
+        lines.append("  ⚠ 没有任何可注册的公开函数（_ 开头的会被忽略）。")
+    for w in report.get("warnings") or []:
+        lines.append(f"  ⚠ {w}")
+    if err.strip():
+        lines.append(f"  （stderr：{err.strip()[:300]}）")
+    tainted = bool(tools) and all(t.get("error") for t in tools)
+    if not tainted:
+        lines.append("  下一步：reload_functions() 生效，再 list_functions() 确认清单。")
+    return "\n".join(lines)
 
 
 def reload_functions() -> str:
@@ -480,6 +754,7 @@ def reload_functions() -> str:
             lines.append(f"  - {Path(e.file).name}: {e.error}")
     else:
         lines.append("全部文件加载正常。")
+    lines.append("当前工具清单：" + ", ".join(reg.names()))
     if KERNEL.recorder is not None:
         KERNEL.recorder.record(
             "evolution",
@@ -537,19 +812,29 @@ def list_functions() -> str:
 
 
 def read_prompts() -> str:
-    """读取当前的系统提示词与用户提示词。"""
+    """读取当前的系统提示词与用户提示词。
+
+    开头先给出系统提示词自带的**章节索引** —— 自省时先看结构一眼看清全貌，
+    要用编辑器式操作改哪一段再决定；全文紧随其后。
+    """
     ws = KERNEL.workspace
     if ws is None:
         return "[错误] 内核未就绪"
-    return (f"# 系统提示词 ({ws.system_prompt_file})\n\n{ws.read_system_prompt()}\n\n"
+    sys_text = ws.read_system_prompt()
+    sections = ws.analysis_sections(sys_text)
+    idx = ("\n".join("- " + s for s in sections)) if sections else "（无章标题）"
+    return (f"# 系统提示词 ({ws.system_prompt_file})\n\n"
+            f"## 章节索引（{len(sections)} 节）\n{idx}\n\n"
+            f"## 全文\n\n{sys_text}\n\n"
             f"# 用户提示词 ({ws.user_prompt_file})\n\n{ws.read_user_prompt()}")
 
 
 def write_system_prompt(content: str) -> str:
     """改写系统提示词 —— 你对「我是谁、我该怎么做」的定义，下一轮即刻生效。
 
-    覆写前会自动把旧稿存进 `prompts/versions/`，因此改坏了可以用
-    `restore_system_prompt` 回退，不必怕失手。
+    覆写前会自动把旧稿存进 prompts/ 的历史目录，因此改坏了可以用
+    `restore_system_prompt` 回退，不必怕失手。想回看自己改过哪些版本，
+    用 `list_prompt_versions`（列清单）、`read_prompt_version("-5")`（回看最近 5 版）。
 
     Args:
         content: 完整的系统提示词 markdown
@@ -632,8 +917,92 @@ def list_prompt_versions() -> str:
         except OSError:
             size = 0
         rows.append(f"- {i}. `{p.name}`（{size}B）")
-    rows.append("\n用 restore_system_prompt(<序号或文件名>) 回退到某一版。")
+    rows.append("\n看某一版全文：`read_prompt_version(<序号>)`；"
+                "回看概览：`read_prompt_version(\"-5\")`；回退：`restore_system_prompt(<序号或文件名>)`。")
     return "\n".join(rows)
+
+
+def read_prompt_version(version: str = "1", chars: int = 6000) -> str:
+    """读回**你自己**的历史版本 —— 自省就是能看见「我从前把自己定义成什么样」。
+
+    每次 write_system_prompt 都会把旧稿自动存进 prompts/ 的历史目录，这里把它读回来。
+
+    两种用法：
+      * 传序号 / 文件名（如 "1"、`system-20261012-174900.md`）→ 完整读回那一版。
+      * 传负数（如 "-5"）→ 回看最近 5 版的**概览**（名字 / 存档时间 / 首行），
+        用来快速看清自己的提示词是怎么一步步长成现在这样的。
+
+    Args:
+        version: 版本序号（1 = 最新）/ 文件名 / 负数表示「回看最近 |N| 版概览」
+        chars: 单版最多显示多少字符（超出截断；完整内容可用 read_file 打开原文件）
+    """
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    versions = ws.list_prompt_versions()
+    raw = str(version if version is not None else "1").strip() or "1"
+
+    # 负数（或 "-N"）→ 概览模式：回看自己最近的几步（没有历史时也给一句话）
+    if raw.startswith("-") and raw[1:].isdigit():
+        n = max(1, int(raw[1:]))
+        if not versions:
+            return ("（还没有历史版本。每次 write_system_prompt 覆写前都会自动存一版，"
+                    "改一次自己的提示词就能在这里回看。）")
+        shown = versions[:n]
+        rows = [f"# 回看最近 {len(shown)} 个版本（共 {len(versions)} 版，新 → 旧）", ""]
+        for i, p in enumerate(shown, 1):
+            rows.append(f"{i}. `{p.name}`  （{_fmt_size(p)}）")
+            head = _version_headline(p)
+            if head:
+                rows.append(f"   {head}")
+        rows.append("")
+        rows.append("看某一版全文：read_prompt_version(\"<序号>\")；回退：restore_system_prompt(\"<序号>\")。")
+        return "\n".join(rows)
+
+    if not versions:
+        return ("（还没有历史版本。每次 write_system_prompt 覆写前都会自动存一版，"
+                "改一次自己的提示词就能在这里回看。）")
+    text = ws.read_prompt_version(raw)
+    if text is None:
+        return (f"[错误] 找不到版本：{version}。"
+                "用 list_prompt_versions 看有哪些，或 read_prompt_version(\"-5\") 回看概览。")
+    limit = max(200, int(chars or 6000))
+    body = text if len(text) <= limit else (
+        text[:limit] + f"\n... [已截断，共 {len(text)} 字符；完整内容见 {ws.versions_dir}/]")
+    return body
+
+
+def _fmt_size(p: Path) -> str:
+    try:
+        return f"{p.stat().st_size}B"
+    except OSError:
+        return "?B"
+
+
+def _version_headline(p: Path) -> str:
+    """取一个历史版本的「存档时间 + 首行」，用作概览。"""
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    stamp = ""
+    first = ""
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        if not stamp and s.startswith("<!--"):
+            stamp = s.strip("<!-> ").strip()
+            continue
+        if not first and not s.startswith("<!--"):
+            first = s
+            break
+    parts = []
+    if stamp:
+        parts.append(stamp)
+    if first:
+        parts.append(first[:120])
+    return " · ".join(parts)
 
 
 def restore_system_prompt(version: str) -> str:
@@ -821,7 +1190,6 @@ def _decode(data: Any) -> str:
 
 def _syntax_error(code: str) -> str:
     """返回语法错误描述；合法则返回空串。"""
-    import ast
     try:
         ast.parse(code)
     except SyntaxError as exc:
@@ -831,28 +1199,265 @@ def _syntax_error(code: str) -> str:
     return ""
 
 
-def _public_function_warning(code: str) -> str:
-    """语法合法但**没有一个公开函数**时给出提醒 —— 否则这是一次静默的失败。
+# 「高危调用」清单：只是**提醒**（很多合法的自造工具确实要起子进程），
+# 但值得让模型知道「你写的这行会动到系统」——写出来时就说清，胜过事后排查。
+_DANGEROUS_CALLS = frozenset({
+    "eval", "exec", "compile", "__import__",
+    "os.system", "os.popen", "os.remove", "os.unlink", "os.rmdir", "os.kill",
+    "os._exit", "shutil.rmtree", "subprocess.run", "subprocess.Popen",
+    "subprocess.call", "subprocess.check_output", "socket.socket", "ctypes.CDLL",
+})
+_DANGEROUS_MODULES = ("subprocess", "ctypes", "socket")
 
-    注册器只收本文件定义、且不以 `_` 开头的函数（类与 import 进来的都不算）。
-    若不提醒，模型会以为 reload 后会多出工具，结果一个也没有。
+
+def _static_audit(code: str, builtin_names: Optional[set] = None) -> Dict[str, Any]:
+    """对一份待落盘的 function 源码做**纯静态**体检（只解析、不执行）。
+
+    返回 dict：``syntax_error`` / ``functions``（可注册的公开函数名）/
+    ``all_functions`` / ``shadows``（覆盖了同名内置工具的公开函数）/
+    ``dangerous``（高危调用，字符串形式）/ ``has_all``（是否声明了 __all__）。
+
+    注册器最终会 ``exec_module``、并按「本文件定义 + 不由 _ 开头」收函数，
+    所以这里用**同一条规则**预先算一遍 —— 把「写错了」提前到写入那一刻。
     """
-    import ast
+    result: Dict[str, Any] = {
+        "syntax_error": "", "functions": [], "all_functions": [],
+        "shadows": [], "dangerous": [], "has_all": False,
+    }
     try:
         tree = ast.parse(code)
-    except Exception:  # noqa: BLE001
-        return ""            # 语法问题由 _syntax_error 负责
-    public = [n.name for n in tree.body
-              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-              and not n.name.startswith("_")]
-    if public:
+    except SyntaxError as exc:
+        result["syntax_error"] = f"{type(exc).__name__}: {exc.msg} (line {exc.lineno})"
+        return result
+    except Exception as exc:  # noqa: BLE001
+        result["syntax_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+    public: List[str] = []
+    all_names: List[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            all_names.append(node.name)
+            if not node.name.startswith("_"):
+                public.append(node.name)
+    result["functions"] = public
+    result["all_functions"] = all_names
+    if builtin_names:
+        result["shadows"] = sorted(n for n in public if n in builtin_names)
+
+    found: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        label = _call_label(node.func)
+        if label in _DANGEROUS_CALLS and label not in found:
+            found.append(label)
+    result["dangerous"] = found
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "__all__":
+                    result["has_all"] = True
+    return result
+
+
+def _call_label(func: ast.AST) -> str:
+    """把 ast 的调用目标还原成 `os.system` / `exec` 这样的字符串。"""
+    parts: List[str] = []
+    node: Any = func
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    else:
         return ""
-    names = [n.name for n in tree.body
-             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    return ".".join(reversed(parts))
+
+
+def _audit_notes(audit: Dict[str, Any]) -> List[str]:
+    """把静态审计结果翻译成给模型看的提示行（没有问题时返回空列表）。"""
+    notes: List[str] = []
+    if audit.get("functions"):
+        notes.append(f"可注册工具：{', '.join(audit['functions'])}")
+    else:
+        warn = _public_function_warning_from_audit(audit)
+        if warn:
+            notes.append("⚠ " + warn)
+    if audit.get("shadows"):
+        notes.append("⚠ 这些公开函数与**内置工具同名**，reload 后会覆盖内置："
+                     + ", ".join(audit["shadows"])
+                     + "。若非本意，请改名（覆盖内置会砍掉你自己的感知通道）。")
+    if audit.get("dangerous"):
+        notes.append("⚠ 检测到高危调用：" + ", ".join(audit["dangerous"])
+                     + "（确认这是你想要的；它们会动到系统）")
+    return notes
+
+
+def _public_function_warning_from_audit(audit: Dict[str, Any]) -> str:
+    if audit.get("syntax_error") or audit.get("functions"):
+        return ""
+    names = audit.get("all_functions") or []
     hint = ("（你定义了 " + ", ".join(f"`{n}`" for n in names)
             + "，但都以下划线开头，会被当作私有函数忽略）") if names else ""
     return ("这个文件里没有可注册的公开函数，reload 后不会出现任何新工具。"
             "请把要暴露给模型的函数改成不以 `_` 开头的顶层函数。" + hint)
+
+
+def _public_function_warning(code: str) -> str:
+    """语法合法但**没有一个公开函数**时给出提醒 —— 否则这是一次静默的失败。"""
+    return _public_function_warning_from_audit(_static_audit(code))
+
+
+# ---------------------------------------------------------------- 验收（子进程）
+
+# 验收脚本：以「文件路径」为 argv（子进程里 argv[0] 会被吃掉，路径必须显式传），
+# 用与注册器完全相同的 build_tool 构造工具，把结果以一行 JSON 吐回主进程。
+# 绝不 import openthree.builtins —— 避免把整个内核拖进子进程。
+_VERIFY_SCRIPT = r"""
+import sys, json, importlib.util, traceback
+
+def _load(path):
+    spec = importlib.util.spec_from_file_location("openthree_verify_probe", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["openthree_verify_probe"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+def _first_doc(obj):
+    d = getattr(obj, "__doc__", None) or ""
+    for line in d.strip().splitlines():
+        line = line.strip()
+        if line:
+            return line[:160]
+    return ""
+
+def main():
+    path = sys.argv[1]
+    rep = {"ok": False, "tools": [], "classes": [], "warnings": []}
+    try:
+        mod = _load(path)
+    except BaseException as e:
+        rep["error"] = f"{type(e).__name__}: {e}"
+        print("OPENTHREE_VERIFY_JSON=" + json.dumps(rep, ensure_ascii=False))
+        return
+    rep["ok"] = True
+    try:
+        from openthree.tool import build_tool
+    except BaseException as e:
+        rep["warnings"].append(f"无法 import openthree.tool（{type(e).__name__}: {e}）")
+        build_tool = None
+    import inspect
+    for nm in dir(mod):
+        if nm.startswith("_"):
+            continue
+        obj = getattr(mod, nm)
+        if isinstance(obj, type):
+            rep["classes"].append(nm)
+            continue
+        if not callable(obj):
+            continue
+        if getattr(obj, "__module__", None) != mod.__name__:
+            continue
+        item = {"name": nm, "signature": nm, "error": "", "brief": _first_doc(obj),
+                "needs_kernel": False}
+        try:
+            sig = inspect.signature(obj)
+            item["signature"] = str(sig)
+            if build_tool is not None:
+                t = build_tool(obj, origin="user", source_file=path)
+                item["needs_kernel"] = bool(t.needs_kernel)
+                item["signature"] = t.signature_hint()
+        except BaseException as e:
+            item["error"] = f"{type(e).__name__}: {e}"
+        rep["tools"].append(item)
+    print("OPENTHREE_VERIFY_JSON=" + json.dumps(rep, ensure_ascii=False))
+
+main()
+"""
+
+
+def _resolve_function_path(ws: Any, name: str) -> Optional[Path]:
+    """把「函数名」或「.py 路径」统一解析成一个存在的文件路径。"""
+    raw = str(name or "").strip().strip('"').strip("'")
+    if not raw:
+        return None
+    cand = Path(raw).expanduser()
+    tries: List[Path] = []
+    looks_like_path = cand.suffix == ".py" or "/" in raw or "\\" in raw
+    if looks_like_path:
+        for base in (Path.cwd(), ws.root, ws.functions_dir):
+            tries.append(cand if cand.is_absolute() else base / cand)
+    tries.append(ws.functions_dir / f"{Path(raw).stem}.py")
+    for p in tries:
+        try:
+            if p.exists() and p.is_file():
+                return p.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def _rel_to(root: Path, path: Path) -> str:
+    try:
+        return str(path.relative_to(root)).replace("\\", "/")
+    except ValueError:
+        return str(path)
+
+
+def _run_capture(cmd: List[str], work: str, timeout: int,
+                 env: Optional[Dict[str, str]] = None) -> tuple:
+    """跑一个短命子进程并把输出收干净；返回 (returncode|None, stdout, stderr)。
+
+    返回码为 None 表示**进程根本没起来**（可执行文件缺失等）。超时会被强杀，
+    绝不无限等待（与 run_shell 同一套原则，只是这里够简单，不必杀整棵树）。
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=work, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, "", f"{type(exc).__name__}: {exc}"
+    try:
+        out_b, err_b = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            out_b, err_b = proc.communicate(timeout=5)
+        except Exception:  # noqa: BLE001
+            out_b, err_b = b"", b""
+        return proc.returncode, _decode(out_b), _decode(err_b) + f"\n[验收超时 {timeout}s，已强杀]"
+    except Exception as exc:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        return proc.returncode, "", f"{type(exc).__name__}: {exc}"
+    return proc.returncode, _decode(out_b), _decode(err_b)
+
+
+_VERIFY_MARKER = "OPENTHREE_VERIFY_JSON="
+
+
+def _parse_verify_report(text: str) -> Optional[Dict[str, Any]]:
+    """从子进程 stdout 里取出验收 JSON（取最后一行标记，容错多余输出）。"""
+    if not text:
+        return None
+    for line in reversed(text.splitlines()):
+        idx = line.find(_VERIFY_MARKER)
+        if idx >= 0:
+            payload = line[idx + len(_VERIFY_MARKER):].strip()
+            try:
+                data = json.loads(payload)
+                return data if isinstance(data, dict) else None
+            except Exception:  # noqa: BLE001
+                return None
+    return None
 
 
 BUILTIN_FUNCTIONS: Dict[str, Any] = {
@@ -861,8 +1466,10 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "write_file": write_file,
     "list_dir": list_dir,
     "search_files": search_files,
+    "code_outline": code_outline,
     "run_shell": run_shell,
     "write_function": write_function,
+    "verify_tool": verify_tool,
     "reload_functions": reload_functions,
     "delete_function": delete_function,
     "list_functions": list_functions,
@@ -872,6 +1479,7 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "read_plan": read_plan,
     "write_plan": write_plan,
     "list_prompt_versions": list_prompt_versions,
+    "read_prompt_version": read_prompt_version,
     "restore_system_prompt": restore_system_prompt,
     "note": note,
     "remember": remember,
