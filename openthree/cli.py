@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("task", nargs="*", help="任务描述；留空则沿用 .openthree/prompts/user-prompts.md")
     p.add_argument("-C", "--dir", default=".", help="项目目录（.openthree 会建在这里），默认当前目录")
     p.add_argument("-m", "--model", default=None, help="覆盖模型名")
-    p.add_argument("-n", "--max-iterations", type=int, default=40, help="ReAct 最大步数，默认 40")
+    p.add_argument("-n", "--max-iterations", type=int, default=200, help="ReAct 最大步数，默认 200")
     p.add_argument("--append", action="store_true", help="把任务追加到 user-prompts.md 而不覆盖")
     p.add_argument("--init", action="store_true", help="只初始化 .openthree/ 工作区，不调模型")
     p.add_argument("--force-prompts", action="store_true", help="初始化时覆盖已有的提示词（危险）")

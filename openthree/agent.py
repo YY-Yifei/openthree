@@ -24,7 +24,7 @@ from .workspace import Workspace
 
 class Agent:
     def __init__(self, workspace: Workspace, registry: Registry, llm: LLM,
-                 recorder: Recorder, *, max_iterations: int = 40) -> None:
+                 recorder: Recorder, *, max_iterations: int = 200) -> None:
         self.ws = workspace
         self.reg = registry
         self.llm = llm

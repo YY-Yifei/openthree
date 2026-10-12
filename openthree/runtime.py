@@ -26,7 +26,7 @@ from .workspace import Workspace
 class Runtime:
     def __init__(self, project_dir: Optional[Path] = None, *,
                  model: Optional[str] = None,
-                 max_iterations: int = 40,
+                 max_iterations: int = 200,
                  force_prompts: bool = False,
                  quiet: bool = False) -> None:
         self.project_dir = Path(project_dir or Path.cwd()).resolve()
