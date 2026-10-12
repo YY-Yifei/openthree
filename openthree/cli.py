@@ -8,6 +8,9 @@
     openthree --inspect               看一眼自己当前的样子（不调模型）
     openthree --functions             列出所有工具
     openthree --serve                 起一个 HTTP 服务看报告（可选）
+
+跑长任务时终端不会沉默：每一步、每次模型调用、每次工具执行都有回声，
+等待超过 --heartbeat 秒还会打印心跳（默认 15s，设 0 关闭）。
 """
 from __future__ import annotations
 
@@ -33,7 +36,7 @@ def _print_banner() -> None:
     print("""
   openthree —— 三生万物
   道生一，一生二，二生三，三生万物
-""")
+""", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="历史累计字符数超此值自动折叠早期步骤，0 表示关闭，默认 120000")
     p.add_argument("--tool-result-limit", type=int, default=4000,
                    help="单个工具结果进入历史的字符上限，超出落盘，默认 4000")
+    p.add_argument("--heartbeat", type=float, default=15.0,
+                   help="长等待（模型/工具）期间每隔多少秒打印一次心跳，0 关闭，默认 15")
     p.add_argument("--append", action="store_true", help="把任务追加到 user-prompts.md 而不覆盖")
     p.add_argument("--init", action="store_true", help="只初始化 .openthree/ 工作区，不调模型")
     p.add_argument("--force-prompts", action="store_true", help="初始化时覆盖已有的提示词（危险）")
@@ -57,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inspect", action="store_true", help="看一眼自己当前的样子")
     p.add_argument("--functions", action="store_true", help="列出当前所有工具")
     p.add_argument("-i", "--interactive", action="store_true", help="交互模式，多轮对话")
-    p.add_argument("-q", "--quiet", action="store_true", help="安静模式")
+    p.add_argument("-q", "--quiet", action="store_true", help="安静模式（连进度回声也关掉）")
     p.add_argument("-V", "--version", action="version", version=f"openthree {__version__}")
     return p
 
@@ -75,6 +80,7 @@ def main(argv=None) -> int:
         quiet=args.quiet,
         context_budget_chars=args.context_budget,
         tool_result_limit=args.tool_result_limit,
+        heartbeat=args.heartbeat,
     )
 
     if args.init:

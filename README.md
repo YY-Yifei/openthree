@@ -1,47 +1,26 @@
 # openthree
 
-> **三生万物**
+> 道生一，一生二，二生三，三生万物。
 
-```
-道生一，一生二，二生三，三生万物。
-```
+一个**极简的 LLM Agent Harness**：`.openthree/functions/*.py` 里的每个 python 文件
+都会变成模型可以调用的工具；模型可以自己写新文件、改自己的提示词——
+**能力因此可以生长**。
 
-一个极简主义的 LLM Agent Harness。没有工作流引擎、没有插件市场、没有编排 DSL。
-只有模型本身，以及让它自己长出一切的三层结构。
-
----
-
-## 它是什么
-
-| | 是什么 | 在哪 |
-|---|---|---|
-| **道** | 模型本身。**唯一的智能来源** | 你的 LLM |
-| **一** | 系统提示词，模型的自我认知 | `.openthree/prompts/system-prompts.md` |
-| **二** | functions，模型的手 | `.openthree/functions/*.py` |
-| **三** | ReAct 循环：观 → 思 → 行 → 观 | runtime |
-| **万物** | 模型自己写出的新能力 | 又回到「二」 |
-
-极简到什么程度？
-
-- **写一个工具 = 写一个 python 函数。** 类型注解就是 JSON Schema，docstring 就是工具描述。
-- **注册工具 = 存一个 `.py` 文件。** 目录即注册表。
-- **不需要重启。** 模型调 `reload_functions`，新工具立即上手。
-- **提示词是文件，模型可以自己改。** 改完下一轮即刻生效——这是它的自省。
-
-## 三层内置律
-
-1. **道生一、一生二、二生三、三生万物** —— 一切能力从模型而来，从循环中长出万物。
-2. **`.openthree/functions/` 下的 python 文件会被注册为 functions。**
-3. **`.openthree/prompts/system-prompts.md` 是系统提示词，`.openthree/prompts/user-prompts.md` 是任务。**
+没有框架，没有 DSL，没有注册装饰器。**类型注解是 Schema，docstring 是描述，文件名是工具名。**
 
 ## 安装
 
 ```bash
-cd /path/to/openthree
-pip install -e .
+pip install openthree
+# 或从源码
+git clone <repo> && cd openthree && pip install -e .
 ```
 
-配置模型（任选一层即可，后者覆盖前者）：
+可选：`pip install json_repair`（模型返回非法 JSON 参数时自动修复）。
+
+## 配置
+
+优先级：**环境变量 < 用户级 < 项目级**。
 
 ```bash
 # 方式 1：环境变量
@@ -70,6 +49,29 @@ openthree --inspect                         # 看一眼自己当前的样子（�
 openthree --functions                       # 列出所有工具
 openthree --report                          # 重建 three-report.html
 ```
+
+**跑起来不会沉默。** 每一步、每次模型调用、每次工具执行都会在终端留下回声：
+
+```
+道生一  工作区 <你的项目>\.openthree
+一生二  16 个工具（内置 16 / 自造 0）
+二生三  ReAct 循环开始（上限 200 步，模型 deepseek-chat）
+       每 15s 打一次心跳，长任务不会看起来卡死
+
+[step 3/200]
+  · 思考中（deepseek-chat）…
+  · … 等待模型返回，已等待 30s          ← 心跳：证明它还活着，不是卡死了
+  · LLM 返回 (31.4s · in=20653 out=412)
+    说：内置工具里没有斐波那契，我造一个 function 给自己用。
+  · 调用 write_function(name=fib, code=(118 字符))
+  · ↳ write_function 完成 (0.0s · 输出 107 字符)
+
+三生万物 完成：4 步 / 4 工具调用 / 2 次演化
+报告 .openthree/three-report.html
+```
+
+- `--heartbeat N`：长等待（模型 / 工具）每隔多少秒打印一次心跳，`0` 关闭，默认 `15`。
+- `-q / --quiet`：连进度回声也关掉。
 
 ## 自我演化长什么样
 
@@ -109,6 +111,8 @@ openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已
   `tool_calls` 当成正常回复。
 - **`run_shell` 跨平台。** Windows 中文环境（GBK）下的输出不再乱码。
 - **`finish` 之后不再执行多余的调用。** 同批剩余 tool_calls 一律跳过。
+- **过程可观测。** 终端有 step / 思考 / 工具 / 心跳的实时回声，磁盘有完整日志——
+  「它现在在干什么」和「它曾经干过什么」都有答案。
 - **自查**：`write_function` 落盘前先做 AST 语法检查；工具重名会记入 `load_errors`；
   `compact_context` 的区间会先校验，折不动就如实告诉你，不会假报成功。
 
@@ -162,6 +166,7 @@ openthree/
 ├── prompt.py      上下文组装（一 + 运行期处境 + 三）
 ├── llm.py         极薄 LLM 客户端
 ├── agent.py       ReAct 循环
+├── progress.py    进度回声（纯展示层，终端不再沉默）
 ├── recorder.py    可观测：一切工作记录
 ├── report.py      three-report.html
 ├── runtime.py     装配
@@ -177,6 +182,7 @@ self_test.py       端到端自测（桩模型）
 - **目录即注册表。** 不引入注册代码、不引入装饰器参数、不引入配置文件。
 - **每轮重装上下文。** 自我修改要立刻生效，就不能缓存。
 - **记录先落盘再返回。** 进程被 kill 也不丢已发生的思考。
+- **进度成回声。** 展示层与决策层分开：Agent 不认识终端，Progress 不认识 ReAct。
 
 ## License
 

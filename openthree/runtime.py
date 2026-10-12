@@ -7,6 +7,11 @@
     二   registry reload，把 functions/*.py 变成工具
     三   agent 进入 ReAct 循环
     万物 模型自己写 function / 改提示词 → 下一轮生效 → 能力自生长
+
+可观测分两层：
+    * Recorder —— 落盘的真相（logs/、three-report.html），回答「发生过什么」。
+    * Progress —— 终端的回声（step / 思考 / 工具 / 心跳），回答「现在在干什么」。
+      后者是纯展示，CLI 不会因为模型思考而长时间沉默。
 """
 from __future__ import annotations
 
@@ -17,6 +22,7 @@ from .agent import Agent
 from .builtins import BUILTIN_FUNCTIONS
 from .kernel import KERNEL
 from .llm import LLM, LLMConfig, load_config
+from .progress import Progress
 from .recorder import Recorder
 from .registry import Registry
 from .report import write_report
@@ -30,12 +36,14 @@ class Runtime:
                  force_prompts: bool = False,
                  quiet: bool = False,
                  tool_result_limit: int = 4000,
-                 context_budget_chars: int = 120_000) -> None:
+                 context_budget_chars: int = 120_000,
+                 heartbeat: float = 15.0) -> None:
         self.project_dir = Path(project_dir or Path.cwd()).resolve()
         self.quiet = quiet
         self.max_iterations = max_iterations
         self.tool_result_limit = tool_result_limit
         self.context_budget_chars = context_budget_chars
+        self.heartbeat = heartbeat
 
         self.ws = Workspace(self.project_dir).init(force_prompts=force_prompts)
         self.config: LLMConfig = load_config(self.project_dir, model_override=model)
@@ -88,16 +96,22 @@ class Runtime:
                                  model=self.config.model)
         KERNEL.recorder = self.recorder
 
+        # 进度回声：CLI 上「还活着、在干什么」。quiet 时它什么都不说。
+        progress = Progress(heartbeat=self.heartbeat, enabled=not self.quiet)
+
         self.agent = Agent(self.ws, self.registry, self.llm, self.recorder,
                            max_iterations=self.max_iterations,
                            tool_result_limit=self.tool_result_limit,
-                           context_budget_chars=self.context_budget_chars)
+                           context_budget_chars=self.context_budget_chars,
+                           progress=progress)
         KERNEL.agent = self.agent
 
         self.say(f"道生一  工作区 {self.ws.dir}")
         self.say(f"一生二  {len(self.registry)} 个工具"
                  f"（内置 {len(self.registry.builtins)} / 自造 {len(self.registry.user_tools())}）")
         self.say(f"二生三  ReAct 循环开始（上限 {self.max_iterations} 步，模型 {self.config.model}）")
+        if self.heartbeat > 0 and not self.quiet:
+            self.say(f"       每 {self.heartbeat:g}s 打一次心跳，长任务不会看起来卡死")
 
         try:
             answer = self.agent.run()
@@ -112,6 +126,8 @@ class Runtime:
             if self.recorder:
                 self.recorder.record("error", summary=answer,
                                      data={"traceback": traceback.format_exc()[-4000:]})
+        finally:
+            progress.close()
 
         doc = self.recorder.finalize(answer=answer, status=status)
 

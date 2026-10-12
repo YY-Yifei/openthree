@@ -15,6 +15,8 @@
     不再指望模型自觉调用 compact_context（见 REVIEW.md P0-3.1）。
   * finish 提交后，同批剩余 tool_calls 一律跳过（见 REVIEW.md P2-3.11）。
   * compact_context 的区间先在现有 history 上校验，如实返回成功/失败（P1-3.8）。
+  * 进度回声：把「正在做什么」通过注入的 progress 打出去，CLI 不再长时间沉默。
+    这是纯展示层，不参与决策；不注入时走 NullProgress，行为与从前一致。
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .kernel import KERNEL
 from .llm import LLM
+from .progress import NullProgress
 from .prompt import build_messages
 from .recorder import Recorder
 from .registry import Registry
@@ -40,7 +43,8 @@ class Agent:
     def __init__(self, workspace: Workspace, registry: Registry, llm: LLM,
                  recorder: Recorder, *, max_iterations: int = 200,
                  tool_result_limit: int = TOOL_RESULT_LIMIT,
-                 context_budget_chars: int = DEFAULT_CONTEXT_BUDGET_CHARS) -> None:
+                 context_budget_chars: int = DEFAULT_CONTEXT_BUDGET_CHARS,
+                 progress: Optional[Any] = None) -> None:
         self.ws = workspace
         self.reg = registry
         self.llm = llm
@@ -48,6 +52,8 @@ class Agent:
         self.max_iterations = max_iterations
         self.tool_result_limit = max(0, int(tool_result_limit))
         self.context_budget_chars = int(context_budget_chars)
+        # 进度回声：只用来「说话」，不参与任何判断
+        self.progress = progress if progress is not None else NullProgress()
 
         self.history: List[Dict[str, Any]] = []
         self.answer: Optional[str] = None
@@ -61,6 +67,7 @@ class Agent:
         while not self.finished and self.iteration < self.max_iterations:
             self.iteration += 1
             self.rec.begin_step()
+            self.progress.step(self.iteration, self.max_iterations)
             self._apply_pending_compactions()
             self._auto_compact()
 
@@ -74,8 +81,11 @@ class Agent:
                 last_action=self.last_action,
                 fold_range=fold_range,
             )
+            self.progress.llm_start(self.llm.config.model)
             result = self.llm.chat(messages, tools=self.reg.schemas() or None)
             msg = result.get("message") or {}
+            self.progress.llm_done(result.get("elapsed_ms", 0.0), result.get("usage"),
+                                   result.get("error"))
             self.rec.record_llm(result.get("raw_request", {}), result.get("raw_response", {}),
                                 result.get("elapsed_ms", 0.0), result.get("usage"),
                                 result.get("error"))
@@ -90,6 +100,7 @@ class Agent:
 
             # 记下模型说的话（reasoning 也是工作记录的一部分）
             if content:
+                self.progress.thought(content)
                 self.rec.record("note", summary=content[:200],
                                 data={"thought": content, "phase": "assistant"})
 
@@ -132,13 +143,16 @@ class Agent:
                 })
                 self.rec.record("note", summary=f"跳过 {name}（已 finish）",
                                 data={"name": name, "call_id": call_id})
+                self.progress.note(f"跳过 {name}（已 finish）")
                 summaries.append(f"{name} → （跳过：已 finish）")
                 continue
 
             args = _parse_args(raw_args)
             started = time.time()
+            self.progress.tool_start(name, args)
             output, error = self._execute(name, args)
             elapsed = (time.time() - started) * 1000
+            self.progress.tool_done(name, elapsed, len(output or ""), error)
 
             self.rec.record(
                 "tool",
@@ -277,6 +291,7 @@ class Agent:
         self.rec.record("note", summary=f"上下文超预算（约 {base} 字符），自动折叠 step {lo}-{hi}",
                         data={"action": "auto_compact", "start": lo, "end": hi,
                               "budget": self.context_budget_chars, "before_chars": base})
+        self.progress.note(f"上下文超预算（约 {base} 字符），自动折叠 step {lo}-{hi}")
         self.compact(lo, hi, "（自动折叠：早期步骤，完整过程见 logs/ 与 steps/）")
         self._apply_pending_compactions()
 
