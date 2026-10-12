@@ -2,7 +2,8 @@
 
     openthree "你的任务"              就地初始化 .openthree/ 并开始 ReAct
     openthree                         沿用 .openthree/prompts/user-prompts.md 继续
-    openthree -i                      交互模式
+    openthree -i                      交互模式（多轮对话）
+    openthree --turns 8               多轮时保留最近 8 轮对话（默认 4，0 关闭）
     openthree --init                  只初始化工作区
     openthree --report                只重建 three-report.html
     openthree --inspect               看一眼自己当前的样子（不调模型）
@@ -62,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inspect", action="store_true", help="看一眼自己当前的样子")
     p.add_argument("--functions", action="store_true", help="列出当前所有工具")
     p.add_argument("-i", "--interactive", action="store_true", help="交互模式，多轮对话")
+    p.add_argument("--turns", type=int, default=4,
+                   help="多轮对话保留最近多少轮（播种进上下文），0 关闭，-1 全部，默认 4")
     p.add_argument("-q", "--quiet", action="store_true", help="安静模式（连进度回声也关掉）")
     p.add_argument("-V", "--version", action="version", version=f"openthree {__version__}")
     return p
@@ -81,6 +84,7 @@ def main(argv=None) -> int:
         context_budget_chars=args.context_budget,
         tool_result_limit=args.tool_result_limit,
         heartbeat=args.heartbeat,
+        prior_turns=args.turns,
     )
 
     if args.init:
@@ -127,7 +131,12 @@ def main(argv=None) -> int:
 def _interactive(rt: Runtime, first_task: str, append: bool) -> int:
     _force_utf8()
     _print_banner()
-    print(f"交互模式。工作区 {rt.ws.dir}    输入 :q 退出，:r 重建报告，:i 自省\n")
+    memory = ("关闭" if rt.prior_turns == 0
+              else "全部" if (rt.prior_turns or 0) < 0
+              else f"最近 {rt.prior_turns if rt.prior_turns is not None else 4} 轮")
+    print(f"交互模式。工作区 {rt.ws.dir}")
+    print(f"输入 :q 退出，:r 重建报告，:i 自省；跨轮记忆：{memory}")
+    print(f"对话原文：{rt.ws.transcript_file}\n")
     pending = first_task
     while True:
         try:

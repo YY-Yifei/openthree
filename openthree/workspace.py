@@ -5,7 +5,10 @@
     .openthree/
         prompts/
             system-prompts.md   # 一：系统提示词
-            user-prompts.md     # 用户输入落在这里，模型可自行改写
+            user-prompts.md     # 当前任务，用户输入落在这里，模型可自行改写
+            history/
+                transcript.jsonl  # 多轮对话档案（append-only，每轮一行 JSON，
+                                  #  用户的完整原始输入永不丢失、无损往返）
         functions/              # 二：python 文件即 function
         logs/                   # 可观测：模型全部工作记录
             session-*.json
@@ -17,12 +20,13 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 DIRNAME = ".openthree"
 
@@ -126,6 +130,21 @@ class Workspace:
         return self.prompts_dir / "user-prompts.md"
 
     @property
+    def transcript_dir(self) -> Path:
+        return self.prompts_dir / "history"
+
+    @property
+    def transcript_file(self) -> Path:
+        """多轮对话档案：append-only JSONL，用户的完整原始输入都在这里。
+
+        用 JSONL 而不是 markdown：用户输入里可能包含任何字符（包括 `### 用户`、
+        `## 2020-01-01T00:00:00` 这种看起来像分隔符的行），JSON 编码保证
+        一字不差地存回去、读回来。这也与本项目其它追加速流
+        （memory.jsonl / events.jsonl）保持一致。
+        """
+        return self.transcript_dir / "transcript.jsonl"
+
+    @property
     def report_file(self) -> Path:
         return self.dir / "three-report.html"
 
@@ -140,6 +159,7 @@ class Workspace:
             self.steps_dir,
             self.events_dir,
             self.memory_dir,
+            self.transcript_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -161,6 +181,7 @@ class Workspace:
             "| 路径 | 含义 |\n|---|---|\n"
             "| `prompts/system-prompts.md` | 一：系统提示词，模型可自改 |\n"
             "| `prompts/user-prompts.md` | 当前任务，用户输入落在这里 |\n"
+            "| `prompts/history/transcript.jsonl` | 多轮对话档案：用户的完整原始输入 |\n"
             "| `functions/*.py` | 二：python 文件即 function |\n"
             "| `logs/` | 模型全部工作记录（json / jsonl 分门别类） |\n"
             "| `memory/` | 模型自省产生的长期记忆 |\n"
@@ -202,10 +223,70 @@ class Workspace:
         block = f"# 当前任务\n\n{text}\n\n_提交于 {datetime.now().isoformat(timespec='seconds')}_\n"
         if append:
             old = self.read_user_prompt()
+            if "等待用户输入" in old:      # 种子占位符不算历史任务
+                old = ""
             if old.strip():
                 block = old.rstrip() + "\n\n---\n\n" + block
         self.write_user_prompt(block)
         return self.user_prompt_file
+
+    # ---------- 多轮对话档案 ----------
+    def append_turn(self, user_input: str, answer: str = "", *,
+                    ts: Optional[datetime] = None) -> Path:
+        """**追加**一轮对话到 transcript.jsonl（append-only，永不覆写）。
+
+        用户的原始输入按原样落盘 —— 多轮对话里「用户说过什么」不会被任何
+        后续轮次冲掉，这正是 user-prompts.md（单槽位、会被覆写）做不到的事。
+        每轮一行 JSON，对任意字符都无损（换行在 JSON 里被转义）。
+
+        Args:
+            user_input: 用户的完整原始输入
+            answer: 本轮 openthree 给出的结论
+            ts: 轮次时间戳，默认现在
+        """
+        self.transcript_dir.mkdir(parents=True, exist_ok=True)
+        doc = {
+            "ts": (ts or datetime.now()).isoformat(timespec="seconds"),
+            "user": user_input if isinstance(user_input, str) else str(user_input),
+            "answer": answer if isinstance(answer, str) else str(answer or ""),
+        }
+        line = json.dumps(doc, ensure_ascii=False)
+        with self.transcript_file.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        return self.transcript_file
+
+    def read_turns(self, n: int = 4) -> List[Dict[str, str]]:
+        """读回最近 n 轮对话（旧 → 新），用于播种进下一轮的上下文。
+
+        Args:
+            n: 轮数。n == 0 返回空列表（关闭记忆）；n < 0 返回全部轮次。
+        """
+        if n == 0:
+            return []
+        path = self.transcript_file
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:  # noqa: BLE001
+            return []
+        turns: List[Dict[str, str]] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                doc = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue          # 半截行 / 损坏行：跳过，不影响其余轮次
+            if not isinstance(doc, dict):
+                continue
+            turns.append({
+                "ts": str(doc.get("ts") or ""),
+                "user": str(doc.get("user") or ""),
+                "answer": str(doc.get("answer") or ""),
+            })
+        return turns if n < 0 else turns[-n:]
 
     # ---------- functions 扫描 ----------
     def list_function_files(self) -> list[Path]:

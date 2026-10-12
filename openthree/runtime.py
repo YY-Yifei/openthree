@@ -12,6 +12,13 @@
     * Recorder —— 落盘的真相（logs/、three-report.html），回答「发生过什么」。
     * Progress —— 终端的回声（step / 思考 / 工具 / 心跳），回答「现在在干什么」。
       后者是纯展示，CLI 不会因为模型思考而长时间沉默。
+
+多轮对话：
+    每轮都是新 Agent，历史不继承。为了让模型跨轮记得住用户说过什么，
+    run() 收尾把本轮 (user, answer) 追加进 append-only 的
+    .openthree/prompts/history/transcript.md，开跑前再读回最近 N 轮
+    播种进 Agent.history（`--turns N`，默认 4，0 关闭，-1 全部）。
+    用户的**完整原始输入**因此永不丢失。
 """
 from __future__ import annotations
 
@@ -37,13 +44,16 @@ class Runtime:
                  quiet: bool = False,
                  tool_result_limit: int = 4000,
                  context_budget_chars: int = 120_000,
-                 heartbeat: float = 15.0) -> None:
+                 heartbeat: float = 15.0,
+                 prior_turns: Optional[int] = None) -> None:
         self.project_dir = Path(project_dir or Path.cwd()).resolve()
         self.quiet = quiet
         self.max_iterations = max_iterations
         self.tool_result_limit = tool_result_limit
         self.context_budget_chars = context_budget_chars
         self.heartbeat = heartbeat
+        # 多轮对话：播种最近多少轮（None = Agent 默认 4，0 = 关闭，负数 = 全部）
+        self.prior_turns = None if prior_turns is None else int(prior_turns)
 
         self.ws = Workspace(self.project_dir).init(force_prompts=force_prompts)
         self.config: LLMConfig = load_config(self.project_dir, model_override=model)
@@ -56,6 +66,7 @@ class Runtime:
         self.llm = LLM(self.config)
         self.recorder: Optional[Recorder] = None
         self.agent: Optional[Agent] = None
+        self.user_input: str = ""
 
         # 挂进内核，用户写的 function 就能拿到
         KERNEL.workspace = self.ws
@@ -91,8 +102,12 @@ class Runtime:
         if user_input is not None:
             self.ws.submit(user_input, append=append)
 
+        # 本轮用户输入：显式传入就用原文（完整保留），否则沿用 user-prompts.md
+        self.user_input = (user_input if user_input is not None
+                           else self.ws.read_user_prompt())
+
         self.recorder = Recorder(self.ws, session_id=session_id,
-                                 user_input=self.ws.read_user_prompt(),
+                                 user_input=self.user_input,
                                  model=self.config.model)
         KERNEL.recorder = self.recorder
 
@@ -103,6 +118,7 @@ class Runtime:
                            max_iterations=self.max_iterations,
                            tool_result_limit=self.tool_result_limit,
                            context_budget_chars=self.context_budget_chars,
+                           prior_turns=self.prior_turns,
                            progress=progress)
         KERNEL.agent = self.agent
 
@@ -131,6 +147,15 @@ class Runtime:
 
         doc = self.recorder.finalize(answer=answer, status=status)
 
+        # 本轮对话入档：用户的完整原始输入 append 进 transcript，永不丢失。
+        # 下一轮开跑时会被读回，播种进新 Agent 的历史（跨轮记忆）。
+        try:
+            self.ws.append_turn(self.user_input, answer)
+        except Exception as exc:  # noqa: BLE001
+            if self.recorder:
+                self.recorder.record("error", summary="对话记录写入失败",
+                                     data={"error": f"{type(exc).__name__}: {exc}"})
+
         # 每轮结束都刷新报告 —— 可观测是常态，不是事后
         try:
             write_report(self.ws)
@@ -157,6 +182,8 @@ class Runtime:
             f"工作区   {self.ws.dir}",
             f"系统提示词 {self.ws.system_prompt_file} ({len(self.ws.read_system_prompt())} 字符)",
             f"任务     {self.ws.user_prompt_file}",
+            f"对话档案 {self.ws.transcript_file}"
+            f"（{len(self.ws.read_turns(-1))} 轮）",
             f"工具     {len(reg)} 个（内置 {len(reg.builtins)} / 自造 {len(reg.user_tools())}）",
         ]
         for t in reg.user_tools():
