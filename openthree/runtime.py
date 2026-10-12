@@ -77,7 +77,7 @@ class Runtime:
                 "  1) 环境变量 OPENAI_API_KEY / OPENAI_BASE_URL / OPENTHREE_MODEL\n"
                 "  2) ~/.openthree/config.yaml  或  <项目>/.openthree/config.yaml\n\n"
                 "  llm:\n    api_key: sk-xxx\n    base_url: https://api.deepseek.com\n"
-                "    model: deepseek-chat\n"
+                "    model: deepseek-v4.1-flash\n"
             )
         return None
 

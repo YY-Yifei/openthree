@@ -195,7 +195,7 @@ def main() -> int:
     isolated = load_config(empty)
     check("配置不从 local-llm 兜底（api_key 为空）",
           isolated.api_key == "", f"api_key={isolated.api_key!r} local-llm存在={local-llm_cfg.exists()}")
-    check("配置 model 回落内置默认", isolated.model == "deepseek-chat", isolated.model)
+    check("配置 model 回落内置默认", isolated.model == "deepseek-v4.1-flash", isolated.model)
     check("配置不可用（usable=False）", isolated.usable is False)
     check("llm.py 不含 local-llm 字样",
           "local-llm" not in (ROOT / "openthree" / "llm.py").read_text(encoding="utf-8"))

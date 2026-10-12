@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover
     yaml = None
 
 
-DEFAULT_MODEL = "deepseek-chat"
+DEFAULT_MODEL = "deepseek-v4.1-flash"
 
 
 @dataclass

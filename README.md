@@ -26,7 +26,7 @@ git clone <repo> && cd openthree && pip install -e .
 # 方式 1：环境变量
 export OPENAI_API_KEY=sk-xxx
 export OPENAI_BASE_URL=https://api.deepseek.com
-export OPENTHREE_MODEL=deepseek-chat
+export OPENTHREE_MODEL=deepseek-v4.1-flash
 ```
 
 ```yaml
@@ -34,7 +34,7 @@ export OPENTHREE_MODEL=deepseek-chat
 llm:
   api_key: sk-xxx
   base_url: https://api.deepseek.com
-  model: deepseek-chat
+  model: deepseek-v4.1-flash
   max_tokens: 8192
 ```
 
@@ -55,11 +55,11 @@ openthree --report                          # 重建 three-report.html
 ```
 道生一  工作区 <你的项目>\.openthree
 一生二  16 个工具（内置 16 / 自造 0）
-二生三  ReAct 循环开始（上限 200 步，模型 deepseek-chat）
+二生三  ReAct 循环开始（上限 200 步，模型 deepseek-v4.1-flash）
        每 15s 打一次心跳，长任务不会看起来卡死
 
 [step 3/200]
-  · 思考中（deepseek-chat）…
+  · 思考中（deepseek-v4.1-flash）…
   · … 等待模型返回，已等待 30s          ← 心跳：证明它还活着，不是卡死了
   · LLM 返回 (31.4s · in=20653 out=412)
     说：内置工具里没有斐波那契，我造一个 function 给自己用。
