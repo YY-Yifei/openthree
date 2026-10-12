@@ -45,6 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-C", "--dir", default=".", help="项目目录（.openthree 会建在这里），默认当前目录")
     p.add_argument("-m", "--model", default=None, help="覆盖模型名")
     p.add_argument("-n", "--max-iterations", type=int, default=200, help="ReAct 最大步数，默认 200")
+    p.add_argument("--context-budget", type=int, default=120000,
+                   help="历史累计字符数超此值自动折叠早期步骤，0 表示关闭，默认 120000")
+    p.add_argument("--tool-result-limit", type=int, default=4000,
+                   help="单个工具结果进入历史的字符上限，超出落盘，默认 4000")
     p.add_argument("--append", action="store_true", help="把任务追加到 user-prompts.md 而不覆盖")
     p.add_argument("--init", action="store_true", help="只初始化 .openthree/ 工作区，不调模型")
     p.add_argument("--force-prompts", action="store_true", help="初始化时覆盖已有的提示词（危险）")
@@ -69,6 +73,8 @@ def main(argv=None) -> int:
         max_iterations=args.max_iterations,
         force_prompts=args.force_prompts,
         quiet=args.quiet,
+        context_budget_chars=args.context_budget,
+        tool_result_limit=args.tool_result_limit,
     )
 
     if args.init:
@@ -94,7 +100,7 @@ def main(argv=None) -> int:
     if args.interactive:
         return _interactive(rt, task, args.append)
 
-    if not task and not rt.ws.user_prompt_file.exists():
+    if not task and not rt.ws.has_task():
         _print_banner()
         print("没有任务。用法：openthree \"你的任务\"   或   openthree -i")
         return 1

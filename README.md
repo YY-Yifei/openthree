@@ -95,6 +95,40 @@ def pdf_to_text(path: str, pages: str = "") -> str:
 然后 `reload_functions()` —— 从下一刻起，`pdf_to_text` 就在它的工具列表里了。
 整个过程不需要人类改一行代码。
 
+## 长任务的健壮性
+
+openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已经能扛住长任务：
+
+- **工具结果有界入上下文。** 单个工具输出超过 4000 字符时，完整内容落盘到
+  `logs/tool-output/`，history 只保留预览 + 文件路径。同一份大输出不会被每轮重发。
+- **上下文自动折叠。** 历史累计超过预算（默认 12 万字符）时，runtime 自动把最老的
+  若干 step 折叠成摘要——不依赖模型自觉调用 `compact_context`。
+- **LLM 调用会重试。** 网络抖动 / 限流 / 5xx 自动指数退避重试（默认 3 次）；
+  参数错误、鉴权失败立即返回，不空转。
+- **输出被截断会被告知。** `finish_reason=length` 时如实报错，而不是把半截
+  `tool_calls` 当成正常回复。
+- **`run_shell` 跨平台。** Windows 中文环境（GBK）下的输出不再乱码。
+- **`finish` 之后不再执行多余的调用。** 同批剩余 tool_calls 一律跳过。
+- **自查**：`write_function` 落盘前先做 AST 语法检查；工具重名会记入 `load_errors`；
+  `compact_context` 的区间会先校验，折不动就如实告诉你，不会假报成功。
+
+```bash
+python self_test.py          # 端到端自测（桩模型，不联网）
+python -m pytest             # 单元测试
+```
+
+## 安全声明
+
+**openthree 会以你的用户权限执行模型决定的一切操作。** 这不是夸张：
+
+- `run_shell` 用 `shell=True` 执行任意命令，无沙箱、无审批；
+- `read_file` / `write_file` 可读写进程权限范围内的任意路径；
+- `write_function` 写出的 `.py` 会被直接导入执行；
+- `write_system_prompt` 可以改写它自己的提示词。
+
+因此：**在受信任的环境中运行，别把 `api_key` 交给你不信任的模型与任务。**
+安全边界目前是「你的操作系统」，不是 openthree。
+
 ## 可观测
 
 模型的一切工作都被记录，分门别类：
@@ -132,6 +166,8 @@ openthree/
 ├── report.py      three-report.html
 ├── runtime.py     装配
 └── cli.py         命令行
+tests/             pytest 单元测试
+self_test.py       端到端自测（桩模型）
 ```
 
 ## 设计上的取舍

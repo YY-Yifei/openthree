@@ -188,6 +188,13 @@ class Workspace:
         self.user_prompt_file.parent.mkdir(parents=True, exist_ok=True)
         self.user_prompt_file.write_text(text, encoding="utf-8")
 
+    def has_task(self) -> bool:
+        """当前是否有真实任务（而不是种子文案）。"""
+        text = self.read_user_prompt().strip()
+        if not text:
+            return False
+        return "等待用户输入" not in text
+
     # ---------- 用户输入 ----------
     def submit(self, user_input: str, append: bool = False) -> Path:
         """把用户输入写进 user-prompts.md，开启 ReAct。"""

@@ -12,13 +12,19 @@ license = { text = "MIT" }
 dependencies = [
     "openai>=1.0",
     "PyYAML>=6.0",
+    # 模型返回非法 JSON 参数时用于修复；生产环境也需要，故列入主依赖
+    "json_repair>=0.30",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "json_repair>=0.30"]
+dev = ["pytest>=7"]
 
 [project.scripts]
 openthree = "openthree.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["openthree*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

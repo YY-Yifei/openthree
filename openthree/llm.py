@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,7 @@ class LLMConfig:
     max_tokens: int = 8192
     temperature: float = 0.3
     timeout: float = 600.0
+    retries: int = 3
     extra: Dict[str, Any] = field(default_factory=dict)
     source: str = "env"
 
@@ -96,6 +98,7 @@ def load_config(project_dir: Optional[Path] = None, model_override: Optional[str
         max_tokens=int(merged.get("max_tokens", 8192) or 8192),
         temperature=float(merged.get("temperature", 0.3) or 0.3),
         timeout=float(merged.get("timeout", 600) or 600),
+        retries=int(merged.get("retries", 3) or 0),
         extra=dict(merged.get("extra") or {}),
     )
     return cfg
@@ -141,18 +144,25 @@ class LLM:
             payload["tool_choice"] = tool_choice
 
         started = time.time()
-        try:
-            resp = client.chat.completions.create(**payload)
-        except Exception as exc:  # noqa: BLE001
-            elapsed = (time.time() - started) * 1000
-            return {
-                "message": {"role": "assistant", "content": f"[LLM 调用失败] {type(exc).__name__}: {exc}"},
-                "usage": {},
-                "elapsed_ms": elapsed,
-                "raw_request": _redact(payload),
-                "raw_response": {"error": f"{type(exc).__name__}: {exc}"},
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+        attempts = max(0, self.config.retries) + 1
+        resp = None
+        for attempt in range(attempts):
+            try:
+                resp = client.chat.completions.create(**payload)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt == attempts - 1 or not _retryable(exc):
+                    elapsed = (time.time() - started) * 1000
+                    return {
+                        "message": {"role": "assistant",
+                                    "content": f"[LLM 调用失败] {type(exc).__name__}: {exc}"},
+                        "usage": {},
+                        "elapsed_ms": elapsed,
+                        "raw_request": _redact(payload),
+                        "raw_response": {"error": f"{type(exc).__name__}: {exc}"},
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                time.sleep(_backoff(attempt))
         elapsed = (time.time() - started) * 1000
 
         try:
@@ -163,15 +173,43 @@ class LLM:
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         usage = data.get("usage") or {}
+        finish_reason = choice.get("finish_reason")
+
+        # 上下文被 max_tokens 截断：tool_calls 极可能是不完整的非法 JSON，
+        # 直接交给模型续写会得到半截参数。这里如实反馈，让 agent 知道要重来。
+        error = None
+        if finish_reason == "length":
+            error = (f"模型输出因 max_tokens={self.config.max_tokens} 被截断"
+                     f"（finish_reason=length）")
+
         return {
             "message": message,
             "usage": usage,
             "elapsed_ms": elapsed,
             "raw_request": _redact(payload),
             "raw_response": data,
-            "error": None,
-            "finish_reason": choice.get("finish_reason"),
+            "error": error,
+            "finish_reason": finish_reason,
         }
+
+
+_RETRYABLE_MARKERS = (
+    "timeout", "timedout", "connection", "connect", "ratelimit", "rate_limit",
+    "internalserver", "servererror", "serviceunavailable", "apiconnection",
+    "temporarily", "502", "503", "504",
+)
+
+
+def _retryable(exc: BaseException) -> bool:
+    """网络抖动 / 限流 / 5xx 才重试；参数错误、鉴权失败等立刻返回。"""
+    name = type(exc).__name__.lower()
+    text = f"{name} {exc}".lower()
+    return any(m in text for m in _RETRYABLE_MARKERS)
+
+
+def _backoff(attempt: int) -> float:
+    """指数退避 + 抖动，避免惊群。"""
+    return min(30.0, (2 ** attempt)) + random.uniform(0, 0.5)
 
 
 def _redact(payload: Dict[str, Any]) -> Dict[str, Any]:

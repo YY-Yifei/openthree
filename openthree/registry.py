@@ -125,6 +125,14 @@ class Registry:
                     LoadError(file=str(path), error=f"签名解析失败 {attr_name}: {exc}")
                 )
                 continue
+            prev = self.tools.get(t.name)
+            if prev is not None:
+                # 同名后者覆盖前者：记录下来供自省（否则模型会以为新工具没有生效）
+                self.load_errors.append(LoadError(
+                    file=str(path),
+                    error=(f"工具名冲突：{t.name} 覆盖了已有的"
+                           f"{prev.origin} 工具（{Path(prev.source_file).name if prev.source_file else '内置'}）"),
+                ))
             self.tools[t.name] = t
             count += 1
 

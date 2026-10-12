@@ -25,6 +25,7 @@ RUNTIME_TEMPLATE = """\
 - 模型：{model}
 - 可用工具：{tool_count} 个（内置 {builtin_count} / 自造 {user_count}）
 - 本轮已是第 {iteration} 步（上限 {max_iterations}）
+- 当前可折叠的 step 范围：{fold_range}（compact_context 只能用这个范围）
 
 # 你的工具（二）
 
@@ -47,7 +48,8 @@ RUNTIME_TEMPLATE = """\
 
 
 def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: int,
-                        max_iterations: int, last_action: str = "") -> str:
+                        max_iterations: int, last_action: str = "",
+                        fold_range: str = "") -> str:
     evolution = _recent_evolution(ws, limit=10)
     builtin = [t for t in reg.tools.values() if t.origin == "builtin"]
     user = [t for t in reg.tools.values() if t.origin == "user"]
@@ -61,6 +63,7 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         user_count=len(user),
         max_iterations=max_iterations,
         iteration=iteration,
+        fold_range=fold_range or "（暂无）",
         digest=reg.digest(),
         last_action=last_action or "（这是第一步）",
         evolution=evolution,
@@ -89,11 +92,12 @@ def _recent_evolution(ws: Workspace, limit: int = 10) -> str:
 
 def build_messages(ws: Workspace, reg: Registry, history: List[Dict[str, Any]], *,
                    model: str, iteration: int, max_iterations: int,
-                   last_action: str = "") -> List[Dict[str, Any]]:
+                   last_action: str = "", fold_range: str = "") -> List[Dict[str, Any]]:
     """组装完整 messages。system = 一 + 运行期三；history 是模型自己走过的路。"""
     system_prompt = ws.read_system_prompt().strip()
     runtime = build_runtime_block(ws, reg, model=model, iteration=iteration,
-                                  max_iterations=max_iterations, last_action=last_action)
+                                  max_iterations=max_iterations, last_action=last_action,
+                                  fold_range=fold_range)
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": f"{system_prompt}\n\n{runtime}"}
     ]

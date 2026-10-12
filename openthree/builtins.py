@@ -113,15 +113,14 @@ def run_shell(command: str, cwd: str = "", timeout: int = 60) -> str:
     work = cwd or str(Path.cwd())
     try:
         proc = subprocess.run(
-            command, shell=True, cwd=work, capture_output=True,
-            text=True, timeout=timeout, encoding="utf-8", errors="replace",
+            command, shell=True, cwd=work, capture_output=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         return f"[错误] 命令超时（{timeout}s）: {command}"
     except Exception as exc:  # noqa: BLE001
         return f"[错误] 执行失败: {type(exc).__name__}: {exc}"
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
+    out = _decode(proc.stdout).strip()
+    err = _decode(proc.stderr).strip()
     parts = [f"$ {command}", f"exit={proc.returncode}"]
     if out:
         parts.append("--- stdout ---\n" + out[:20000])
@@ -157,6 +156,16 @@ def write_function(name: str, code: str, overwrite: bool = True) -> str:
         return f"[错误] {path.name} 已存在（overwrite=false）"
     existed = path.exists()
     path.write_text(code, encoding="utf-8")
+
+    syntax_error = _syntax_error(code)
+    if syntax_error:
+        if KERNEL.recorder is not None:
+            KERNEL.recorder.record(
+                "error", summary=f"写 function 语法错误: {path.name}",
+                data={"action": "write_function", "name": name, "error": syntax_error},
+            )
+        return (f"[错误] {path} 已写入，但语法检查未通过（尚未生效）。"
+                f"请修正后重新 write_function：\n{syntax_error}")
 
     if KERNEL.recorder is not None:
         KERNEL.recorder.record(
@@ -335,14 +344,17 @@ def compact_context(start: int, end: int, summary: str) -> str:
         end: 结束步骤号（含）
         summary: 摘要，必须保留关键事实、数值、结论与未完成任务
     """
+    ok, msg = False, "[错误] 内核未就绪"
     if KERNEL.agent is not None:
-        KERNEL.agent.compact(start, end, summary)
+        ok, msg = KERNEL.agent.compact(start, end, summary)
     if KERNEL.recorder is not None:
-        KERNEL.recorder.record("evolution",
-                               summary=f"压缩上下文 step {start}-{end}",
-                               data={"action": "compact_context", "start": start,
-                                     "end": end, "summary": summary})
-    return f"[ok] 已折叠 step {start}-{end}，下一轮生效。"
+        KERNEL.recorder.record(
+            "evolution" if ok else "error",
+            summary=(f"压缩上下文 step {start}-{end}" if ok else msg[:200]),
+            data={"action": "compact_context", "start": start, "end": end,
+                  "summary": summary, "ok": ok},
+        )
+    return msg
 
 
 # ---------------------------------------------------------------- 收尾
@@ -365,6 +377,53 @@ def get_time() -> str:
     """获取当前时间。"""
     from datetime import datetime
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------- 内部辅助
+
+
+def _candidate_encodings() -> List[str]:
+    """依次尝试的解码方案：utf-8 优先，再用系统首选（Windows 下多为 GBK）。"""
+    encs = ["utf-8"]
+    try:
+        import locale
+        pref = locale.getpreferredencoding(False)
+        if pref and pref.lower() not in ("utf-8", "utf8"):
+            encs.append(pref)
+    except Exception:  # noqa: BLE001
+        pass
+    if sys.platform == "win32":
+        for e in ("gbk", "cp936"):
+            if e not in encs:
+                encs.append(e)
+    encs.append("latin-1")   # 最后兜底，不会报错
+    return encs
+
+
+def _decode(data: Any) -> str:
+    """将子进程输出（bytes）按候选编码逐级解码，bad case 不会丢字。"""
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    for enc in _candidate_encodings():
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _syntax_error(code: str) -> str:
+    """返回语法错误描述；合法则返回空串。"""
+    import ast
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        return f"{type(exc).__name__}: {exc.msg} (line {exc.lineno})"
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+    return ""
 
 
 BUILTIN_FUNCTIONS: Dict[str, Any] = {

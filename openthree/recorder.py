@@ -29,6 +29,11 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
 
 
+# session json 落盘节流（避免每条事件全量重写，O(n^2) 写放大）
+FLUSH_EVERY = 5        # 满 N 条事件至少刷一次
+FLUSH_INTERVAL = 2.0   # 至少间隔多少秒
+
+
 def _jsonable(obj: Any) -> Any:
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
@@ -50,9 +55,11 @@ class Event:
     data: Dict[str, Any] = field(default_factory=dict)
     step: int = 0
     elapsed_ms: Optional[float] = None
+    session: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        d = {"seq": self.seq, "ts": self.ts, "step": self.step, "kind": self.kind,
+        d = {"seq": self.seq, "session": self.session, "ts": self.ts,
+             "step": self.step, "kind": self.kind,
              "summary": self.summary, "data": self.data}
         if self.elapsed_ms is not None:
             d["elapsed_ms"] = round(self.elapsed_ms, 1)
@@ -77,6 +84,9 @@ class Recorder:
         self._llm_count = 0
         self._final_answer: Optional[str] = None
         self._lock = threading.Lock()
+        self._dirty = False
+        self._flush_since = 0
+        self._last_flush = time.time()
 
         self.ws.logs_dir.mkdir(parents=True, exist_ok=True)
         (self.ws.logs_dir / "llm").mkdir(parents=True, exist_ok=True)
@@ -108,8 +118,19 @@ class Recorder:
         try:
             self.session_file.write_text(
                 json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._dirty = False
+            self._flush_since = 0
+            self._last_flush = time.time()
         except Exception:  # noqa: BLE001
             pass
+
+    def _maybe_flush(self, force: bool = False) -> None:
+        """按条数/时间节流落盘；force 时立刻写。进程被 kill 仍只丢最近几条事件。"""
+        if not self._dirty:
+            return
+        if (force or self._flush_since >= FLUSH_EVERY
+                or (time.time() - self._last_flush) >= FLUSH_INTERVAL):
+            self._flush_session()
 
     # ---------- 步 ----------
     def begin_step(self, thought: str = "") -> int:
@@ -131,6 +152,7 @@ class Recorder:
         self.steps.append(step_obj)
         path = self.ws.steps_dir / f"step-{self._step:04d}.json"
         path.write_text(json.dumps(step_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._flush_session()
 
     # ---------- 记录 ----------
     def record(self, kind: str, summary: str = "", data: Optional[Dict[str, Any]] = None,
@@ -138,14 +160,17 @@ class Recorder:
         with self._lock:
             self._seq += 1
             ev = Event(seq=self._seq, ts=_now(), kind=kind, summary=summary,
-                       data=_jsonable(data or {}), step=self._step, elapsed_ms=elapsed_ms)
+                       data=_jsonable(data or {}), step=self._step,
+                       elapsed_ms=elapsed_ms, session=self.session_id)
             self.events.append(ev)
             self._step_buf.append(ev)
             self._append_line(self.events_file, ev.to_dict())
             if kind == "evolution":
                 self._append_line(self.evolution_file, ev.to_dict())
-        # 增量投影：即使进程随后被 kill，磁盘上也有最新状态
-        self._flush_session()
+            self._dirty = True
+            self._flush_since += 1
+        # 增量投影：按条数/时间节流落盘，避免每条事件全量重写
+        self._maybe_flush()
         return ev
 
     def record_llm(self, request: Dict[str, Any], response: Dict[str, Any],
@@ -188,6 +213,8 @@ class Recorder:
         self._close_step()
         self.ended_at = _now()
         self._final_answer = answer
+        self._dirty = True
+        self._maybe_flush(force=True)
         self._flush_session(final=(status == "done"))
         return {
             "session_id": self.session_id,

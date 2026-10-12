@@ -28,10 +28,14 @@ class Runtime:
                  model: Optional[str] = None,
                  max_iterations: int = 200,
                  force_prompts: bool = False,
-                 quiet: bool = False) -> None:
+                 quiet: bool = False,
+                 tool_result_limit: int = 4000,
+                 context_budget_chars: int = 120_000) -> None:
         self.project_dir = Path(project_dir or Path.cwd()).resolve()
         self.quiet = quiet
         self.max_iterations = max_iterations
+        self.tool_result_limit = tool_result_limit
+        self.context_budget_chars = context_budget_chars
 
         self.ws = Workspace(self.project_dir).init(force_prompts=force_prompts)
         self.config: LLMConfig = load_config(self.project_dir, model_override=model)
@@ -85,7 +89,9 @@ class Runtime:
         KERNEL.recorder = self.recorder
 
         self.agent = Agent(self.ws, self.registry, self.llm, self.recorder,
-                           max_iterations=self.max_iterations)
+                           max_iterations=self.max_iterations,
+                           tool_result_limit=self.tool_result_limit,
+                           context_budget_chars=self.context_budget_chars)
         KERNEL.agent = self.agent
 
         self.say(f"道生一  工作区 {self.ws.dir}")
@@ -112,8 +118,10 @@ class Runtime:
         # 每轮结束都刷新报告 —— 可观测是常态，不是事后
         try:
             write_report(self.ws)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            if self.recorder:
+                self.recorder.record("error", summary="报告生成失败",
+                                     data={"error": f"{type(exc).__name__}: {exc}"})
 
         stats = doc["stats"]
         self.say(f"三生万物 完成：{stats['steps']} 步 / {stats['tool_calls']} 工具调用 "
