@@ -384,8 +384,10 @@ class Runtime:
             f"{len(self.ws.list_prompt_versions())} 份）",
             f"对话档案 {self.ws.transcript_file}"
             f"（{len(self.ws.read_turns(-1))} 轮，只增不改；--resume 可续读）",
+            f"长期记忆 {self.ws.memory_file}"
+            f"（{self.ws.count_memory()} 条，每轮注入最近几条；recall_memory 可检索）",
             f"会话     {'进行中' if self._session_active else '无'}"
-            f"（记忆 {self.turns if self.turns >= 0 else '全部'} 轮；"
+            f"（会话内记忆 {self.turns if self.turns >= 0 else '全部'} 轮；"
             "单次任务不读盘，-i / --auto 才逐轮累积）",
             f"工具     {len(reg)} 个（内置 {len(reg.builtins)} / 自造 {len(reg.user_tools())}）",
             f"上下文   窗口 {_fmt_tokens(self.context_window_tokens)} token"

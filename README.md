@@ -230,7 +230,7 @@ python self_test.py          # 端到端自测（桩模型，不联网）
 python -m pytest             # 单元测试
 ```
 
-## 记忆：会话之内跨轮，磁盘之上只读不写
+## 会话记忆：跨轮可见，退出即忘
 
 ```bash
 openthree -i            # 开一个会话；会话内的轮次互相可见
@@ -264,6 +264,37 @@ openthree --resume 4    # 或：显式把档案里最近 4 轮读回，作为会
   - **`-i` / `--auto N`**：各开一个进程内会话，逐轮累积、跨轮可见。
   - **`--resume N`**：唯一的读盘入口，显式把档案里最近 N 轮载入为会话起点。
   - `--turns N` 控制会话内播种多少轮：默认 4，`0` 关闭（回到纯单轮），`-1` 全部。
+
+## 检索与长期记忆：让模型「找得到、记得住」
+
+前一条讲的是**会话内**的轮次记忆（进程内、退出即忘）。这一条讲**跨会话**的两种持久能力：
+
+**检索（`search_files`）—— 感知带宽。** 内置的 grep：给出「文件:行号: 内容」，
+自动跳过 `.git` / `node_modules` / `__pycache__` / `logs` 等噪声目录，跳过二进制与
+超大文件；而 `.openthree` 里的 `functions/`、`prompts/`、`memory/` **照样能搜**
+（那正是 agent 最该翻的地方）。模型不必再硬读整份文件，而是
+**先 grep 定位 → 再 `read_file(offset=行号)` 精读**。
+
+```python
+search_files("def handle_", path="src", glob="*.py", regex=True, ignore_case=True)
+# src/app.py:42: def handle_request(req):
+# src/worker.py:17: def handle_task(task):
+```
+
+**长期记忆（`remember` 写 / `recall_memory` 读）。** `.openthree/memory/memory.jsonl`
+是 append-only 的经验笔记：`remember` 写一条，跨会话、跨上下文折叠都还在。
+**最近的记忆每一轮都会自动注入 system 的「你的长期记忆」一节**，要翻更旧的用
+`recall_memory(query=...)` 检索（或直接 `search_files` 搜这个 jsonl）。
+注入有预算护栏（单条截到 300 字符、整节至多 2000 字符），记忆只是提示，不会挤爆上下文。
+
+```bash
+# 模型侧（在 ReAct 循环里自己调用）：
+remember("这个项目的测试要用 python -m pytest，别用 pwd", tags="test,坑")
+recall_memory(query="pytest")     # → 把写下的经验读回来
+```
+
+设计上这是补上「能力可生长」闭环里断掉的一环：**写下的经验，只有被读回才有价值。**
+记忆与检索都不含任何硬编码智能——它们只是给模型的手，怎么用由模型决定。
 
 ## 安全声明
 
@@ -308,7 +339,7 @@ openthree/
 ├── workspace.py   .openthree/ 的读写与初始化
 ├── tool.py        函数 → Tool（类型注解 + docstring → JSON Schema）
 ├── registry.py    扫描 functions/*.py → 工具注册表
-├── builtins.py    种子 functions（看世界 / 改自己 / 收尾）
+├── builtins.py    种子 functions（看世界 / 改自己 / 记忆 / 收尾）
 ├── prompt.py      上下文组装（一 + 运行期处境 + 三）
 ├── llm.py         极薄 LLM 客户端
 ├── agent.py       ReAct 循环

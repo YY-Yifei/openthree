@@ -4,6 +4,7 @@
 「二」=  .openthree/functions/*.py  → 工具清单        （能力，模型可自造）
 「三」=  运行期事实：工作目录、时间、演化史、上次结果  （处境，模型该知道）
          + .openthree/prompts/plan.md                 （计划，模型自己维护的待办）
+         + .openthree/memory/memory.jsonl             （长期记忆，跨会话可回看）
          + .openthree/prompts/user-prompts.md        （任务，模型可自改）
 
 整个 run() 每一轮都重新组装，所以模型的自我修改下一轮立即生效。
@@ -16,6 +17,12 @@ from typing import Any, Dict, List, Optional
 
 from .registry import Registry
 from .workspace import Workspace
+
+# 运行期注入「最近长期记忆」的字符预算上限 —— 记忆是提示，不是正文，
+# 不能让它把上下文挤爆（尤其是模型自己写了很长记忆之后）。
+MEMORY_INJECT_LIMIT_CHARS = 2000
+MEMORY_INJECT_MAX_ITEMS = 8
+
 
 RUNTIME_TEMPLATE = """\
 # 你的处境（运行期自动组装）
@@ -35,6 +42,10 @@ RUNTIME_TEMPLATE = """\
 # 你的计划（长任务的待办）
 
 {plan}
+
+# 你的长期记忆（跨会话）
+
+{memory}
 
 # 你上次的行动
 
@@ -71,10 +82,49 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         fold_range=fold_range or "（暂无）",
         digest=reg.digest(),
         plan=_plan_block(ws),
+        memory=_memory_block(ws),
         last_action=last_action or "（这是第一步）",
         evolution=evolution,
         user_prompt=ws.read_user_prompt().strip() or "（空）",
     )
+
+
+def _memory_block(ws: Workspace) -> str:
+    """把最近的长期记忆摆到模型眼前 —— 让「写下的经验」真的能被读回。
+
+    `remember` 把经验 append 进 memory/memory.jsonl，但如果没有这一块，
+    模型自己永远看不到它：长期记忆就退化成只写不读的摆设。这里取最近
+    MEMORY_INJECT_MAX_ITEMS 条、并在 MEMORY_INJECT_LIMIT_CHARS 字符处截断，
+    保证它只是「提示」而不是把上下文挤爆的正文。要更细就调用 recall_memory。
+    """
+    try:
+        entries = ws.read_memory(limit=MEMORY_INJECT_MAX_ITEMS)
+    except Exception:  # noqa: BLE001
+        return "（记忆读取失败）"
+    total = 0
+    try:
+        total = ws.count_memory()
+    except Exception:  # noqa: BLE001
+        total = len(entries)
+    if not entries:
+        return "（还没有长期记忆。值得跨会话记住的结论用 remember 写下。）"
+    rows: List[str] = []
+    used = 0
+    shown = 0
+    per_item = 300      # 单条记忆在上下文里的展示上限（完整内容可在 memory.jsonl / recall_memory 看）
+    for e in entries:
+        content = e["content"].strip().replace("\n", " ")
+        if len(content) > per_item:
+            content = content[:per_item] + "…"
+        tags = e.get("tags") or []
+        line = "- " + content + (f"  [{'，'.join(tags)}]" if tags else "")
+        if shown > 0 and used + len(line) > MEMORY_INJECT_LIMIT_CHARS:
+            break
+        rows.append(line)
+        used += len(line)
+        shown += 1
+    head = f"（共 {total} 条，这里显示最近 {shown} 条；找旧的用 recall_memory(query=...)）"
+    return head + "\n" + "\n".join(rows)
 
 
 def _plan_block(ws: Workspace) -> str:

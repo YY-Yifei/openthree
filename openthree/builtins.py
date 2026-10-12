@@ -2,11 +2,12 @@
 
 它们少而必需，且**每一个都在为自我演化铺路**：
 
-    看世界      read_file / list_dir / view_image / write_file / run_shell
+    看世界      read_file / list_dir / search_files / view_image / write_file / run_shell
     改自己      write_function / reload_functions / delete_function
     改提示词    read_prompts / write_system_prompt / write_user_prompt
     长任务      read_plan / write_plan（待办清单）
                 list_prompt_versions / restore_system_prompt（提示词回滚）
+    管记忆      remember（写下）/ recall_memory（读回）
     管上下文    compact_context / note
     收尾        finish
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -55,7 +57,7 @@ def read_file(path: str, offset: int = 0, limit: int = 2000) -> str:
     Args:
         path: 文件路径（绝对路径，或相对当前工作目录）
         offset: 起始行号（从 0 开始）
-        limit: 最多读取行数
+        limit: 最多读取行数；<= 0 表示读到文件末尾
     """
     p = Path(path).expanduser()
     if not p.is_absolute():
@@ -65,10 +67,19 @@ def read_file(path: str, offset: int = 0, limit: int = 2000) -> str:
     if p.is_dir():
         return f"[错误] 这是一个目录，请用 list_dir: {p}"
     try:
+        offset = int(offset)
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 2000
+    offset = max(0, offset)      # 负数行号无意义，夹到 0
+    try:
         lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception as exc:  # noqa: BLE001
         return f"[错误] 读取失败: {type(exc).__name__}: {exc}"
-    chunk = lines[offset: offset + limit] if limit else lines[offset:]
+    chunk = lines[offset: offset + limit] if limit > 0 else lines[offset:]
     body = "\n".join(f"{i + offset + 1}\t{ln}" for i, ln in enumerate(chunk))
     head = f"# {p} （共 {len(lines)} 行，显示 {offset + 1}-{offset + len(chunk)}）\n"
     return head + body
@@ -80,7 +91,7 @@ def list_dir(path: str = ".", show_hidden: bool = False, max_items: int = 200) -
     Args:
         path: 目录路径，默认当前目录
         show_hidden: 是否显示以点开头的隐藏项
-        max_items: 最多显示条目数
+        max_items: 最多显示条目数（至少 1）
     """
     p = Path(path).expanduser()
     if not p.is_absolute():
@@ -89,6 +100,11 @@ def list_dir(path: str = ".", show_hidden: bool = False, max_items: int = 200) -
         return f"[错误] 目录不存在: {p}"
     if not p.is_dir():
         return f"[错误] 不是目录: {p}"
+    try:
+        max_items = int(max_items)
+    except (TypeError, ValueError):
+        max_items = 200
+    max_items = max(1, min(max_items, 100_000))
     rows: List[str] = []
     entries = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
     for e in entries:
@@ -106,6 +122,151 @@ def list_dir(path: str = ".", show_hidden: bool = False, max_items: int = 200) -
             rows.append("  ...")
             break
     return f"# {p}\n" + ("\n".join(rows) if rows else "  （空）")
+
+
+# 检索时跳过的目录：版本库 / 缓存 / 依赖 —— 真正的搜索几乎从不关心它们。
+_SEARCH_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".idea", ".vscode",
+    ".cache", ".next", "dist", "build", ".eggs",
+})
+# 以点开头、但**值得搜**的目录：agent 自己的 .openthree（functions/prompts/memory
+# 正是最该被检索的地方），以及 CI / 编辑器配置。
+_SEARCH_ALLOW_DOT = frozenset({
+    ".openthree", ".github", ".gitlab", ".circleci", ".claude", ".cursor",
+})
+_SEARCH_MAX_FILE_BYTES = 2_000_000   # 单文件超过此大小不逐行搜（防止拖死循环）
+_SEARCH_MAX_FILES = 20_000           # 单次检索最多扫描这么多文件
+_SEARCH_MAX_LINE_CHARS = 400         # 命中行过长时只保留前 400 字符
+# .openthree 下属于「运行时churn」的子目录：日志与资产每次运行都变、体量大，
+# 纯属噪声。functions / prompts / memory 不在此列 —— 它们才是该被搜的。
+_SEARCH_SKIP_WS_SUBDIRS = frozenset({"logs", "assets"})
+
+
+def _should_prune_dir(parent: Path, name: str) -> bool:
+    """给定「父目录 + 子目录名」，判断检索时是否该跳过它。"""
+    if name in _SEARCH_SKIP_DIRS:
+        return True
+    if parent.name == ".openthree" and name in _SEARCH_SKIP_WS_SUBDIRS:
+        return True
+    return name.startswith(".") and name not in _SEARCH_ALLOW_DOT
+
+
+def _iter_search_files(root: Path, glob_pat: str):
+    """遍历待检索的文件；跳过噪声目录、按 glob 过滤、带上限。"""
+    import fnmatch
+    if root.is_file():
+        yield root
+        return
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        dirnames[:] = sorted(d for d in dirnames if not _should_prune_dir(here, d))
+        for fname in sorted(filenames):
+            if fname.startswith("."):
+                continue
+            if glob_pat and not fnmatch.fnmatch(fname, glob_pat):
+                continue
+            scanned += 1
+            if scanned > _SEARCH_MAX_FILES:
+                return
+            yield here / fname
+
+
+def _looks_binary(path: Path) -> bool:
+    """按前 4KB 里有没有 NUL 字节判断二进制（简单、够用）。"""
+    try:
+        with path.open("rb") as f:
+            chunk = f.read(4096)
+    except Exception:  # noqa: BLE001
+        return True
+    return b"\x00" in chunk
+
+
+def search_files(pattern: str, path: str = ".", glob: str = "",
+                 regex: bool = False, ignore_case: bool = False,
+                 max_results: int = 100, context: int = 0) -> str:
+    """在文件里检索文本（grep 式），返回「文件:行号: 内容」清单 —— 这是你的感知带宽。
+
+    比「读整份文件」精准得多：先 search_files 定位，再 read_file(offset=行号) 精读。
+    `glob` 可按文件名过滤（如 `*.py`）；`regex=true` 时 pattern 按正则解释。
+    自动跳过 .git / node_modules / __pycache__ / logs 等噪声，跳过二进制与超大文件；
+    `.openthree` 下的 functions / prompts / memory 仍会被搜到（那正是最该翻的地方）。
+
+    Args:
+        pattern: 要找的文本（regex=true 时为正则）
+        path: 检索起点：文件或目录，默认当前目录
+        glob: 只搜匹配此通配符的文件名，如 *.py / test_*.py
+        regex: pattern 是否按正则解释，默认 false（纯文本子串）
+        ignore_case: 是否忽略大小写，默认 false
+        max_results: 最多返回多少条命中，默认 100
+        context: 每条命中额外显示前后各几行，默认 0
+    """
+    src = (path or ".").strip() or "."
+    root = Path(src).expanduser()
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    if not root.exists():
+        return f"[错误] 路径不存在: {root}"
+    if not (pattern if isinstance(pattern, str) else ""):
+        return "[错误] pattern 为空，请给出要检索的文本"
+    pattern = str(pattern)
+
+    max_results = max(1, min(int(max_results or 100), 1000))
+    context = max(0, min(int(context or 0), 5))
+
+    if regex:
+        try:
+            rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+        except re.error as exc:
+            return f"[错误] 正则非法: {exc}"
+        def hit(line: str) -> bool:
+            return rx.search(line) is not None
+    else:
+        needle = pattern.lower() if ignore_case else pattern
+        def hit(line: str) -> bool:
+            return needle in (line.lower() if ignore_case else line)
+
+    matches: List[str] = []
+    hits = 0
+    scanned = 0
+    truncated = False
+    for fp in _iter_search_files(root, (glob or "").strip()):
+        try:
+            if fp.stat().st_size > _SEARCH_MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+        if _looks_binary(fp):
+            continue
+        scanned += 1
+        try:
+            lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:  # noqa: BLE001
+            continue
+        for i, line in enumerate(lines):
+            if not hit(line):
+                continue
+            hits += 1
+            if len(matches) >= max_results:
+                truncated = True
+                break
+            matches.append(f"{fp}:{i + 1}: {line.strip()[:_SEARCH_MAX_LINE_CHARS]}")
+            for j in range(max(0, i - context), min(len(lines), i + context + 1)):
+                if j == i:
+                    continue
+                matches.append(f"{fp}:{j + 1}- {lines[j].strip()[:_SEARCH_MAX_LINE_CHARS]}")
+        if truncated:
+            break
+
+    head = (f"# 检索 {pattern!r} 于 {root}（命中 {hits} 处"
+            f"{'+' if truncated else ''} / 扫描 {scanned} 个文件）")
+    if not matches:
+        return head + "\n（无命中）"
+    body = "\n".join(matches)
+    if truncated:
+        body += f"\n... [已达 max_results={max_results}，仅显示前 {len(matches)} 条；请缩小范围或提高 max_results]"
+    return head + "\n" + body
 
 
 def write_file(path: str, content: str) -> str:
@@ -290,6 +451,10 @@ def write_function(name: str, code: str, overwrite: bool = True) -> str:
             data={"action": "write_function", "name": name, "file": str(path),
                   "code": code, "overwrite": existed},
         )
+    warning = _public_function_warning(code)
+    if warning:
+        return (f"[ok] 已写入 {path}\n⚠ {warning}"
+                f"\n下一步：调用 reload_functions 让它变成可用的工具。")
     return f"[ok] 已写入 {path}\n下一步：调用 reload_functions 让它变成可用的工具。"
 
 
@@ -532,13 +697,48 @@ def remember(content: str, tags: str = "") -> str:
     ws.memory_dir.mkdir(parents=True, exist_ok=True)
     entry = {"ts": datetime.now().isoformat(timespec="seconds"), "content": content,
              "tags": _split_tags(tags)}
-    path = ws.memory_dir / "memory.jsonl"
+    path = ws.memory_file
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     if KERNEL.recorder is not None:
         KERNEL.recorder.record("evolution", summary=f"写入记忆：{content[:60]}",
                                data={"action": "remember", "entry": entry})
     return "[ok] 已记住。"
+
+
+def recall_memory(query: str = "", limit: int = 20) -> str:
+    """检索你自己的长期记忆（`.openthree/memory/memory.jsonl`）—— 把写下的经验读回来。
+
+    `remember` 只负责写下；这条才是读回。跨会话、跨上下文折叠都还在。
+    不传 query 就是「最近 limit 条」；传了就在 content 与 tags 里做不区分
+    大小写的子串匹配。想找得更细（跨文件）可用 search_files 直接搜 memory 目录。
+
+    Args:
+        query: 关键词；空 = 不过滤，返回最近的
+        limit: 最多返回多少条（从最近的往回取），默认 20
+    """
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    try:
+        n = int(limit) if limit else 20
+    except (TypeError, ValueError):
+        n = 20
+    n = max(1, min(n, 200))
+    total = ws.count_memory()
+    entries = ws.read_memory(limit=n, query=query)
+    label = f"（最近 {len(entries)}/{total} 条）" if not query \
+        else f"（匹配 {len(entries)}/{total} 条）"
+    if not entries:
+        return (f"# 长期记忆 {label}\n（空 —— 还没有记忆。"
+                + ("没匹配到，换个关键词，或不传 query 看最近几条。）" if query
+                   else "值得记住的结论可用 remember 写下。）"))
+    lines = [f"# 长期记忆 {label}"]
+    for e in entries:
+        tags = ("  [" + ", ".join(e["tags"]) + "]") if e.get("tags") else ""
+        ts = f"{e['ts']} " if e.get("ts") else ""
+        lines.append(f"- {ts}{e['content']}{tags}")
+    return "\n".join(lines)
 
 
 def compact_context(start: int, end: int, summary: str) -> str:
@@ -631,11 +831,36 @@ def _syntax_error(code: str) -> str:
     return ""
 
 
+def _public_function_warning(code: str) -> str:
+    """语法合法但**没有一个公开函数**时给出提醒 —— 否则这是一次静默的失败。
+
+    注册器只收本文件定义、且不以 `_` 开头的函数（类与 import 进来的都不算）。
+    若不提醒，模型会以为 reload 后会多出工具，结果一个也没有。
+    """
+    import ast
+    try:
+        tree = ast.parse(code)
+    except Exception:  # noqa: BLE001
+        return ""            # 语法问题由 _syntax_error 负责
+    public = [n.name for n in tree.body
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and not n.name.startswith("_")]
+    if public:
+        return ""
+    names = [n.name for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    hint = ("（你定义了 " + ", ".join(f"`{n}`" for n in names)
+            + "，但都以下划线开头，会被当作私有函数忽略）") if names else ""
+    return ("这个文件里没有可注册的公开函数，reload 后不会出现任何新工具。"
+            "请把要暴露给模型的函数改成不以 `_` 开头的顶层函数。" + hint)
+
+
 BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "view_image": view_image,
     "read_file": read_file,
     "write_file": write_file,
     "list_dir": list_dir,
+    "search_files": search_files,
     "run_shell": run_shell,
     "write_function": write_function,
     "reload_functions": reload_functions,
@@ -650,6 +875,7 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "restore_system_prompt": restore_system_prompt,
     "note": note,
     "remember": remember,
+    "recall_memory": recall_memory,
     "compact_context": compact_context,
     "finish": finish,
     "get_time": get_time,

@@ -192,16 +192,8 @@ def _load_evolution(ws: Workspace) -> List[Dict[str, Any]]:
 
 
 def _load_memory(ws: Workspace) -> List[Dict[str, Any]]:
-    path = ws.memory_dir / "memory.jsonl"
-    if not path.exists():
-        return []
-    out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            out.append(json.loads(line))
-        except Exception:  # noqa: BLE001
-            continue
-    return out
+    """长期记忆条目 —— 复用 workspace 的唯一解析口径（容错、跳过坏行）。"""
+    return ws.read_memory()
 
 
 def _list_functions(ws: Workspace) -> List[Dict[str, str]]:

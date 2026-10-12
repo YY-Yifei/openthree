@@ -20,6 +20,8 @@
             steps/
             events/
         memory/                 # 模型自省产生的长期记忆（可选）
+            memory.jsonl        #   append-only：一行一条 {ts, content, tags}
+                                #   写入用 remember，读回用 read_memory / recall_memory
         three-report.html       # 可观测：一页看全智能体工作
 """
 from __future__ import annotations
@@ -30,7 +32,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .multimodal import (IMAGE_EXTS, ImageError, is_remote, resolve_path,
                          save_asset)
@@ -90,9 +92,15 @@ _SYSTEM_PROMPT_SEED = """\
 # 工作方式
 
 - 先看再用：不确定环境就调用 function 去看（读文件、列目录、跑命令）。
+- **找东西先检索，别硬读整份文件**：`search_files(pattern, path, glob="*.py")`
+  给出「文件:行号: 内容」，定位后用 `read_file(offset=行号)` 精读。
+  这是你的感知带宽 —— 先 grep，后精读。
 - **你能「看见」图片**：用 `view_image(path)` 把一张图读进上下文，然后据此描述 / 识别 / 判断。
 - 一次只推进一小步，每步都想清楚「为什么」，把理由写进 `note`（会进工作记录）。
 - 任务完成后，用 `finish` 给出结论。
+- **记忆要回看**：`remember` 写下跨会话的经验；**最近的记忆每轮自动出现在你的
+  上下文里**。若要找更旧的，用 `recall_memory(query=...)` 检索自己的长期记忆——
+  写下的经验只有被读回才有价值。
 - **自省**：每完成一个阶段性任务，问自己「我的 functions 够用吗？提示词准确吗？
   计划写清楚了吗？」不够就当场补上——这就是演化。
 - **改提示词前不必畏手畏脚，但可以留个后路**：`write_system_prompt` 会自动把旧稿
@@ -171,6 +179,15 @@ class Workspace:
     @property
     def memory_dir(self) -> Path:
         return self.dir / "memory"
+
+    @property
+    def memory_file(self) -> Path:
+        """长期记忆：append-only JSONL，一行一条 {ts, content, tags}。
+
+        只增不改，所以它既是模型的自省笔记，也是一份可被 `recall_memory`
+        检索、并每轮注入上下文的档案。
+        """
+        return self.memory_dir / "memory.jsonl"
 
     @property
     def system_prompt_file(self) -> Path:
@@ -255,7 +272,7 @@ class Workspace:
             "| `prompts/history/transcript.jsonl` | 对话档案：用户的完整原始输入（只增不改，`--resume` 可续读） |\n"
             "| `functions/*.py` | 二：python 文件即 function |\n"
             "| `logs/` | 模型全部工作记录（json / jsonl 分门别类） |\n"
-            "| `memory/` | 模型自省产生的长期记忆 |\n"
+            "| `memory/memory.jsonl` | 二：长期记忆（append-only）；`remember` 写、`recall_memory` 读、每轮注入 |\n"
             "| `three-report.html` | 一页看全智能体工作 |\n\n"
             "```bash\nopenthree \"你的任务\"\n```\n",
             encoding="utf-8",
@@ -555,6 +572,56 @@ class Workspace:
                 "images": [str(x) for x in imgs] if isinstance(imgs, list) else [],
             })
         return turns if n < 0 else turns[-n:]
+
+    # ---------- 长期记忆 ----------
+    def read_memory(self, limit: int = 0, query: str = "") -> List[Dict[str, Any]]:
+        """读回长期记忆条目（旧 → 新），供 `recall_memory` 与上下文注入使用。
+
+        这是**唯一的解析口径**：`remember` 的写入格式若变更，只需改这里。
+        容错优先——半截行 / 损坏行一律跳过，绝不让一条坏记录拖垮整份记忆。
+
+        Args:
+            limit: 最多返回多少条（0 = 全部；>0 取**最近** limit 条）。
+            query: 非空时只保留 content 或 tags 里包含它（不区分大小写）的条目。
+        """
+        path = self.memory_file
+        if not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:  # noqa: BLE001
+            return []
+        entries: List[Dict[str, Any]] = []
+        needle = (query or "").strip().lower()
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                doc = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue          # 半截行 / 损坏行：跳过
+            if not isinstance(doc, dict):
+                continue
+            content = str(doc.get("content") or "").strip()
+            if not content:
+                continue
+            raw_tags = doc.get("tags")
+            tags = ([str(t) for t in raw_tags if str(t).strip()]
+                    if isinstance(raw_tags, list) else [])
+            if needle:
+                hay = (content + " " + " ".join(tags)).lower()
+                if needle not in hay:
+                    continue
+            entries.append({"ts": str(doc.get("ts") or ""),
+                            "content": content, "tags": tags})
+        if limit and limit > 0:
+            return entries[-limit:]
+        return entries
+
+    def count_memory(self) -> int:
+        """长期记忆的条目数（自省 / 报告用）。"""
+        return len(self.read_memory())
 
     # ---------- functions 扫描 ----------
     def list_function_files(self) -> list[Path]:
