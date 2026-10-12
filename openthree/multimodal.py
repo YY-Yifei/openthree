@@ -14,7 +14,7 @@
   1. 用户输入    CLI `--image` / 交互 `:img`  →  本轮 history 的 user 消息
   2. 工具返回    工具返回 `ImageResult`        →  Agent 补一条带图片的 user 消息
                  （tool 消息本身只能承载字符串，这是协议限制，不是我们的取舍）
-  3. 多轮记忆    transcript.jsonl 记图片路径   →  下一轮播种时还原成图片
+  3. 会话记忆    transcript.jsonl 记图片路径   →  同会话下一轮播种时还原成图片
 
 工具里要用，只要：
 

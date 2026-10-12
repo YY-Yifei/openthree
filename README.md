@@ -42,11 +42,12 @@ llm:
 ## 使用
 
 ```bash
-openthree "把 utils.py 里的重复代码抽出来"   # 就地初始化 .openthree/，写任务，开跑
-openthree                                   # 沿用上次的 user-prompts.md 继续
-openthree -i                                # 交互模式（多轮对话）
+openthree "把 utils.py 里的重复代码抽出来"   # 就地初始化 .openthree/，写任务，开跑（单次）
+openthree                                   # 沿用上次的 user-prompts.md 继续（单次）
+openthree -i                                # 交互模式（进程内会话，多轮记忆）
 openthree -i --auto 5                       # 长任务自主推进：计划未完成就自动接力，最多 5 轮
-openthree --turns 8                         # 多轮时保留最近 8 轮（默认 4，0 关闭）
+openthree --resume 4                        # 显式把对话档案里最近 4 轮读回本会话（默认不读盘）
+openthree --turns 8                         # 会话内保留最近 8 轮（默认 4，0 关闭）
 openthree --init                            # 只建工作区
 openthree --inspect                         # 看一眼自己当前的样子（不调模型）
 openthree --functions                       # 列出所有工具
@@ -71,7 +72,8 @@ openthree -i                                             # 交互模式里用 :i
 1. **用户输入**：`--image` / `:img` → 本轮 user 消息带上图片。
 2. **工具返回**：模型调用内置 `view_image(path)`，或任何自造工具返回
    `openthree.ImageResult(text=..., images=[...])` → Agent 补一条带图片的 user 消息。
-3. **多轮记忆**：图片路径记进 `transcript.jsonl`，下一轮播种时自动还原。
+3. **会话记忆**：图片路径记进 `transcript.jsonl`，**同一会话**的下一轮播种时自动还原
+   （单次任务之间不共享记忆；跨进程续读用 `--resume`）。
 
 几条刻意的设计（都是为了让多模态不把系统搞坏）：
 
@@ -168,8 +170,9 @@ def pdf_to_text(path: str, pages: str = "") -> str:
 
 **2) 自主多轮推进（`--auto N`）。** 一轮跑完后，运行期检查计划里是否还有
 `- [ ]` 未完成项——有就自动开启下一轮，最多接 N 轮。轮与轮之间靠三样东西接续：
-跨轮对话记忆（`transcript.jsonl`）、每轮重新组装的 system（含计划）、
-模型自己写进文件的进度。于是「一个长任务」会自己跑到做完，而不是跑一轮就停。
+**会话内**的跨轮记忆、每轮重新组装的 system（含计划）、模型自己写进文件的进度。
+于是「一个长任务」会自己跑到做完，而不是跑一轮就停。一次 `--auto` 接力 = 一个
+进程内会话：接力过程中逐轮连贯，收尾后即弃，不会残留到下一次单次任务。
 
 ```bash
 openthree -i --auto 8 "把项目里的重复代码抽干净"
@@ -209,9 +212,11 @@ openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已
   最坏约 3×(600+30)≈32 分钟——**这也会表现为「很久没结果」**，
   可用 `config.yaml: llm.timeout / llm.retries` 调小。
 - **`finish` 之后不再执行多余的调用。** 同批剩余 tool_calls 一律跳过。
-- **多轮对话不会失忆。** 每轮的 (用户原文, 结论) 追加进 append-only 的
-  `prompts/history/transcript.jsonl`；下一轮开跑前读回最近 N 轮播种进上下文
-  （`--turns N`，默认 4，`0` 关闭，`-1` 全部）。用户的**完整输入**永不丢失。
+- **多轮记忆只活在会话里。** 每轮的 (用户原文, 结论) 追加进 append-only 的
+  `prompts/history/transcript.jsonl` 作档案；但**记忆本身在进程内的会话里**
+  ——`-i` / `--auto` 逐轮累积、跨轮可见（`--turns N` 限制轮数，默认 4，`0` 关闭）。
+  **单次任务从零开跑，绝不读上一次的对话**；想续读旧档案得用 `--resume N` 显式要求。
+  用户的**完整输入**永不丢失（档案只增不改）。
 - **长任务自己会往下走。** 计划（`prompts/plan.md`）每轮注入上下文；
   `--auto N` 下若计划仍有未完成项，收尾后自动接力下一轮，直到勾完 / 出错 /
   触到上限。改提示词会先存档，能回滚。
@@ -225,16 +230,17 @@ python self_test.py          # 端到端自测（桩模型，不联网）
 python -m pytest             # 单元测试
 ```
 
-## 多轮对话：用户的完整输入不会被丢掉
+## 记忆：会话之内跨轮，磁盘之上只读不写
 
 ```bash
-openthree -i
+openthree -i            # 开一个会话；会话内的轮次互相可见
+openthree --resume 4    # 或：显式把档案里最近 4 轮读回，作为会话起点
 ```
 
 ```
 交互模式。工作区 <你的项目>\.openthree
-输入 :q 退出，:r 重建报告，:i 自省；跨轮记忆：最近 4 轮
-对话原文：<你的项目>\.openthree\prompts\history\transcript.jsonl
+输入 :q 退出，:r 重建报告，:i 自省，:img 附图片；会话记忆：最近 4 轮
+对话档案：<你的项目>\.openthree\prompts\history\transcript.jsonl（只增不改；记忆只在本会话内）
 
 你 ▸ 我叫小明，请记住
 ...
@@ -242,18 +248,22 @@ openthree -i
 ...        ← 模型看得到「我叫小明，请记住」，答得出「你叫小明」
 ```
 
-设计上只有一句话：**用户的原始输入 append 落盘，永不覆写。**
+两条线，一条**写**、一条**读**，刻意分开：
 
-- `.openthree/prompts/user-prompts.md` 是「单槽位」，永远只装当前任务，会被下一轮覆写；
-  它是模型能自己改写的工作台，不适合当档案。
-- `.openthree/prompts/history/transcript.jsonl` 是 append-only 的档案：
+- **写（档案，永远只增不改）**：`.openthree/prompts/history/transcript.jsonl`
   每轮把 `(用户原文, openthree 结论)` 追加成一行 JSON，一个字都不删、不改。
   用 JSONL 而非 markdown，是因为用户输入里可能包含任何字符（换行、`### 用户`、
   甚至一行看起来像 `## 2020-01-01T00:00:00` 的文本），JSON 编码保证无损往返。
-- 每轮都是新的 `Agent`，历史不继承；但开跑前会从 transcript 读回最近 N 轮，
-  以 `user` / `assistant` 消息播种进新 Agent 的历史——**记忆在消息层，不在 system 层**，
-  所以「system 每轮重组装」的演化机制毫发无损。
-- `--turns N` 控制播种多少轮：默认 4，`0` 关闭（回到纯单轮），`-1` 全部。
+  `.openthree/prompts/user-prompts.md` 则是「单槽位」，只装当前任务、会被覆写，
+  它是模型能自己改写的工作台，不当档案。
+- **读（记忆，只在进程内会话）**：每轮都是新 `Agent`，历史不继承；运行期把
+  **本会话累积的轮次**以 `user` / `assistant` 消息播种进它的历史——**记忆在消息层，
+  不在 system 层**，所以「system 每轮重组装」的演化机制毫发无损。
+  - **单次任务**（`openthree "任务"`）：没有会话，**从零开跑，绝不读盘** ——
+    不会莫名背上上一次的对话。
+  - **`-i` / `--auto N`**：各开一个进程内会话，逐轮累积、跨轮可见。
+  - **`--resume N`**：唯一的读盘入口，显式把档案里最近 N 轮载入为会话起点。
+  - `--turns N` 控制会话内播种多少轮：默认 4，`0` 关闭（回到纯单轮），`-1` 全部。
 
 ## 安全声明
 

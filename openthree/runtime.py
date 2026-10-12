@@ -13,12 +13,15 @@
     * Progress —— 终端的回声（step / 思考 / 工具 / 心跳），回答「现在在干什么」。
       后者是纯展示，CLI 不会因为模型思考而长时间沉默。
 
-多轮对话：
-    每轮都是新 Agent，历史不继承。为了让模型跨轮记得住用户说过什么，
-    run() 收尾把本轮 (user, answer) 追加进 append-only 的
-    .openthree/prompts/history/transcript.jsonl，开跑前再读回最近 N 轮
-    播种进 Agent.history（`--turns N`，默认 4，0 关闭，-1 全部）。
-    用户的**完整原始输入**因此永不丢失。
+多轮对话（会话）：
+    记忆的寿命 = **进程内会话**，由 Runtime 持有，不再每次从磁盘读回。
+      * 单次 `openthree "任务"`：不带会话 → 从零开跑，不读任何旧对话。
+      * `-i` 交互模式：开一个会话，逐轮累积、跨轮可见（`--turns N` 限制播种轮数）。
+      * `--auto` 自主接力：本次接力过程也开一个会话（或搭 `-i` 的会话），
+        于是长任务逐轮连贯，收尾后不残留、不影响后续单次任务。
+      * `--resume`：**显式**把 transcript 档案里最近若干轮载入为本会话起点。
+    每轮收尾仍把 (user, answer) 追加进 append-only 的 transcript.jsonl 作档案/可观测，
+    但它**不再被自动回读**。用户的完整原始输入因此永不丢失。
 """
 from __future__ import annotations
 
@@ -47,7 +50,7 @@ class Runtime:
                  context_budget_chars: Optional[int] = None,
                  context_window_tokens: Optional[int] = None,
                  heartbeat: float = 15.0,
-                 prior_turns: Optional[int] = None) -> None:
+                 turns: Optional[int] = None) -> None:
         self.project_dir = Path(project_dir or Path.cwd()).resolve()
         self.quiet = quiet
         self.max_iterations = max_iterations
@@ -56,8 +59,12 @@ class Runtime:
         self._context_budget_arg = context_budget_chars
         self._context_window_arg = context_window_tokens
         self.heartbeat = heartbeat
-        # 多轮对话：播种最近多少轮（None = Agent 默认 4，0 = 关闭，负数 = 全部）
-        self.prior_turns = None if prior_turns is None else int(prior_turns)
+        # 会话内播种多少轮（默认 4，0 = 关闭记忆，负数 = 全部）。
+        # 注意：这只是「会话」的上限，没有会话时一律不播种、不读盘。
+        self.turns = 4 if turns is None else int(turns)
+        # 进程内会话：之前几轮的 (user, answer) 暂存在这里，供后续轮次播种。
+        self._session_active = False
+        self._session_turns: List[Dict[str, Any]] = []
 
         self.ws = Workspace(self.project_dir).init(force_prompts=force_prompts)
         self.config: LLMConfig = load_config(self.project_dir, model_override=model)
@@ -108,17 +115,78 @@ class Runtime:
             )
         return None
 
+    # ---------------------------------------------------------------- 会话
+    def begin_session(self, *, resume: int = 0, with_history: bool = True) -> int:
+        """开一个进程内会话：后续每一轮都能看到「本次会话内之前几轮」。
+
+        `-i` / `--auto` 用它来把逐轮对话串起来。记忆**只活在进程内**——
+        默认不读盘，只有 `resume` 显式要求时才从 transcript 载入最近若干轮
+        作为起点（`--resume`，answer 一并带回，让模型知道之前聊过什么）。
+
+        Args:
+            resume: 从 transcript 档案载入最近多少轮作为会话起点；0 = 不读盘。
+            with_history: 是否播种（False = 开会话但记忆关闭，等价于自增计数）。
+
+        Returns:
+            载入的轮数（不读盘时为 0）。
+        """
+        self._session_active = True
+        self._session_turns = []
+        loaded = 0
+        if resume and with_history:
+            loaded = self.extend_session(resume)
+        return loaded
+
+    def end_session(self) -> None:
+        """结束会话，丢弃进程内记忆（下一轮单次任务不受影响）。"""
+        self._session_active = False
+        self._session_turns = []
+
+    def extend_session(self, n: int) -> int:
+        """从 transcript 档案载入最近 n 轮，**追加**进当前会话起点。
+
+        只有 `--resume` 这条显式路径会用到；返回实际载入的轮数。
+        """
+        n = int(n or 0)
+        if n == 0:
+            return 0
+        try:
+            turns = self.ws.read_turns(n)
+        except Exception:  # noqa: BLE001
+            return 0
+        for t in turns:
+            self._session_turns.append(dict(t))
+        return len(turns)
+
+    def _effective_turns(self) -> List[Dict[str, Any]]:
+        """本轮该播种的会话轮次（旧 → 新，受 `--turns` 限制）。"""
+        if not self._session_active:
+            return []
+        if self.turns == 0:
+            return []
+        turns = self._session_turns
+        return turns if self.turns < 0 else turns[-self.turns:]
+
     def run(self, user_input: Optional[str] = None, *,
             append: bool = False, session_id: Optional[str] = None,
-            images: Optional[Sequence[Union[str, Path]]] = None) -> Dict[str, Any]:
+            images: Optional[Sequence[Union[str, Path]]] = None,
+            session: bool = False) -> Dict[str, Any]:
         """跑一轮任务。user_input 为 None 时沿用已有的 user-prompts.md。
 
         images 是本轮携带的图片（本地路径或 http/data URL）。本地文件会先
         复制进 .openthree/assets/ 去重归档，再交给 Agent 注入进 user 消息。
+
+        session 为 True（或已由 begin_session 开会话）时，本轮的播种来自
+        进程内会话；否则从零开跑，**不读磁盘**。
         """
         problem = self.check()
         if problem:
             raise RuntimeError(problem)
+
+        # 这一轮是否处于会话中：显式 session=True 或此前已 begin_session()。
+        in_session = bool(session) or self._session_active
+        if session:
+            self._session_active = True
 
         # 图片先归置成本地绝对路径 / URL（本地文件复制进 assets 去重）
         image_refs: List[str] = []
@@ -157,7 +225,7 @@ class Runtime:
                            max_iterations=self.max_iterations,
                            tool_result_limit=self.tool_result_limit,
                            context_budget_chars=self.context_budget_chars,
-                           prior_turns=self.prior_turns,
+                           seed_turns=self._effective_turns(),
                            progress=progress)
         self.agent.current_images = list(image_refs)
         self.agent.task_text = self.user_text
@@ -193,13 +261,22 @@ class Runtime:
         doc = self.recorder.finalize(answer=answer, status=status)
 
         # 本轮对话入档：用户的完整原始输入 append 进 transcript，永不丢失。
-        # 下一轮开跑时会被读回，播种进新 Agent 的历史（跨轮记忆）。
+        # 这只写不读（档案/可观测）；跨轮记忆走进程内会话，见 _effective_turns。
         try:
             self.ws.append_turn(self.user_text, answer, images=image_refs or None)
         except Exception as exc:  # noqa: BLE001
             if self.recorder:
                 self.recorder.record("error", summary="对话记录写入失败",
                                      data={"error": f"{type(exc).__name__}: {exc}"})
+
+        # 会话内累积本轮 (用户原文, 结论)，供同一会话的后续轮次播种。
+        # 没有会话（单次任务）时不累积，于是收尾即忘、不留痕。
+        if in_session:
+            self._session_turns.append({
+                "user": self.user_text,
+                "answer": answer or "",
+                "images": list(image_refs),
+            })
 
         # 每轮结束都刷新报告 —— 可观测是常态，不是事后
         try:
@@ -224,9 +301,13 @@ class Runtime:
         `rounds` 是自动接力的**总轮数上限**（含首轮）。每轮都是一次完整的
         ReAct 循环；轮与轮之间靠三样东西自然接续：
 
-          * transcript 的跨轮记忆（模型记得住用户说过什么）；
+          * 会话内的跨轮记忆（模型记得住本次接力里说过什么）；
           * 每轮重新组装的 system（含模型自己维护的 plan.md 待办）；
           * 模型自己写进文件的进度（不随上下文折叠而丢失）。
+
+        一次接力 = 一个进程内会话：接力过程中逐轮连贯，收尾后即弃，
+        不会残留到下一次单次任务。若调用前已在会话中（如 `-i` 的会话），
+        则沿用该会话，接力结束后它继续存在。
 
         停下条件（任一）：计划已无 `- [ ]` 未完成项 / 某轮出错或被中断 /
         达到轮数上限。于是「一个长任务」会自己跑到做完，而不是跑一轮就停。
@@ -235,40 +316,49 @@ class Runtime:
             最后一轮的会话文档，额外带 `auto_rounds` 与 `auto_answers` 两个字段。
         """
         rounds = max(1, int(rounds or 1))
+        # 自己开的会话，接力结束就关掉；沿用已有会话（如 -i 的）时不动它。
+        owns_session = not self._session_active
+        if owns_session:
+            self.begin_session()
         docs: List[Dict[str, Any]] = []
-        for i in range(rounds):
-            first = (i == 0)
-            try:
-                doc = self.run(
-                    user_input if first else None,
-                    append=append if first else False,
-                    session_id=session_id,
-                    images=images if first else None,
-                )
-            except RuntimeError as exc:
-                self.say(f"[auto] 第 {i + 1} 轮启动失败：{exc}")
-                break
-            docs.append(doc)
+        try:
+            for i in range(rounds):
+                first = (i == 0)
+                try:
+                    doc = self.run(
+                        user_input if first else None,
+                        append=append if first else False,
+                        session_id=session_id,
+                        images=images if first else None,
+                        session=True,
+                    )
+                except RuntimeError as exc:
+                    self.say(f"[auto] 第 {i + 1} 轮启动失败：{exc}")
+                    break
+                docs.append(doc)
 
-            status = str(doc.get("status") or "")
-            open_items = self.ws.plan_open_items()
-            if status in ("error", "interrupted"):
-                self.say(f"[auto] 第 {i + 1} 轮 {status}，停止自动接力。")
-                break
-            # 还有未完成项，或本轮被迭代上限截断（unfinished）——都算「没做完」。
-            if open_items <= 0 and status != "unfinished":
-                self.say(f"[auto] 计划已无未完成项，收工（共 {i + 1} 轮）。")
-                break
-            if i + 1 >= rounds:
-                why = (f"计划还剩 {open_items} 项未完成" if open_items
-                       else "上一轮被步数上限截断（unfinished）")
-                self.say(f"[auto] 已达轮数上限 {rounds}，{why}；"
-                         "再跑请加大 --auto 或用 openthree 继续。")
-                break
-            nxt = i + 2
-            why = (f"计划还有 {open_items} 项未完成" if open_items
-                   else "上一轮未跑完（unfinished）")
-            self.say(f"[auto] {why} → 自动开始第 {nxt} 轮")
+                status = str(doc.get("status") or "")
+                open_items = self.ws.plan_open_items()
+                if status in ("error", "interrupted"):
+                    self.say(f"[auto] 第 {i + 1} 轮 {status}，停止自动接力。")
+                    break
+                # 还有未完成项，或本轮被迭代上限截断（unfinished）——都算「没做完」。
+                if open_items <= 0 and status != "unfinished":
+                    self.say(f"[auto] 计划已无未完成项，收工（共 {i + 1} 轮）。")
+                    break
+                if i + 1 >= rounds:
+                    why = (f"计划还剩 {open_items} 项未完成" if open_items
+                           else "上一轮被步数上限截断（unfinished）")
+                    self.say(f"[auto] 已达轮数上限 {rounds}，{why}；"
+                             "再跑请加大 --auto 或用 openthree 继续。")
+                    break
+                nxt = i + 2
+                why = (f"计划还有 {open_items} 项未完成" if open_items
+                       else "上一轮未跑完（unfinished）")
+                self.say(f"[auto] {why} → 自动开始第 {nxt} 轮")
+        finally:
+            if owns_session:
+                self.end_session()
 
         if not docs:
             return {"status": "error", "answer": "[auto] 一轮都没跑起来",
@@ -293,7 +383,10 @@ class Runtime:
             f"（未完成 {self.ws.plan_open_items()} 项 / 历史版本 "
             f"{len(self.ws.list_prompt_versions())} 份）",
             f"对话档案 {self.ws.transcript_file}"
-            f"（{len(self.ws.read_turns(-1))} 轮）",
+            f"（{len(self.ws.read_turns(-1))} 轮，只增不改；--resume 可续读）",
+            f"会话     {'进行中' if self._session_active else '无'}"
+            f"（记忆 {self.turns if self.turns >= 0 else '全部'} 轮；"
+            "单次任务不读盘，-i / --auto 才逐轮累积）",
             f"工具     {len(reg)} 个（内置 {len(reg.builtins)} / 自造 {len(reg.user_tools())}）",
             f"上下文   窗口 {_fmt_tokens(self.context_window_tokens)} token"
             f" → 预算 {_fmt_chars(self.context_budget_chars)} 字符"

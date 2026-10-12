@@ -117,7 +117,7 @@ def _agent(ws, registry, **kw) -> Agent:
 
 
 def test_inject_images_appends_current_turn_message(ws, registry, png):
-    ag = _agent(ws, registry, prior_turns=0)
+    ag = _agent(ws, registry)
     ag.history.append({"role": "user", "content": "旧问题"})
     ag.history.append({"role": "assistant", "content": "旧回答"})
     ag.task_text = "描述一下"
@@ -130,7 +130,7 @@ def test_inject_images_appends_current_turn_message(ws, registry, png):
 
 
 def test_inject_images_is_idempotent(ws, registry, png):
-    ag = _agent(ws, registry, prior_turns=0)
+    ag = _agent(ws, registry)
     ag.current_images = [str(png)]
     ag._inject_images()
     ag._inject_images()                          # 再来一次
@@ -139,8 +139,8 @@ def test_inject_images_is_idempotent(ws, registry, png):
 
 def test_inject_images_not_attached_to_seeded_turns(ws, registry, png):
     """跨轮播种的旧轮次不能被本轮图片污染。"""
-    ws.append_turn("上一轮的问题", "上一轮的回答")
-    ag = _agent(ws, registry, prior_turns=4)
+    ag = _agent(ws, registry, seed_turns=[
+        {"user": "上一轮的问题", "answer": "上一轮的回答"}])
     ag.task_text = "这一轮的问题"
     ag.current_images = [str(png)]
     ag._inject_images()
@@ -150,7 +150,7 @@ def test_inject_images_not_attached_to_seeded_turns(ws, registry, png):
 
 def test_tool_image_result_becomes_user_message(ws, registry, png):
     """工具返回 ImageResult → tool 消息是文本，图片另走一条 user 消息。"""
-    ag = _agent(ws, registry, prior_turns=0)
+    ag = _agent(ws, registry)
 
     def fake(**kwargs):
         return image_result("生成了一张图", [str(png)])
@@ -174,15 +174,14 @@ def test_transcript_roundtrips_images(ws, png):
 
 
 def test_agent_seeds_prior_turn_images(ws, registry, png):
-    ws.append_turn("先看这张", "好", images=[str(png)])
-    ag = _agent(ws, registry, prior_turns=4)
+    ag = _agent(ws, registry, seed_turns=[
+        {"user": "先看这张", "answer": "好", "images": [str(png)]}])
     assert count_images(ag.history[0]["content"]) == 1
     assert "先看这张" in content_text(ag.history[0]["content"])
 
 
 def test_turns_without_images_still_plain_string(ws, registry):
-    ws.append_turn("没有图", "好的")
-    ag = _agent(ws, registry, prior_turns=4)
+    ag = _agent(ws, registry, seed_turns=[{"user": "没有图", "answer": "好的"}])
     assert ag.history[0]["content"] == "没有图"   # 行为与从前逐字节一致
 
 

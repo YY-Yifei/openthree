@@ -17,9 +17,11 @@
   * compact_context 的区间先在现有 history 上校验，如实返回成功/失败（P1-3.8）。
   * 进度回声：把「正在做什么」通过注入的 progress 打出去，CLI 不再长时间沉默。
     这是纯展示层，不参与决策；不注入时走 NullProgress，行为与从前一致。
-  * 跨轮记忆：开跑前从 .openthree/prompts/history/transcript.jsonl 读回最近若干轮
-    （prior_turns），以 user/assistant 消息播种进 history，于是多轮对话里
-    模型记得住用户说过什么（见 workspace.append_turn / read_turns）。
+  * 跨轮记忆：会话里「之前几轮」由 Runtime 显式传入（seed_turns），以
+    user/assistant 消息播种进 history，于是多轮会话里模型记得住用户说过什么。
+    **Agent 自己不读磁盘** —— 没有会话（如单次任务）时 seed_turns 为空，
+    历史就是空的，不会莫名背上上一轮的旧对话；会话记忆只活在进程内
+    （见 runtime.begin_session / workspace.append_turn）。
     system 依然每轮重组装，播种只发生在消息层，演化机制不受影响。
 """
 from __future__ import annotations
@@ -27,7 +29,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .kernel import KERNEL
 from .llm import CHARS_PER_TOKEN, DEFAULT_CONTEXT_WINDOW_TOKENS, LLM
@@ -51,8 +53,6 @@ DEFAULT_CONTEXT_BUDGET_CHARS = 1_000_000
 MAX_CONTEXT_BUDGET_CHARS = 1_000_000
 # 历史至多占用上下文窗口的比例（留一半给 system/工具 schema/模型输出）。
 CONTEXT_BUDGET_RATIO = 0.5
-# 多轮对话默认播种最近多少轮（0 关闭，负数表示全部）。
-DEFAULT_PRIOR_TURNS = 4
 
 
 def resolve_context_budget(context_budget_chars: Optional[int],
@@ -80,7 +80,7 @@ class Agent:
                  recorder: Recorder, *, max_iterations: int = 200,
                  tool_result_limit: int = TOOL_RESULT_LIMIT,
                  context_budget_chars: Optional[int] = None,
-                 prior_turns: Optional[int] = None,
+                 seed_turns: Optional[Sequence[Dict[str, Any]]] = None,
                  progress: Optional[Any] = None) -> None:
         self.ws = workspace
         self.reg = registry
@@ -98,9 +98,10 @@ class Agent:
         self.context_budget_chars = resolve_context_budget(
             context_budget_chars, getattr(getattr(llm, "config", None),
                                           "context_window_tokens", None))
-        # 跨轮记忆：播种最近多少轮对话（None = 默认值，0 = 关闭，负数 = 全部）
-        self.prior_turns = (DEFAULT_PRIOR_TURNS if prior_turns is None
-                            else int(prior_turns))
+        # 跨轮记忆：本会话「之前几轮」的对话，由 Runtime 显式传入。
+        # Agent 不读盘 —— 没有会话（单次任务）时这里就是空的，从零开跑。
+        self.seed_turns: List[Dict[str, Any]] = [
+            dict(t) for t in (seed_turns or []) if isinstance(t, dict)]
         # 进度回声：只用来「说话」，不参与任何判断
         self.progress = progress if progress is not None else NullProgress()
 
@@ -113,18 +114,18 @@ class Agent:
 
     # ---------------------------------------------------------------- 跨轮记忆
     def _seed_history(self) -> List[Dict[str, Any]]:
-        """从 transcript 读回最近若干轮，播种成本轮历史的开头。
+        """把本会话「之前几轮」播种成本轮历史的开头。
 
-        多轮对话的「记性」就长在这里：每轮都是新 Agent，上一轮的 history 不继承；
-        但用户的原始输入落在 append-only 的 transcript.md 里，于是下一轮开跑前
-        先把它还原成 user/assistant 消息，模型就看得到「用户之前说过什么」。
+        多轮会话的「记性」长在这里：每轮都是新 Agent，上一轮的 history 不继承；
+        运行期把会话中累积的轮次（seed_turns）显式传进来，这里还原成
+        user/assistant 消息，模型就看得到「用户之前说过什么」。
+
+        关键：**Agent 自己绝不读磁盘**。所以单次任务（没有会话）时 seed_turns
+        为空，历史就是空的 —— 不会莫名背上上一次对话。会话记忆只活在进程内。
         播种只走消息层，system 依然每轮重组装，演化机制不受影响。
         """
-        if self.prior_turns == 0:
-            return []
-        try:
-            turns = self.ws.read_turns(self.prior_turns)
-        except Exception:  # noqa: BLE001
+        turns = self.seed_turns
+        if not turns:
             return []
         history: List[Dict[str, Any]] = []
         for turn in turns:
@@ -138,11 +139,10 @@ class Agent:
             if answer:
                 history.append({"role": "assistant", "content": answer})
         if history:
-            self.rec.record("system", summary=f"跨轮记忆：播种最近 {len(turns)} 轮对话",
-                            data={"action": "seed_prior_turns",
-                                  "turns": len(turns), "messages": len(history),
-                                  "prior_turns": self.prior_turns})
-            self.progress.note(f"跨轮记忆：播种最近 {len(turns)} 轮对话")
+            self.rec.record("system", summary=f"跨轮记忆：播种会话内 {len(turns)} 轮对话",
+                            data={"action": "seed_session_turns",
+                                  "turns": len(turns), "messages": len(history)})
+            self.progress.note(f"跨轮记忆：播种会话内 {len(turns)} 轮对话")
         return history
 
     # ---------------------------------------------------------------- 主循环

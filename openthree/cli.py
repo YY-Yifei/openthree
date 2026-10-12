@@ -1,15 +1,19 @@
 """命令行入口。
 
-    openthree "你的任务"              就地初始化 .openthree/ 并开始 ReAct
-    openthree                         沿用 .openthree/prompts/user-prompts.md 继续
-    openthree -i                      交互模式（多轮对话）
+    openthree "你的任务"              就地初始化 .openthree/ 并开始 ReAct（单次，不读旧对话）
+    openthree                         沿用 .openthree/prompts/user-prompts.md 继续（单次）
+    openthree -i                      交互模式（进程内会话，多轮记忆）
     openthree -i --auto 5             长任务自动推进：计划未完成就接力，最多 5 轮
-    openthree --turns 8               多轮时保留最近 8 轮对话（默认 4，0 关闭）
+    openthree --resume 4              显式把对话档案里最近 4 轮读回本会话（默认不读）
+    openthree --turns 8               会话内保留最近 8 轮（默认 4，0 关闭）
     openthree --init                  只初始化工作区
     openthree --report                只重建 three-report.html
     openthree --inspect               看一眼自己当前的样子（不调模型）
     openthree --functions             列出所有工具
     openthree --serve                 起一个 HTTP 服务看报告（可选）
+
+跨轮记忆只在**会话**里存在（`-i` / `--auto`）；单次任务从零开跑，绝不读磁盘上
+上一次的对话。对话原文仍 append 到 transcript.jsonl 作档案，想续读就用 --resume。
 
 跑长任务时终端不会沉默：每一步、每次模型调用、每次工具执行都有回声，
 等待超过 --heartbeat 秒还会打印心跳（默认 15s，设 0 关闭）。
@@ -72,12 +76,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--report-only", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--inspect", action="store_true", help="看一眼自己当前的样子")
     p.add_argument("--functions", action="store_true", help="列出当前所有工具")
-    p.add_argument("-i", "--interactive", action="store_true", help="交互模式，多轮对话")
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="交互模式：开一个进程内会话，多轮记忆（退出即忘）")
     p.add_argument("--auto", type=int, default=0, metavar="N",
                    help="长任务自动推进：跑完一轮后若计划仍有未完成项，自动接力下一轮，"
                         "最多 N 轮（0 = 关闭，默认）。常与 -i 联用。")
     p.add_argument("--turns", type=int, default=4,
-                   help="多轮对话保留最近多少轮（播种进上下文），0 关闭，-1 全部，默认 4")
+                   help="会话内保留最近多少轮（播种进上下文），0 关闭，-1 全部，默认 4")
+    p.add_argument("--resume", type=int, default=0, metavar="N",
+                   help="从对话档案 transcript.jsonl 续读最近 N 轮作为会话起点；"
+                        "默认 0 = 不读盘，从零开始")
     p.add_argument("-q", "--quiet", action="store_true", help="安静模式（连进度回声也关掉）")
     p.add_argument("-V", "--version", action="version", version=f"openthree {__version__}")
     return p
@@ -98,7 +106,7 @@ def main(argv=None) -> int:
         context_window_tokens=args.context_window,
         tool_result_limit=args.tool_result_limit,
         heartbeat=args.heartbeat,
-        prior_turns=args.turns,
+        turns=args.turns,
     )
 
     if args.init:
@@ -123,7 +131,8 @@ def main(argv=None) -> int:
     images = _collect_images(args)
 
     if args.interactive:
-        return _interactive(rt, task, args.append, images, auto=args.auto)
+        return _interactive(rt, task, args.append, images, auto=args.auto,
+                            resume=args.resume)
 
     if not task and not rt.ws.has_task() and not images:
         _print_banner()
@@ -131,12 +140,18 @@ def main(argv=None) -> int:
         return 1
 
     _print_banner()
+    # --resume：显式把档案里最近 N 轮读回本会话（默认不读盘，从零开跑）。
+    if args.resume > 0:
+        loaded = rt.begin_session(resume=args.resume)
+        print(f"[会话] 已从对话档案续读最近 {args.resume} 轮"
+              f"（实际载入 {loaded} 轮）\n", flush=True)
     try:
         if args.auto > 0:
             doc = rt.run_auto(task or None, rounds=args.auto, append=args.append,
                               images=images or None)
         else:
-            doc = rt.run(task or None, append=args.append, images=images or None)
+            doc = rt.run(task or None, append=args.append, images=images or None,
+                         session=args.resume > 0)
     except RuntimeError as exc:
         print(f"[错误] {exc}", file=sys.stderr)
         return 2
@@ -169,17 +184,22 @@ def _collect_images(args) -> list[str]:
 
 
 def _interactive(rt: Runtime, first_task: str, append: bool,
-                 first_images: Optional[list] = None, auto: int = 0) -> int:
+                 first_images: Optional[list] = None, auto: int = 0,
+                 resume: int = 0) -> int:
     _force_utf8()
     _print_banner()
-    memory = ("关闭" if rt.prior_turns == 0
-              else "全部" if (rt.prior_turns or 0) < 0
-              else f"最近 {rt.prior_turns if rt.prior_turns is not None else 4} 轮")
+    # 交互模式 = 一个进程内会话：逐轮累积、跨轮可见，退出即忘。
+    loaded = rt.begin_session(resume=resume)
+    memory = ("关闭" if rt.turns == 0
+              else "全部" if rt.turns < 0
+              else f"最近 {rt.turns} 轮")
     print(f"交互模式。工作区 {rt.ws.dir}")
-    print(f"输入 :q 退出，:r 重建报告，:i 自省，:img 附图片；跨轮记忆：{memory}")
+    print(f"输入 :q 退出，:r 重建报告，:i 自省，:img 附图片；会话记忆：{memory}")
+    if resume > 0:
+        print(f"续读：已从对话档案载入最近 {resume} 轮（实际 {loaded} 轮）")
     if auto > 0:
         print(f"自动推进：开启（每轮跑完后若计划仍有未完成项，最多接力 {auto} 轮）")
-    print(f"对话原文：{rt.ws.transcript_file}\n")
+    print(f"对话档案：{rt.ws.transcript_file}（只增不改；记忆只在本会话内）\n")
     pending = first_task
     pending_images = list(first_images or [])
     while True:
@@ -212,7 +232,8 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
         pending_images = []
         try:
             if auto > 0:
-                doc = rt.run_auto(text or None, rounds=auto, append=append, images=images)
+                doc = rt.run_auto(text or None, rounds=auto, append=append,
+                                  images=images)
                 answers = doc.get("auto_answers") or []
                 if len(answers) > 1:
                     print("\n" + "═" * 60)
@@ -224,7 +245,7 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
                     print("═" * 60 + "\n")
                     continue
             else:
-                doc = rt.run(text or None, append=append, images=images)
+                doc = rt.run(text or None, append=append, images=images, session=True)
             print("\n" + "─" * 60)
             print(doc.get("answer", ""))
             print("─" * 60 + "\n")

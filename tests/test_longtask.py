@@ -136,7 +136,7 @@ class _PlanStubLLM:
 
 
 def _rt(tmp_path, plans, turns=4) -> Runtime:
-    rt = Runtime(tmp_path, quiet=True, heartbeat=0, prior_turns=turns)
+    rt = Runtime(tmp_path, quiet=True, heartbeat=0, turns=turns)
     rt.config.api_key = rt.config.base_url = "stub"
     rt.config.model = "stub-model"
     rt.llm = _PlanStubLLM(rt.config, plans)

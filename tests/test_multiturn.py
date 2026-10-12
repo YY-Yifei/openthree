@@ -1,6 +1,9 @@
-"""多轮对话：用户的完整原始输入必须跨轮保留，且模型跨轮记得住。
+"""多轮记忆：记忆只活在**进程内会话**里，不再每次从磁盘读回。
 
-这是用户诉求（「多轮对话模式应该保留用户的完整输入」）的直接回归测试。
+用户诉求的两个面：
+  * 用户的完整原始输入必须跨轮保留（档案层，append-only）；
+  * 但**单次任务绝不自动读盘** —— 只有 `-i` / `--auto` 的会话才跨轮可见，
+    想续读旧档案得用 `--resume` 显式要求。
 """
 from __future__ import annotations
 
@@ -81,53 +84,45 @@ def test_submit_append_drops_seed_placeholder(ws: Workspace):
 
 
 # ---------------------------------------------------------------- Agent 层
-def _agent(ws, registry, prior_turns=None) -> Agent:
+def _agent(ws, registry, seed=None) -> Agent:
     rec = Recorder(ws, user_input="t", model="stub")
     return Agent(ws, registry, LLM(LLMConfig(api_key="k", base_url="u")), rec,
-                 prior_turns=prior_turns)
+                 seed_turns=seed)
 
 
-def test_agent_seeds_prior_turns(ws, registry):
-    ws.append_turn("我叫小明，请记住", "好的")
-    ws.append_turn("我叫什么？", "你叫小明")
-    ag = _agent(ws, registry)
+def _turns(*pairs):
+    return [{"user": u, "answer": a} for u, a in pairs]
+
+
+def test_agent_seeds_explicit_turns(ws, registry):
+    ag = _agent(ws, registry,
+                seed=_turns(("我叫小明，请记住", "好的"), ("我叫什么？", "你叫小明")))
     assert ag.history[0] == {"role": "user", "content": "我叫小明，请记住"}
     assert ag.history[1] == {"role": "assistant", "content": "好的"}
     assert ag.history[2] == {"role": "user", "content": "我叫什么？"}
     assert ag.history[3] == {"role": "assistant", "content": "你叫小明"}
 
 
-def test_agent_seed_is_bounded_by_prior_turns(ws, registry):
-    for i in range(5):
-        ws.append_turn(f"u{i}", f"a{i}")
-    ag = _agent(ws, registry, prior_turns=2)
+def test_agent_without_seed_starts_empty(ws, registry):
+    """回归：Agent 不再自动读盘 —— 没显式给轮次，历史就是空的。"""
+    ws.append_turn("上一轮的旧对话", "旧回答")
+    ag = _agent(ws, registry)                  # 不给 seed_turns
+    assert ag.history == []                     # 磁盘有档案，但不读它
+
+
+def test_agent_seed_takes_only_what_it_is_given(ws, registry):
+    """播种什么就播什么：裁剪轮数是调用方（Runtime）的职责。"""
+    ag = _agent(ws, registry, seed=_turns(("u0", "a0"), ("u1", "a1")))
     assert len(ag.history) == 4
-    assert ag.history[0]["content"] == "u3"
-
-
-def test_agent_prior_turns_zero_disables_memory(ws, registry):
-    ws.append_turn("我叫小明", "好的")
-    ag = _agent(ws, registry, prior_turns=0)
-    assert ag.history == []
-
-
-def test_agent_without_prior_turns_defaults_to_four(ws, registry):
-    for i in range(6):
-        ws.append_turn(f"u{i}", f"a{i}")
-    ag = _agent(ws, registry)          # 不传 = 默认 4 轮
-    assert len(ag.history) == 8
-    assert ag.history[0]["content"] == "u2"
 
 
 def test_agent_records_seed_event(ws, registry):
-    ws.append_turn("我叫小明", "好的")
-    ag = _agent(ws, registry)
+    ag = _agent(ws, registry, seed=_turns(("我叫小明", "好的")))
     assert any(e.kind == "system" and "播种" in e.summary for e in ag.rec.events)
 
 
 def test_agent_history_still_balanced_after_seed(ws, registry):
-    ws.append_turn("问题", "答案")
-    ag = _agent(ws, registry)
+    ag = _agent(ws, registry, seed=_turns(("问题", "答案")))
     # 播种只产生 user/assistant，不会破坏 tool_call / tool 的配对
     assert all(m["role"] in ("user", "assistant") for m in ag.history)
 
@@ -161,9 +156,24 @@ def _runtime(tmp_path, **kw):
     return rt
 
 
-def test_runtime_second_turn_remembers_first(tmp_path):
-    """用户的原话：第二轮必须看得到第一轮的完整输入。"""
+def test_runtime_single_run_does_not_read_transcript(tmp_path):
+    """本次诉求的直接回归：单次任务绝不去读上一次的对话。"""
     rt = _runtime(tmp_path)
+    rt.run("我叫小明，请记住")
+    rt.run("我叫什么？")
+
+    second = rt.llm.calls[-1]
+    texts = [str(m.get("content")) for m in second]
+    assert not any("我叫小明，请记住" in t for t in texts)   # 不读盘，从零开跑
+    assert [m["role"] for m in second] == ["system"]         # 没有任何播种
+    # 但档案照写不误（可观测 / 可续读）
+    assert [t["user"] for t in rt.ws.read_turns(-1)] == ["我叫小明，请记住", "我叫什么？"]
+
+
+def test_runtime_session_remembers_prior_turns(tmp_path):
+    """-i 那样的会话：开了会话，第二轮才看得到第一轮。"""
+    rt = _runtime(tmp_path)
+    rt.begin_session()
     rt.run("我叫小明，请记住")
     rt.run("我叫什么？")
 
@@ -177,6 +187,37 @@ def test_runtime_second_turn_remembers_first(tmp_path):
     assert second[1]["content"] == "我叫小明，请记住"
 
 
+def test_runtime_run_session_flag_opens_session(tmp_path):
+    """不显式 begin_session，也可以逐轮 session=True 累积。"""
+    rt = _runtime(tmp_path)
+    rt.run("第一句", session=True)
+    rt.run("第二句", session=True)
+    texts = [str(m.get("content")) for m in rt.llm.calls[-1]]
+    assert any("第一句" in t for t in texts)
+    assert any("第二句" in t for t in texts)
+
+
+def test_runtime_end_session_forgets(tmp_path):
+    rt = _runtime(tmp_path)
+    rt.begin_session()
+    rt.run("我叫小明，请记住")
+    rt.end_session()
+    rt.run("我叫什么？")
+    assert [m["role"] for m in rt.llm.calls[-1]] == ["system"]   # 会话已关，不播种
+
+
+def test_runtime_resume_reads_transcript_explicitly(tmp_path):
+    """--resume 是唯一的读盘入口：显式要求才把档案读回会话。"""
+    rt = _runtime(tmp_path)
+    rt.run("我叫小明，请记住")            # 单次，写档案
+    loaded = rt.begin_session(resume=1)  # 显式续读
+    assert loaded == 1
+    rt.run("我叫什么？")
+    texts = [str(m.get("content")) for m in rt.llm.calls[-1]]
+    assert any("我叫小明，请记住" in t for t in texts)   # 读回来了
+    assert any("收到" in t for t in texts)              # 上一轮的结论也在
+
+
 def test_runtime_transcript_keeps_full_input(tmp_path):
     rt = _runtime(tmp_path)
     rt.run("我叫小明，请记住")
@@ -186,7 +227,9 @@ def test_runtime_transcript_keeps_full_input(tmp_path):
 
 
 def test_runtime_turns_zero_is_single_turn(tmp_path):
-    rt = _runtime(tmp_path, prior_turns=0)
+    """会话里 turns=0 = 关闭记忆（但原文照样入档）。"""
+    rt = _runtime(tmp_path, turns=0)
+    rt.begin_session()
     rt.run("我叫小明，请记住")
     rt.run("我叫什么？")
     assert len(rt.llm.calls[-1]) == 1                    # 只剩 system
@@ -194,10 +237,26 @@ def test_runtime_turns_zero_is_single_turn(tmp_path):
 
 
 def test_runtime_turns_limits_seeded_rounds(tmp_path):
-    rt = _runtime(tmp_path, prior_turns=1)
+    rt = _runtime(tmp_path, turns=1)
+    rt.begin_session()
     rt.run("第一句")
     rt.run("第二句")
     rt.run("第三句")
     texts = [str(m.get("content")) for m in rt.llm.calls[-1]]
     assert not any("第一句" in t for t in texts)          # 只播种最近 1 轮
     assert any("第二句" in t for t in texts)
+
+
+def test_runtime_effective_turns_bounds_session(tmp_path):
+    rt = _runtime(tmp_path, turns=2)
+    rt.begin_session()
+    for i in range(5):
+        rt._session_turns.append({"user": f"u{i}", "answer": f"a{i}"})
+    eff = rt._effective_turns()
+    assert len(eff) == 2 and eff[0]["user"] == "u3"
+
+
+def test_runtime_effective_turns_empty_without_session(tmp_path):
+    rt = _runtime(tmp_path)
+    rt._session_turns.append({"user": "x", "answer": "y"})   # 有存货但没开会话
+    assert rt._effective_turns() == []

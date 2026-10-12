@@ -9,8 +9,9 @@
             user-prompts.md     # 当前任务，用户输入落在这里，模型可自行改写
             versions/           # 系统提示词的历史版本（可回滚）
             history/
-                transcript.jsonl  # 多轮对话档案（append-only，每轮一行 JSON，
-                                  #  用户的完整原始输入永不丢失、无损往返）
+                transcript.jsonl  # 对话档案（append-only，每轮一行 JSON，
+                                  #  用户的完整原始输入永不丢失、无损往返；
+                                  #  只增不改，不会被自动回读，--resume 才显式续读）
         functions/              # 二：python 文件即 function
         assets/                 # 用户/工具带入的图片（按内容 sha1 去重）
         logs/                   # 可观测：模型全部工作记录
@@ -251,7 +252,7 @@ class Workspace:
             "| `prompts/system-prompts.md` | 一：系统提示词，模型可自改（旧稿存于 `prompts/versions/`） |\n"
             "| `prompts/user-prompts.md` | 当前任务，用户输入落在这里 |\n"
             "| `prompts/plan.md` | 长任务待办清单，模型自己维护、每轮自动注入 |\n"
-            "| `prompts/history/transcript.jsonl` | 多轮对话档案：用户的完整原始输入 |\n"
+            "| `prompts/history/transcript.jsonl` | 对话档案：用户的完整原始输入（只增不改，`--resume` 可续读） |\n"
             "| `functions/*.py` | 二：python 文件即 function |\n"
             "| `logs/` | 模型全部工作记录（json / jsonl 分门别类） |\n"
             "| `memory/` | 模型自省产生的长期记忆 |\n"
@@ -517,10 +518,14 @@ class Workspace:
         return self.transcript_file
 
     def read_turns(self, n: int = 4) -> List[Dict[str, str]]:
-        """读回最近 n 轮对话（旧 → 新），用于播种进下一轮的上下文。
+        """读回最近 n 轮对话（旧 → 新），供 `--resume` 显式续读或统计轮数。
+
+        注意：这条读盘路径**不再被自动调用**。跨轮记忆走进程内会话
+        （见 runtime.begin_session / _effective_turns），只有 `--resume`
+        与自省/报告这类只读展示才会用到它。
 
         Args:
-            n: 轮数。n == 0 返回空列表（关闭记忆）；n < 0 返回全部轮次。
+            n: 轮数。n == 0 返回空列表；n < 0 返回全部轮次。
         """
         if n == 0:
             return []
