@@ -211,6 +211,7 @@ class Runtime:
 
         docs: List[Dict[str, Any]] = []
         budget: Optional[int] = (max(1, int(rounds)) if rounds is not None else None)
+        prev_summary = ""
         try:
             while True:
                 first = not docs
@@ -223,8 +224,10 @@ class Runtime:
                     round_index=len(docs) + 1,
                     first_round=first,
                     autonomous=True,
+                    next_round_summary=prev_summary,
                 )
                 docs.append(doc)
+                prev_summary = doc.get("next_round_summary") or ""
                 # 首轮跑完才知道整场轮预算（显式 --max-rounds / limits.json / 内核默认）
                 if budget is None:
                     budget = max(1, int(getattr(self.agent, "max_rounds", 1) or 1))
@@ -255,11 +258,14 @@ class Runtime:
                    images: Optional[Sequence[Union[str, Path]]] = None,
                    session: bool = False, round_index: int = 1,
                    first_round: bool = True,
-                   autonomous: bool = False) -> Dict[str, Any]:
+                   autonomous: bool = False,
+                   next_round_summary: str = "") -> Dict[str, Any]:
         """跑**一轮**：建 Agent → 起 ReAct → finalize，返回本轮的会话文档。
 
         一次任务由若干轮组成（见 run / run_auto）；本函数只管一轮。
-        `round_index` 是本轮序号，`autonomous` 表示处在自动接力里（供处境告知模型）。
+        `round_index` 是本轮序号，`autonomous` 表示处在自动接力里（供处境告知模型）；
+        `next_round_summary` 是上一轮 `next_round(summary=…)` 留下的交接说明，会播种进
+        本轮 Agent 的历史开头 —— 让「交给下一轮的自己」真的能交接。
         """
         problem = self.check()
         if problem:
@@ -314,7 +320,8 @@ class Runtime:
                            progress=progress,
                            max_rounds=self.max_rounds,
                            round_index=round_index,
-                           autonomous=autonomous)
+                           autonomous=autonomous,
+                           next_round_summary=next_round_summary)
         self.agent.current_images = list(image_refs)
         self.agent.task_text = self.user_text
         KERNEL.agent = self.agent
@@ -359,6 +366,8 @@ class Runtime:
         doc["max_rounds"] = self.agent.max_rounds
         doc["step_limit_hit"] = self.agent.step_limit_hit
         doc["wants_next_round"] = self.agent.wants_next_round
+        # 本轮给下一轮的交接说明（由 Runtime 带到下一轮，见 _run_round 的入参）。
+        doc["next_round_summary"] = self.agent.next_round_summary
 
         # 本轮对话入档：用户的完整原始输入 append 进 transcript，永不丢失。
         # 这只写不读（档案/可观测）；跨轮记忆走进程内会话，见 _effective_turns。
@@ -422,6 +431,7 @@ class Runtime:
         if owns_session:
             self.begin_session()
         docs: List[Dict[str, Any]] = []
+        prev_summary = ""
         try:
             for i in range(rounds):
                 first = (i == 0)
@@ -435,11 +445,13 @@ class Runtime:
                         round_index=i + 1,
                         first_round=first,
                         autonomous=True,
+                        next_round_summary=prev_summary,
                     )
                 except RuntimeError as exc:
                     self.say(f"[auto] 第 {i + 1} 轮启动失败：{exc}")
                     break
                 docs.append(doc)
+                prev_summary = doc.get("next_round_summary") or ""
 
                 status = str(doc.get("status") or "")
                 open_items = self.ws.plan_open_items()

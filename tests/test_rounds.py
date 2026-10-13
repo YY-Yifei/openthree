@@ -208,3 +208,62 @@ def test_next_round_without_autonomy_says_so(ws, registry):
     out = next_round(summary="x")
     assert "没有下一轮" in out
     assert ag.wants_next_round is True
+
+
+# ---------------------------------------------------------------- 交接说明真能过轮
+def test_next_round_summary_is_stored_round_write(ws, registry):
+    """next_round(summary=…) 不只是记日志 —— 说明必须存下来，供下一轮取用。"""
+    from openthree.llm import LLM, LLMConfig
+    ag = _agent(ws, registry, LLM(LLMConfig(api_key="k", base_url="u")),
+                round_index=1, autonomous=True)
+    next_round(summary="做完一半，下一轮收尾")
+    assert ag.next_round_summary == "做完一半，下一轮收尾"
+
+
+def test_next_round_summary_injected_into_history(ws, registry):
+    """Runtime 把上一轮的交接说明带来 → 本轮 history 开头出现一条 system 便条。"""
+    from openthree.agent import Agent
+    from openthree.llm import LLM, LLMConfig
+    ag = Agent(ws, registry, LLM(LLMConfig(api_key="k", base_url="u")),
+               Recorder(ws, user_input="t", model="s"),
+               next_round_summary="上一轮到哪了")
+    ag._inject_next_round_summary()
+    assert ag.history[0]["role"] == "system"
+    assert "上一轮到哪了" in ag.history[0]["content"]
+    # 只注入一次（第二步不该再来一条）
+    first = len(ag.history)
+    ag._inject_next_round_summary()
+    assert len(ag.history) == first
+
+
+def test_run_carries_next_round_summary_across_rounds(tmp_path):
+    """端到端：第一轮 next_round 的 summary，第二轮的历史开头真的能看到。"""
+    seen = {}
+
+    class _TwoRoundLLM:
+        """第 1 轮 next_round 交代交接；第 2 轮检查 history 里有没有它，然后 finish。"""
+
+        def __init__(self, cfg):
+            self.config = cfg
+            self.round = 0
+
+        def chat(self, messages, tools=None, tool_choice="auto", **kwargs):
+            self.round += 1
+            if self.round == 1:
+                name, args = "next_round", {"summary": "第一轮交接词"}
+            else:
+                blob = json.dumps(messages, ensure_ascii=False)
+                seen["leaked"] = "第一轮交接词" in blob
+                name, args = "finish", {"answer": "done"}
+            msg = {"role": "assistant", "content": "",
+                   "tool_calls": [{"id": f"c{self.round}", "type": "function",
+                                   "function": {"name": name,
+                                                "arguments": json.dumps(args)}}]}
+            return {"message": msg, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    "elapsed_ms": 0.0, "raw_request": {"messages": []},
+                    "raw_response": {"choices": [{"message": msg}]}, "error": None}
+
+    rt = _rt(tmp_path, llm_cls=_TwoRoundLLM, max_rounds=2)
+    doc = rt.run("开始长任务")
+    assert doc["rounds_run"] == 2                      # 第 1 轮 next_round → 续第 2 轮
+    assert seen.get("leaked") is True                  # 交接词跨轮进了第二轮的 prompt

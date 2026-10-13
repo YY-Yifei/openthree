@@ -1271,7 +1271,7 @@ def next_round(summary: str = "") -> str:
     if KERNEL.agent is None:
         return "[错误] 内核未就绪"
     r = KERNEL.agent.round_stats()
-    KERNEL.agent.next_round()
+    KERNEL.agent.next_round(summary)
     if KERNEL.recorder is not None:
         KERNEL.recorder.record(
             "finish" if not r.get("next") else "note",

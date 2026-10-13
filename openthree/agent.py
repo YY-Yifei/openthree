@@ -154,7 +154,8 @@ class Agent:
                  max_truncations: int = 2,
                  max_rounds: Optional[int] = None,
                  round_index: int = 1,
-                 autonomous: bool = False) -> None:
+                 autonomous: bool = False,
+                 next_round_summary: str = "") -> None:
         self.ws = workspace
         self.reg = registry
         self.llm = llm
@@ -216,6 +217,11 @@ class Agent:
         self.step_limit_hit = False
         # 模型用 next_round 显式宣告「这一阶段做完了，开新一轮」。
         self.wants_next_round = False
+        # 上一轮 next_round(summary=…) 的交接说明：由 Runtime 跨轮带来，
+        # 播种进本轮历史开头 —— 否则那句「交给下一轮的自己」只会写进日志，
+        # 下一轮其实收不到（next_round 的 docstring 却承诺了交接）。
+        self.next_round_summary = (next_round_summary or "").strip()
+        self._next_round_injected = False
         self._compact_marks: List[Tuple[int, int, str]] = []
         # 累计发生过多少次折叠（模型折叠 + 内核兜底），供 context_usage 读数
         self._compaction_count = 0
@@ -523,13 +529,17 @@ class Agent:
             "max_steps": self.max_iterations,
         }
 
-    def next_round(self) -> None:
+    def next_round(self, summary: str = "") -> None:
         """（工具入口）宣告「这一阶段做完了，开新一轮」——替本条消息收尾，但不算 finish。
 
         与 finish 的区别：finish 是「整件事做完」，next_round 是「这一轮先到这，
         剩下的下一轮接着做」。只在自动接力（Runtime 逐轮驱动）里真正会开出下一轮；
         单次任务里它只是把发言权交还，运行期如实告诉模型「没有下一轮」。
+
+        `summary` 由 Runtime 带到下一轮、播种在本轮历史开头（见 _seed_history），
+        于是「交给下一轮的自己」是真能交接的，而不是只落在日志里。
         """
+        self.next_round_summary = (summary or "").strip()
         self.wants_next_round = True
         self.finished = True
 
@@ -595,6 +605,7 @@ class Agent:
             self._apply_pending_compactions()
             self._auto_compact()
             self._inject_images()
+            self._inject_next_round_summary()  # 上一轮 next_round 的交接说明（只在首步注入）
 
             steps = _index_steps(self.history)
             fold_range = f"{min(steps)}-{max(steps)}" if steps else ""
@@ -762,6 +773,25 @@ class Agent:
                         data={"action": "inject_images", "count": n,
                               "sources": images, "detail": detail or DEFAULT_DETAIL})
         self.progress.note(f"注入 {n} 张图片供模型查看")
+
+    def _inject_next_round_summary(self) -> None:
+        """把上一轮 `next_round(summary=…)` 的交接说明注入 history 开头（只一次）。
+
+        与跨轮播种的旧对话不同：这是**上一轮的你**留给**这一轮的你**的便条，
+        不是用户说的话，所以标成 system，放在最前面 —— 让本轮一开场就知道
+        「上一轮到哪了、还剩什么」。
+        """
+        if self._next_round_injected or not self.next_round_summary:
+            return
+        self.history.insert(0, {
+            "role": "system",
+            "content": ("[上一轮交接] " + self.next_round_summary
+                        + "\n（这是你主动 next_round 时留给这一轮的便条；接着做。）"),
+        })
+        self._next_round_injected = True
+        self.rec.record("system", summary="注入上一轮 next_round 交接说明",
+                        data={"action": "seed_next_round_summary",
+                              "chars": len(self.next_round_summary)})
 
     def _inject_images(self) -> None:
         """把本轮的「任务文本 + 图片」作为一条 user 消息注入 history（只注入一次）。
