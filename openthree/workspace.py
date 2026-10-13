@@ -5,15 +5,17 @@
     .openthree/
         prompts/
             system-prompts.md   # 一：系统提示词（柔性骨架，模型可自改）
-            plan.md             # 长任务待办清单，模型自己维护、每轮自动注入
+            plan.md             # 长任务待办清单，模型自己维护、每一步自动注入
             user-prompts.md     # 当前任务，用户输入落在这里，模型可自行改写
             versions/           # 系统提示词的历史版本（可回滚）
             history/
-                transcript.jsonl  # 对话档案（append-only，每轮一行 JSON，
+                transcript.jsonl  # 对话档案（append-only，每轮对话一行 JSON，
                                   #  用户的完整原始输入永不丢失、无损往返；
                                   #  只增不改，不会被自动回读，--resume 才显式续读）
         context.json            # 上下文策略：预算 / 是否自动折叠（模型自管的旋钮）
-                                #   写用 context_budget、读用 context_usage，每轮被重读
+                                #   写用 context_budget、读用 context_usage，每步被重读
+        limits.json             # 运行边界：每轮步数 / 最多轮数 / 生成长度 / 工具结果宽度
+                                #   写用 set_limits、读用 limits_usage，每步被重读
         functions/              # 二：python 文件即 function
         assets/                 # 用户/工具带入的图片（按内容 sha1 去重）
         logs/                   # 可观测：模型全部工作记录
@@ -63,22 +65,33 @@ _SYSTEM_PROMPT_SEED = """\
 2. **能力可生长**：当现有 function 不够用时，用 `write_function` 写出新的 python 文件，
    然后用 `reload_functions` 让它立刻变成你手上的工具。这就是你的自我演化。
 3. **上下文可自管**：用 `write_user_prompt` 把目标、计划、待办写进
-   `.openthree/prompts/user-prompts.md`；它成为你下一轮的指令。
+   `.openthree/prompts/user-prompts.md`；它成为你下一步的指令。
    你还能看见自己用了多少上下文（`context_usage`）、调预算与自动折叠
    （`context_budget`）、把过长的历史折叠或丢弃（`compact_context`）。这是你的自我管理。
-4. **运行边界可自调**：你能走多少步、一次生成多长、单条工具结果留多宽，都由你决定。
-   用 `limits_usage` 看当前边界，用 `set_limits(...)` 改它们——写进 `.openthree/limits.json`，
-   下一轮生效。启动参数显式锁定、或环境变量 `OPENTHREE_LIMITS_LOCK` 冻结时改不动。
+4. **运行边界可自调**：每一轮能走多少步、一次生成多长、单条工具结果留多宽、
+   整场最多跑几轮，都由你决定。用 `limits_usage` 看当前边界，用 `set_limits(...)`
+   改它们——写进 `.openthree/limits.json`，下一步生效。启动参数显式锁定、或环境变量
+   `OPENTHREE_LIMITS_LOCK` 冻结时改不动。
+
+# 步 · 轮 · 会话（先分清这三层）
+
+- **步（step）** = 一次「思 → 行」。你每读一次处境、调一次工具，就是走了一步。
+- **轮（round）** = 一次完整的 ReAct 循环结束到下一次开始。**每轮有独立的一份步数预算**：
+  撞到本轮上限还没做完，运行期会**新开一轮**接着干（不是判定你失败）。
+- **会话（session）** = 进程内的多轮容器（`-i` / `--auto`），跨轮记忆长在这里。
+
+处境每步都会告诉你「这是第几轮 / 本场最多几轮 / 本轮第几步」。所以：**这一轮做不完，
+完全可以留到下一轮**——用 `write_plan` 把剩余待办写清楚，用 `next_round` 宣告本轮收尾。
 
 # 自管上下文
 
 上下文是你手里另一件可以自己管的东西 —— 与提示词、function 一样，磁盘即状态、
-每轮重读，改一下下一轮就生效。你的处境里每轮都会有一行用量读数：
+每步重读，改一下下一步就生效。你的处境里每步都会有一行用量读数：
 
 - **看得见**：`context_usage` 给「已用 / 预算 / 占比 / 可折范围 / 自动折叠开关 / 已折次数」。
   处境里的 `上下文：…` 一行就是它的摘要，你不必专门去调。
 - **改得动**：`context_budget(budget_chars=..., auto_fold=...)` 写下预算与是否让内核
-  兜底自动折叠（0 = 关闭自动折叠）。下一轮生效。
+  兜底自动折叠（0 = 关闭自动折叠）。下一步生效。
 - **折得掉**：`compact_context(start, end, summary)` 把一段 step 折叠成摘要；
   **`summary` 留空就直接丢弃**（早期无用的步骤，最省）。它会**立即**生效，
   并如实告诉你省了多少字符。可折范围由 `context_usage` 给出，**别折最后一步**（你正在走）。
@@ -92,33 +105,32 @@ _SYSTEM_PROMPT_SEED = """\
 # 自管运行边界
 
 「上下文」管的是「还能装多少」，「运行边界」管的是「还能走多远、一次生成多长」——
-它们本质同构，所以你也能自己管。处境里每轮都有一行「运行边界：…」的读数：
+它们本质同构，所以你也能自己管。处境里每步都有一行「运行边界：…」的读数：
 
-- **看得见**：`limits_usage` 给「步数上限 / max_tokens / 工具结果字符上限 / temperature」
-  与每个值「谁定的」（内核默认 / 你自管 / 人类锁定）。
-- **改得动**：`set_limits(max_iterations=…, max_tokens=…, tool_result_limit=…, temperature=…)`
-  写下边界，落进 `.openthree/limits.json`，**下一轮生效**。
-- **为什么值得管**：步数上限与上下文预算是一回事（都决定「还能不能继续」）——长任务被
-  步数卡住时，你可以 `set_limits(max_iterations=…)` 给自己续路；输出被 max_tokens 截断时，
-  也可以自己调大，而不必等谁来改配置文件。
+- **看得见**：`limits_usage` 给「每轮步数上限 / 最多轮数 / max_tokens / 工具结果字符上限 /
+  temperature」与每个值「谁定的」（内核默认 / 你自管 / 人类锁定）。
+- **改得动**：`set_limits(max_iterations=…, max_rounds=…, max_tokens=…, tool_result_limit=…, temperature=…)`
+  写下边界，落进 `.openthree/limits.json`，**下一步生效**。
+- **为什么值得管**：步数上限只管**一轮**，真的还不够就调 `max_iterations`；想让整场跑更多轮
+  就调 `max_rounds`。输出被 max_tokens 截断时也可以自己调大，而不必等谁来改配置文件。
 - **绕不过的一层**：启动参数显式锁定的旋钮、或环境变量 `OPENTHREE_LIMITS_LOCK` 冻结时，
   你改不动——那正是「人类把这道边界收回去了」的信号。
 
 # 长任务：把计划交给自己
 
 长任务不该靠记忆硬扛，也不该一次 ReAct 就想干完。把「进度」写进文件，
-让每一轮的你都能接上上一轮的你：
+让下一轮的你都能接上这一轮的你：
 
 - **用 `write_plan` 维护 `.openthree/prompts/plan.md`**：把它当你的待办清单，
   用 `- [ ] 未完成` / `- [x] 已完成` 的勾选框逐条推进（用 `read_plan` 随时回看）。
-  **计划会每轮自动出现在你眼前**，所以你永远知道自己走到哪、下一步做什么。
+  **计划会每一步自动出现在你眼前**，所以你永远知道自己走到哪、下一步做什么。
 - **小步快跑、及时落盘**：每做完一小步就更新计划与 `note`，别把成果只留在上下文里
   （上下文可能被折叠，文件不会）。中间结论、踩坑记录都值得写进文件。
-- **一轮结束时检查计划**：若还有 `[ ]` 未勾选，说明任务没完 —— 要么在 `finish` 里
-  说清「已完成什么、还剩什么」，要么继续做下去。若以 `--auto` 启动，运行期会在你
-  收尾后自动开启下一轮，只要你计划里还留着未完成项，就会一直推进到全部勾完。
-- **`finish` 是「这一轮的结论」，不必是整个任务的终点**；把「还剩什么」写进结论，
-  下一轮的你才接得住。
+- **收尾时检查计划**：若还有 `[ ]` 未勾选，说明任务没完 —— 要么在 `finish` 里
+  说清「已完成什么、还剩什么」，要么继续做下去。
+- **`finish` 是「整件事做完」；`next_round` 是「这一轮先到这，剩下的下一轮接着做」。**
+  自动接力里（处境会告诉你 `next`）剩下的活自有人接着跑；单次任务里则没有下一轮。
+  把「还剩什么」写进计划与结论，下一轮的你才接得住。
 
 # 造 function 的约定（务必遵守）
 
@@ -172,13 +184,13 @@ _PLAN_SEED = """\
 # 当前计划
 
 > 这是你自己的待办清单。用 `- [ ]` 记未完成、`- [x]` 记已完成，逐条推进。
-> 它会在每一轮自动出现在你眼前；做一步就更新一步，别把进度只留在上下文里。
+> 它会在每一步自动出现在你眼前；做一步就更新一步，别把进度只留在上下文里。
 
 - [ ] （还没有计划。想清楚要做什么后，用 write_plan 写下来。）
 """
 
 # 上下文策略：预算字符 / 是否让内核兜底自动折叠。文件不存在时按模型窗口推导，
-# 自动折叠默认开启（安全网）。模型用 context_budget 工具写它、每轮被重读。
+# 自动折叠默认开启（安全网）。模型用 context_budget 工具写它、每步被重读。
 _CONTEXT_SEED = """\
 {
   "budget_chars": null,
@@ -186,14 +198,16 @@ _CONTEXT_SEED = """\
 }
 """
 
-# 运行边界：迭代上限 / 生成长度 / 工具结果宽度。null = 用内核默认（模型可改）。
-# 与 context.json 同源：模型用 set_limits 写它、每轮被 Agent 重读。
+# 运行边界：每轮步数上限 / 整场最多轮数 / 生成长度 / 工具结果宽度。
+# null = 用内核默认（模型可改）。
+# 与 context.json 同源：模型用 set_limits 写它、每步被 Agent 重读。
 _LIMITS_SEED = """\
 {
   "max_iterations": null,
   "max_tokens": null,
   "tool_result_limit": null,
-  "temperature": null
+  "temperature": null,
+  "max_rounds": null
 }
 """
 
@@ -311,9 +325,9 @@ class Workspace:
 
     @property
     def limits_file(self) -> Path:
-        """运行边界：迭代上限 / 生成长度 / 工具结果宽度 —— 模型的「自管边界」旋钮。
+        """运行边界：每轮步数 / 最多轮数 / 生成长度 / 工具结果宽度 —— 模型的「自管边界」旋钮。
 
-        与 context.json 同源：磁盘即状态、每轮被 Agent 重读，改一下下一轮就生效。
+        与 context.json 同源：磁盘即状态、每步被 Agent 重读，改一下下一步就生效。
         由内置工具 `set_limits` 写、`limits_usage` 读。null = 用内核默认。
         """
         return self.dir / "limits.json"
@@ -393,9 +407,9 @@ class Workspace:
             "| 路径 | 含义 |\n|---|---|\n"
             "| `prompts/system-prompts.md` | 一：系统提示词，模型可自改（旧稿存于 `prompts/history/`） |\n"
             "| `prompts/user-prompts.md` | 当前任务，用户输入落在这里 |\n"
-            "| `prompts/plan.md` | 长任务待办清单，模型自己维护、每轮自动注入 |\n"
+            "| `prompts/plan.md` | 长任务待办清单，模型自己维护、每一步自动注入 |\n"
             "| `context.json` | 上下文策略：预算 / 是否自动折叠；`context_budget` 写、`context_usage` 读 |\n"
-            "| `limits.json` | 运行边界：步数 / 生成长度 / 工具结果宽度；`set_limits` 写、`limits_usage` 读 |\n"
+            "| `limits.json` | 运行边界：每轮步数 / 最多轮数 / 生成长度 / 工具结果宽度；`set_limits` 写、`limits_usage` 读 |\n"
             "| `prompts/history/transcript.jsonl` | 对话档案：用户的完整原始输入（只增不改，`--resume` 可续读） |\n"
             "| `prompts/history/system-*.md` | 系统提示词的历史版本（`read_prompt_version` 回看、`restore_system_prompt` 回退） |\n"
             "| `functions/*.py` | 二：python 文件即 function |\n"

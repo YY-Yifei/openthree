@@ -831,7 +831,7 @@ def read_prompts() -> str:
 
 
 def write_system_prompt(content: str) -> str:
-    """改写系统提示词 —— 你对「我是谁、我该怎么做」的定义，下一轮即刻生效。
+    """改写系统提示词 —— 你对「我是谁、我该怎么做」的定义，下一步即刻生效。
 
     覆写前会自动把旧稿存进 prompts/ 的历史目录，因此改坏了可以用
     `restore_system_prompt` 回退，不必怕失手。想回看自己改过哪些版本，
@@ -850,7 +850,7 @@ def write_system_prompt(content: str) -> str:
                                data={"action": "write_system_prompt", "content": content,
                                      "snapshot": snapshot.name if snapshot else ""})
     saved = f"，旧稿存档 {snapshot.name}" if snapshot else ""
-    return f"[ok] 系统提示词已更新（{len(content)} 字符{saved}），下一轮生效。"
+    return f"[ok] 系统提示词已更新（{len(content)} 字符{saved}），下一步生效。"
 
 
 def write_user_prompt(content: str) -> str:
@@ -866,7 +866,7 @@ def write_user_prompt(content: str) -> str:
     if KERNEL.recorder is not None:
         KERNEL.recorder.record("evolution", summary="改写用户提示词（任务）",
                                data={"action": "write_user_prompt", "content": content})
-    return f"[ok] 任务已更新（{len(content)} 字符），下一轮生效。"
+    return f"[ok] 任务已更新（{len(content)} 字符），下一步生效。"
 
 
 def read_plan() -> str:
@@ -882,7 +882,7 @@ def read_plan() -> str:
 
 
 def write_plan(content: str) -> str:
-    """写下/更新你的计划——长任务的推进清单，它会每轮自动出现在你眼前。
+    """写下/更新你的计划——长任务的推进清单，它会每一步自动出现在你眼前。
 
     用 markdown 勾选框逐条推进：`- [ ] 未完成`、`- [x] 已完成`。
     长任务请把「已完成什么、还剩什么」写在这里，别只留在上下文里
@@ -900,7 +900,7 @@ def write_plan(content: str) -> str:
         KERNEL.recorder.record("evolution", summary=f"更新计划（未完成 {open_items} 项）",
                                data={"action": "write_plan", "content": content,
                                      "open_items": open_items})
-    return f"[ok] 计划已更新（{len(content)} 字符，未完成 {open_items} 项），下一轮生效。"
+    return f"[ok] 计划已更新（{len(content)} 字符，未完成 {open_items} 项），下一步生效。"
 
 
 def list_prompt_versions() -> str:
@@ -1022,7 +1022,7 @@ def restore_system_prompt(version: str) -> str:
     if KERNEL.recorder is not None:
         KERNEL.recorder.record("evolution", summary=f"回退系统提示词到 {name}",
                                data={"action": "restore_system_prompt", "version": version})
-    return f"[ok] 系统提示词已回退到 {name}，下一轮生效。"
+    return f"[ok] 系统提示词已回退到 {name}，下一步生效。"
 
 
 # ---------------------------------------------------------------- 管上下文
@@ -1164,7 +1164,7 @@ def context_usage() -> str:
 
 def context_budget(budget_chars: Optional[int] = None,
                    auto_fold: Optional[bool] = None) -> str:
-    """调整「上下文策略」——改预算、开关自动折叠。下一轮即生效。
+    """调整「上下文策略」——改预算、开关自动折叠。下一步即生效。
 
     这是你自管上下文的旋钮：预算给多大、要不要内核兜底自动折叠，都由你决定。
     `context_usage` 是它的读数。两个参数至少给一个。
@@ -1188,18 +1188,22 @@ def context_budget(budget_chars: Optional[int] = None,
 
 
 def limits_usage() -> str:
-    """看一眼「运行边界」——你能走多少步、生成多长、单条工具结果留多宽。
+    """看一眼「运行边界」——你能走多少步、最多几轮、生成多长、单条工具结果留多宽。
 
-    自管边界的前提是看得见。返回：迭代上限 / max_tokens / 工具结果字符上限 /
-    temperature，以及每个值「谁定的」（内核默认 / 模型自管 / 显式锁定）。
-    想调整它们，用 `set_limits`。
+    自管边界的前提是看得见。返回：每轮步数上限 / 最多轮数 / max_tokens /
+    工具结果字符上限 / temperature，以及每个值「谁定的」（内核默认 / 模型自管 /
+    显式锁定）。想调整它们，用 `set_limits`。
+
+    **步与轮是两层**：`max_iterations` 只管**一轮**；一轮没做完会由运行期开下一轮，
+    整场最多跑 `max_rounds` 轮。长任务做不完时，先想「还差几轮」，而不是一味堆步数。
     """
     if KERNEL.agent is None:
         return "[错误] 内核未就绪"
     s = KERNEL.agent.limits_stats()
     src = s["source"]
     lines = [
-        f"迭代上限：{s['max_iterations']} 步（{src['max_iterations']}）",
+        f"每轮步数上限：{s['max_iterations']} 步（{src['max_iterations']}）",
+        f"整场最多轮数 max_rounds：{s['max_rounds']} 轮（{src['max_rounds']}）",
         f"生成上限 max_tokens：{s['max_tokens']}（{src['max_tokens']}）",
         f"工具结果上限：{s['tool_result_limit']} 字符（{src['tool_result_limit']}）",
         f"temperature：{s['temperature']}（{src['temperature']}）",
@@ -1212,37 +1216,76 @@ def limits_usage() -> str:
 def set_limits(max_iterations: Optional[int] = None,
                max_tokens: Optional[int] = None,
                tool_result_limit: Optional[int] = None,
-               temperature: Optional[float] = None) -> str:
-    """调整「运行边界」——步数 / 生成长度 / 工具结果宽度 / 温度。下一轮即生效。
+               temperature: Optional[float] = None,
+               max_rounds: Optional[int] = None) -> str:
+    """调整「运行边界」——每轮步数 / 最多轮数 / 生成长度 / 工具结果宽度 / 温度。
+    下一步即生效。
 
-    这是你自管「运行边界」的旋钮：能走多远、一次输出多长、单条工具结果留多宽，
-    都由你决定。`limits_usage` 是它的读数。被启动参数显式锁定、或被环境变量
-    `OPENTHREE_LIMITS_LOCK` 冻结时，这些旋钮改不动（会如实告诉你）。
+    这是你自管「运行边界」的旋钮：一轮能走多远、整场能跑几轮、一次输出多长、
+    单条工具结果留多宽，都由你决定。`limits_usage` 是它的读数。被启动参数显式锁定、
+    或被环境变量 `OPENTHREE_LIMITS_LOCK` 冻结时，这些旋钮改不动（会如实告诉你）。
 
     Args:
-        max_iterations: ReAct 步数上限；不传 = 不改。
+        max_iterations: **每轮** ReAct 步数上限；不传 = 不改。
         max_tokens: 单次生成 token 上限（`config.yaml` 的 llm.max_tokens）；不传 = 不改。
         tool_result_limit: 单个工具结果进 history 的字符上限，超出落盘；不传 = 不改。
         temperature: 采样温度（0~2）；不传 = 不改。
+        max_rounds: **整场任务**最多自动接力几轮（一轮=一次完整 ReAct 循环）；不传 = 不改。
     """
     if KERNEL.agent is None:
         return "[错误] 内核未就绪"
     ok, msg = KERNEL.agent.set_limits(max_iterations=max_iterations,
                                       max_tokens=max_tokens,
                                       tool_result_limit=tool_result_limit,
-                                      temperature=temperature)
+                                      temperature=temperature,
+                                      max_rounds=max_rounds)
     if KERNEL.recorder is not None:
         KERNEL.recorder.record(
             "evolution" if ok else "error",
             summary=f"调整运行边界：{msg}" if ok else msg[:200],
             data={"action": "set_limits", "max_iterations": max_iterations,
                   "max_tokens": max_tokens, "tool_result_limit": tool_result_limit,
-                  "temperature": temperature, "ok": ok},
+                  "temperature": temperature, "max_rounds": max_rounds, "ok": ok},
         )
     return msg
 
 
 # ---------------------------------------------------------------- 收尾
+
+
+def next_round(summary: str = "") -> str:
+    """宣告「这一阶段做完了，把剩下的留到下一轮」——收本轮，不算整件事完成。
+
+    与 `finish` 的区别：`finish` 是「整件事做完了」；`next_round` 是「这一轮先到这，
+    剩下的下一轮接着做」。一轮 = 一次完整的 ReAct 循环，**每轮有独立的步数预算**。
+
+    - 处在**自动接力**里（处境会告诉你 `next` 是否为真）：本消息收尾后，运行期会新开一轮，
+      再把 `summary` 当作交接说明交给你下一轮。这正是「长任务分轮推进」的正规出口。
+    - 处在**单次任务**里（没有下一轮）：它只是把发言权交还，运行期会如实告诉你没有下一轮 ——
+      如果你其实还没做完，应该在 `finish` 里把「还剩什么」说清楚，或用 `set_limits(max_rounds=…)`
+      申请更多轮（若启动时开了自动接力）。
+
+    Args:
+        summary: 给「下一轮的你」的交接说明（已完成什么、还剩什么、下一步做什么）。
+    """
+    if KERNEL.agent is None:
+        return "[错误] 内核未就绪"
+    r = KERNEL.agent.round_stats()
+    KERNEL.agent.next_round()
+    if KERNEL.recorder is not None:
+        KERNEL.recorder.record(
+            "finish" if not r.get("next") else "note",
+            summary=f"第 {r['index']} 轮收尾，交由下一轮：{summary[:160]}",
+            data={"action": "next_round", "round": r["index"],
+                  "max_rounds": r["max"], "remaining": r["remaining"],
+                  "summary": summary},
+        )
+    if r.get("next"):
+        return (f"[ok] 已结束第 {r['index']} 轮（本场共 {r['max']} 轮，还剩 {r['remaining']} 轮）。"
+                f"运行期将开下一轮；已把你的交接说明记入工作记录。")
+    return ("[ok] 已结束本轮 —— 但这是**单次任务，没有下一轮**：进程到此收尾。"
+            "若事情没做完，请在 finish 里写清「还剩什么」；"
+            "想要真正的多轮接力，需要用自动接力启动（CLI `--auto N`）。")
 
 
 def finish(answer: str) -> str:
@@ -1600,6 +1643,7 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "context_budget": context_budget,
     "limits_usage": limits_usage,
     "set_limits": set_limits,
+    "next_round": next_round,
     "finish": finish,
     "get_time": get_time,
 }

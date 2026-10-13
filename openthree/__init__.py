@@ -6,7 +6,7 @@
     一   = 系统提示词（.openthree/prompts/system-prompts.md，柔性骨架，模型可自改）
     二   = functions（.openthree/functions/*.py，行动的能力）
     三   = ReAct 循环（观 → 思 → 行 → 观 …）
-           + 计划（.openthree/prompts/plan.md，长任务待办，每轮自动注入）
+           + 计划（.openthree/prompts/plan.md，长任务待办，每一步自动注入）
     万物 = 模型自己写出的新 function、新提示词、新工具、新世界
 
 写 function 只需要两件事：类型注解 + docstring。

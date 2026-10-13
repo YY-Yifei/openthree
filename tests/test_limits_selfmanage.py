@@ -24,7 +24,7 @@ def test_workspace_seeds_limits(ws: Workspace):
     assert ws.limits_file.exists()
     data = json.loads(ws.limits_file.read_text(encoding="utf-8"))
     assert set(data) == {"max_iterations", "max_tokens",
-                         "tool_result_limit", "temperature"}
+                         "tool_result_limit", "temperature", "max_rounds"}
     assert all(v is None for v in data.values())        # 种子 = 全交给内核默认
 
 
@@ -187,12 +187,13 @@ def test_generation_limits_passed_per_call(ws, registry):
 def test_limits_tools_registered():
     assert "limits_usage" in BUILTIN_FUNCTIONS
     assert "set_limits" in BUILTIN_FUNCTIONS
+    assert "next_round" in BUILTIN_FUNCTIONS
 
 
 def test_limits_usage_and_set_limits_tools(make_agent):
     ag = make_agent()
     out = limits_usage()
-    assert "迭代上限" in out and "max_tokens" in out
+    assert "每轮步数上限" in out and "max_rounds" in out and "max_tokens" in out
     msg = set_limits(max_iterations=77)
     assert msg.startswith("[ok]") and ag.max_iterations == 77
     assert "77" in limits_usage()
@@ -202,10 +203,10 @@ def test_limits_usage_and_set_limits_tools(make_agent):
 def test_prompt_injects_limits_line(ws, registry):
     block = build_runtime_block(
         ws, registry, model="m", iteration=1, max_iterations=200,
-        limits_stats={"max_iterations": 200, "max_tokens": 8192,
+        limits_stats={"max_iterations": 200, "max_rounds": 3, "max_tokens": 8192,
                       "tool_result_limit": 4000, "temperature": 0.3,
                       "locked": False})
-    assert "步数 ≤ 200" in block
+    assert "每轮步数 ≤ 200" in block
     assert "生成 ≤ 8192 token" in block
 
 

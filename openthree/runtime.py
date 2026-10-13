@@ -6,7 +6,7 @@
     一   workspace.init() 铺好 .openthree/，读出系统提示词
     二   registry reload，把 functions/*.py 变成工具
     三   agent 进入 ReAct 循环
-    万物 模型自己写 function / 改提示词 → 下一轮生效 → 能力自生长
+    万物 模型自己写 function / 改提示词 → 下一步生效 → 能力自生长
 
 可观测分两层：
     * Recorder —— 落盘的真相（logs/、three-report.html），回答「发生过什么」。
@@ -52,13 +52,16 @@ class Runtime:
                  context_budget_chars: Optional[int] = None,
                  context_window_tokens: Optional[int] = None,
                  heartbeat: float = 15.0,
-                 turns: Optional[int] = None) -> None:
+                 turns: Optional[int] = None,
+                 max_rounds: Optional[int] = None) -> None:
         self.project_dir = Path(project_dir or Path.cwd()).resolve()
         self.quiet = quiet
-        self.max_iterations = max_iterations          # None = 交给模型（.openthree/limits.json）
+        self.max_iterations = max_iterations          # 每轮步数；None = 交给模型（limits.json）
         self.tool_result_limit = tool_result_limit    # 同上：显式才锁，否则模型可自管
         self.max_tokens = max_tokens
         self.temperature = temperature
+        # 整场最多几轮（每轮一次完整 ReAct）；None = 交给模型（limits.json），内核默认 3。
+        self.max_rounds = max_rounds
         # 先记住是否显式给了预算/窗口，等 config 读出来后再统一解析。
         self._context_budget_arg = context_budget_chars
         self._context_window_arg = context_window_tokens
@@ -178,21 +181,92 @@ class Runtime:
     def run(self, user_input: Optional[str] = None, *,
             append: bool = False, session_id: Optional[str] = None,
             images: Optional[Sequence[Union[str, Path]]] = None,
-            session: bool = False) -> Dict[str, Any]:
-        """跑一轮任务。user_input 为 None 时沿用已有的 user-prompts.md。
+            session: bool = False,
+            rounds: Optional[int] = None) -> Dict[str, Any]:
+        """跑一次任务 —— **一次任务 = 若干轮（round），每轮是一次完整 ReAct 循环**。
 
-        images 是本轮携带的图片（本地路径或 http/data URL）。本地文件会先
-        复制进 .openthree/assets/ 去重归档，再交给 Agent 注入进 user 消息。
+        轮与步是两层：`max_iterations` 是**一轮**的步预算，`max_rounds` 是**整场**的
+        轮预算。于是「200 步」不再是整场任务的硬墙 —— 一轮没跑完（撞步数上限还没
+        finish，或模型主动 `next_round`）运行期会**新开一轮接着干**，由轮预算兜住成本。
 
-        session 为 True（或已由 begin_session 开会话）时，本轮的播种来自
+        单次任务的收尾条件（任一）：模型 finish（整件事做完）/ 某轮出错或被中断 /
+        达到轮预算。计划里还有未完成项但本轮已正常 finish 时，**不**自动续轮 ——
+        那是 `--auto`（run_auto）的语义，不是单次任务的。
+
+        `rounds` 可显式给整场轮数上限；None = 用 `max_rounds`（显式参数 > limits.json > 内核默认）。
+
+        user_input 为 None 时沿用已有的 user-prompts.md。images 是本轮携带的图片
+        （本地路径或 http/data URL）。session 为 True（或已开会话）时，跨轮播种来自
         进程内会话；否则从零开跑，**不读磁盘**。
         """
         problem = self.check()
         if problem:
             raise RuntimeError(problem)
 
+        # 会话归谁管：调用方显式 session=True 或已 begin_session() → 归调用方（跨调用累积）；
+        # 否则本次任务自带一个**短命会话**（只为本任务的轮间连续），收尾即弃、不残留。
+        owns_session = False
+        if not self._session_active and not session:
+            self.begin_session()
+            owns_session = True
+
+        docs: List[Dict[str, Any]] = []
+        budget: Optional[int] = (max(1, int(rounds)) if rounds is not None else None)
+        try:
+            while True:
+                first = not docs
+                doc = self._run_round(
+                    user_input if first else None,
+                    append=append if first else False,
+                    session_id=session_id,
+                    images=images if first else None,
+                    session=True,
+                    round_index=len(docs) + 1,
+                    first_round=first,
+                    autonomous=True,
+                )
+                docs.append(doc)
+                # 首轮跑完才知道整场轮预算（显式 --max-rounds / limits.json / 内核默认）
+                if budget is None:
+                    budget = max(1, int(getattr(self.agent, "max_rounds", 1) or 1))
+                status = str(doc.get("status") or "")
+
+                if status in ("error", "interrupted"):
+                    break
+                more = bool(doc.get("step_limit_hit")) or bool(doc.get("wants_next_round"))
+                if not more:
+                    break                          # 本轮正常 finish = 整件事收尾
+                if len(docs) >= budget:
+                    why = "撞到本轮步数上限" if doc.get("step_limit_hit") else "模型主动 next_round"
+                    self.say(f"[轮] 第 {len(docs)} 轮{why}，已达轮数上限 {budget}；"
+                             "再跑请加大 --max-rounds 或用 set_limits(max_rounds=…)")
+                    break
+                self.say(f"[轮] 第 {len(docs)} 轮未跑完（{budget} 轮预算内）→ 自动开始第 {len(docs) + 1} 轮")
+        finally:
+            if owns_session:
+                self.end_session()
+
+        last = dict(docs[-1])
+        last["rounds_run"] = len(docs)
+        last["round_answers"] = [d.get("answer", "") for d in docs]
+        return last
+
+    def _run_round(self, user_input: Optional[str] = None, *,
+                   append: bool = False, session_id: Optional[str] = None,
+                   images: Optional[Sequence[Union[str, Path]]] = None,
+                   session: bool = False, round_index: int = 1,
+                   first_round: bool = True,
+                   autonomous: bool = False) -> Dict[str, Any]:
+        """跑**一轮**：建 Agent → 起 ReAct → finalize，返回本轮的会话文档。
+
+        一次任务由若干轮组成（见 run / run_auto）；本函数只管一轮。
+        `round_index` 是本轮序号，`autonomous` 表示处在自动接力里（供处境告知模型）。
+        """
+        problem = self.check()
+        if problem:
+            raise RuntimeError(problem)
+
         # 这一轮是否处于会话中：显式 session=True 或此前已 begin_session()。
-        in_session = bool(session) or self._session_active
         if session:
             self._session_active = True
 
@@ -238,24 +312,31 @@ class Runtime:
                            # 「策略文件里的预算」能否生效；已推导的默认值不当覆写。
                            context_budget_chars=self._explicit_budget,
                            seed_turns=self._effective_turns(),
-                           progress=progress)
+                           progress=progress,
+                           max_rounds=self.max_rounds,
+                           round_index=round_index,
+                           autonomous=autonomous)
         self.agent.current_images = list(image_refs)
         self.agent.task_text = self.user_text
         KERNEL.agent = self.agent
 
-        self.say(f"道生一  工作区 {self.ws.dir}")
-        self.say(f"一生二  {len(self.registry)} 个工具"
-                 f"（内置 {len(self.registry.builtins)} / 自造 {len(self.registry.user_tools())}）")
-        self.say(f"二生三  ReAct 循环开始（上限 {self.agent.max_iterations} 步，模型 {self.config.model}）")
-        if image_refs:
+        # 「道生一」只在整场任务的开头喊一次；续轮的头部只交代「现在是第几轮」。
+        if first_round:
+            self.say(f"道生一  工作区 {self.ws.dir}")
+            self.say(f"一生二  {len(self.registry)} 个工具"
+                     f"（内置 {len(self.registry.builtins)} / 自造 {len(self.registry.user_tools())}）")
+        self.say(f"二生三  {'ReAct 循环开始' if first_round else f'第 {round_index} 轮开始'}"
+                 f"（每轮 ≤ {self.agent.max_iterations} 步 × 最多 {self.agent.max_rounds} 轮，"
+                 f"模型 {self.config.model}）")
+        if first_round and image_refs:
             self.say(f"       本轮输入含 {len(image_refs)} 张图片（多模态）")
         self.say(f"       上下文窗口 {_fmt_tokens(self.context_window_tokens)} token"
                  f" → 预算 {_fmt_chars(self.agent.context_budget_chars)} 字符"
                  f"（来源：{self.agent.context_budget_source()}；模型可用 context_budget 改）")
-        self.say(f"       运行边界：步数 ≤ {self.agent.max_iterations}、"
+        self.say(f"       运行边界：每轮 ≤ {self.agent.max_iterations} 步、最多 {self.agent.max_rounds} 轮、"
                  f"生成 ≤ {self.agent.max_tokens} token、工具结果 ≤ {self.agent.tool_result_limit} 字符"
                  f"（模型可用 set_limits 改）")
-        if self.heartbeat > 0 and not self.quiet:
+        if first_round and self.heartbeat > 0 and not self.quiet:
             self.say(f"       每 {self.heartbeat:g}s 打一次心跳，长任务不会看起来卡死")
 
         try:
@@ -275,6 +356,10 @@ class Runtime:
             progress.close()
 
         doc = self.recorder.finalize(answer=answer, status=status)
+        doc["round"] = self.agent.round_index
+        doc["max_rounds"] = self.agent.max_rounds
+        doc["step_limit_hit"] = self.agent.step_limit_hit
+        doc["wants_next_round"] = self.agent.wants_next_round
 
         # 本轮对话入档：用户的完整原始输入 append 进 transcript，永不丢失。
         # 这只写不读（档案/可观测）；跨轮记忆走进程内会话，见 _effective_turns。
@@ -287,7 +372,7 @@ class Runtime:
 
         # 会话内累积本轮 (用户原文, 结论)，供同一会话的后续轮次播种。
         # 没有会话（单次任务）时不累积，于是收尾即忘、不留痕。
-        if in_session:
+        if session or self._session_active:
             self._session_turns.append({
                 "user": self.user_text,
                 "answer": answer or "",
@@ -303,8 +388,9 @@ class Runtime:
                                      data={"error": f"{type(exc).__name__}: {exc}"})
 
         stats = doc["stats"]
-        self.say(f"三生万物 完成：{stats['steps']} 步 / {stats['tool_calls']} 工具调用 "
-                 f"/ {stats['evolutions']} 次演化")
+        self.say(f"三生万物 第 {self.agent.round_index} 轮完成：{stats['steps']} 步 / "
+                 f"{stats['tool_calls']} 工具调用 / {stats['evolutions']} 次演化"
+                 + ("（本轮撞步数上限，未收尾）" if self.agent.step_limit_hit else ""))
         self.say(f"报告 {self.ws.report_file}")
         self.say(f"记录 {self.recorder.session_file}")
         return doc
@@ -325,7 +411,7 @@ class Runtime:
         不会残留到下一次单次任务。若调用前已在会话中（如 `-i` 的会话），
         则沿用该会话，接力结束后它继续存在。
 
-        停下条件（任一）：计划已无 `- [ ]` 未完成项 / 某轮出错或被中断 /
+        停下条件（任一）：计划已无 `- [ ]` 未完成项且本轮已正常收尾 / 某轮出错或被中断 /
         达到轮数上限。于是「一个长任务」会自己跑到做完，而不是跑一轮就停。
 
         Returns:
@@ -341,12 +427,15 @@ class Runtime:
             for i in range(rounds):
                 first = (i == 0)
                 try:
-                    doc = self.run(
+                    doc = self._run_round(
                         user_input if first else None,
                         append=append if first else False,
                         session_id=session_id,
                         images=images if first else None,
                         session=True,
+                        round_index=i + 1,
+                        first_round=first,
+                        autonomous=True,
                     )
                 except RuntimeError as exc:
                     self.say(f"[auto] 第 {i + 1} 轮启动失败：{exc}")
@@ -358,19 +447,23 @@ class Runtime:
                 if status in ("error", "interrupted"):
                     self.say(f"[auto] 第 {i + 1} 轮 {status}，停止自动接力。")
                     break
-                # 还有未完成项，或本轮被迭代上限截断（unfinished）——都算「没做完」。
-                if open_items <= 0 and status != "unfinished":
+                # 计划还有未完成项、本轮撞了步数上限、或模型主动 next_round —— 都算「没做完」。
+                unfinished = (open_items > 0 or bool(doc.get("step_limit_hit"))
+                              or bool(doc.get("wants_next_round")))
+                if not unfinished:
                     self.say(f"[auto] 计划已无未完成项，收工（共 {i + 1} 轮）。")
                     break
                 if i + 1 >= rounds:
                     why = (f"计划还剩 {open_items} 项未完成" if open_items
-                           else "上一轮被步数上限截断（unfinished）")
+                           else ("上一轮撞到步数上限" if doc.get("step_limit_hit")
+                                 else "上一轮主动 next_round"))
                     self.say(f"[auto] 已达轮数上限 {rounds}，{why}；"
                              "再跑请加大 --auto 或用 openthree 继续。")
                     break
                 nxt = i + 2
                 why = (f"计划还有 {open_items} 项未完成" if open_items
-                       else "上一轮未跑完（unfinished）")
+                       else ("上一轮撞到步数上限" if doc.get("step_limit_hit")
+                             else "上一轮主动 next_round"))
                 self.say(f"[auto] {why} → 自动开始第 {nxt} 轮")
         finally:
             if owns_session:
@@ -399,11 +492,11 @@ class Runtime:
             f"（未完成 {self.ws.plan_open_items()} 项 / 历史版本 "
             f"{len(self.ws.list_prompt_versions())} 份）",
             f"对话档案 {self.ws.transcript_file}"
-            f"（{len(self.ws.read_turns(-1))} 轮，只增不改；--resume 可续读）",
+            f"（{len(self.ws.read_turns(-1))} 轮对话，只增不改；--resume 可续读）",
             f"长期记忆 {self.ws.memory_file}"
-            f"（{self.ws.count_memory()} 条，每轮注入最近几条；recall_memory 可检索）",
+            f"（{self.ws.count_memory()} 条，每步注入最近几条；recall_memory 可检索）",
             f"会话     {'进行中' if self._session_active else '无'}"
-            f"（会话内记忆 {self.turns if self.turns >= 0 else '全部'} 轮；"
+            f"（会话内记忆 {self.turns if self.turns >= 0 else '全部'} 轮对话；"
             "单次任务不读盘，-i / --auto 才逐轮累积）",
             f"工具     {len(reg)} 个（内置 {len(reg.builtins)} / 自造 {len(reg.user_tools())}）",
             f"上下文   窗口 {_fmt_tokens(self.context_window_tokens)} token"

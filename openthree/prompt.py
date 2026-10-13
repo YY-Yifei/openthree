@@ -7,7 +7,13 @@
          + .openthree/memory/memory.jsonl             （长期记忆，跨会话可回看）
          + .openthree/prompts/user-prompts.md        （任务，模型可自改）
 
-整个 run() 每一轮都重新组装，所以模型的自我修改下一轮立即生效。
+整个 run() 每一步都重新组装，所以模型的自我修改下一步立即生效。
+
+「轮 / 步 / 会话」三层务必分清（旧版把它们混着叫「轮」，是歧义的源头）：
+    * **步（step）** = ReAct 的一次「思 → 行」；一次 run() 内逐步推进。
+    * **轮（round）** = 一次完整的 ReAct 循环（= 一个 Agent 的生命周期）；
+      **每轮有独立的一份步数预算**，撞上限就由运行期决定是否开下一轮。
+    * **会话（session）** = 进程内的多轮容器（-i / --auto）。
 """
 from __future__ import annotations
 
@@ -32,7 +38,7 @@ RUNTIME_TEMPLATE = """\
 - 当前时间：{now}
 - 模型：{model}
 - 可用工具：{tool_count} 个（内置 {builtin_count} / 自造 {user_count}）
-- 本轮已是第 {iteration} 步（上限 {max_iterations}）
+- 这是第 {round_index} 轮（本场最多 {max_rounds} 轮），本轮第 {iteration} 步（上限 {max_iterations}）
 - 上下文：{context}（`context_usage` 看细节 / `context_budget` 调预算）
 - 运行边界：{limits}（`limits_usage` 看细节 / `set_limits` 调）
 
@@ -68,7 +74,8 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
                         max_iterations: int, last_action: str = "",
                         fold_range: str = "",
                         context_stats: Optional[Dict[str, Any]] = None,
-                        limits_stats: Optional[Dict[str, Any]] = None) -> str:
+                        limits_stats: Optional[Dict[str, Any]] = None,
+                        round_stats: Optional[Dict[str, Any]] = None) -> str:
     evolution = _recent_evolution(ws, limit=10)
     builtin = [t for t in reg.tools.values() if t.origin == "builtin"]
     user = [t for t in reg.tools.values() if t.origin == "user"]
@@ -82,6 +89,8 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         user_count=len(user),
         max_iterations=max_iterations,
         iteration=iteration,
+        round_index=int((round_stats or {}).get("index", 1)),
+        max_rounds=int((round_stats or {}).get("max", 1)),
         context=_context_line(context_stats, fold_range),
         limits=_limits_line(limits_stats, max_iterations),
         digest=reg.digest(),
@@ -123,7 +132,8 @@ def _limits_line(stats: Optional[Dict[str, Any]], max_iterations: int) -> str:
     if not stats:
         return f"步数上限 {max_iterations}"
     lock = "；被环境冻结，改不动" if stats.get("locked") else ""
-    return (f"步数 ≤ {stats.get('max_iterations', max_iterations)}；"
+    return (f"每轮步数 ≤ {stats.get('max_iterations', max_iterations)}；"
+            f"最多 {stats.get('max_rounds', '?')} 轮（整场）；"
             f"生成 ≤ {stats.get('max_tokens', '?')} token；"
             f"工具结果 ≤ {stats.get('tool_result_limit', '?')} 字符；"
             f"temperature {stats.get('temperature', '?')}{lock}")
@@ -189,7 +199,7 @@ def _plan_block(ws: Workspace) -> str:
 
 def _recent_evolution(ws: Workspace, limit: int = 10) -> str:
     """最近若干条演化史。**只给最近 10 条**，是为了让模型知道「怎么回看更多」——
-    完整历史在 evolution.jsonl 与 prompts/history/，不必也不必全部塞进每一轮上下文。
+    完整历史在 evolution.jsonl 与 prompts/history/，不必也不必全部塞进每一步上下文。
     """
     path = ws.logs_dir / "evolution.jsonl"
     if not path.exists():
@@ -219,13 +229,14 @@ def build_messages(ws: Workspace, reg: Registry, history: List[Dict[str, Any]], 
                    model: str, iteration: int, max_iterations: int,
                    last_action: str = "", fold_range: str = "",
                    context_stats: Optional[Dict[str, Any]] = None,
-                   limits_stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                   limits_stats: Optional[Dict[str, Any]] = None,
+                   round_stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """组装完整 messages。system = 一 + 运行期三；history 是模型自己走过的路。"""
     system_prompt = ws.read_system_prompt().strip()
     runtime = build_runtime_block(ws, reg, model=model, iteration=iteration,
                                   max_iterations=max_iterations, last_action=last_action,
                                   fold_range=fold_range, context_stats=context_stats,
-                                  limits_stats=limits_stats)
+                                  limits_stats=limits_stats, round_stats=round_stats)
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": f"{system_prompt}\n\n{runtime}"}
     ]

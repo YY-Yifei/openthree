@@ -60,9 +60,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--images", default=None, metavar="A,B,C",
                    help="随任务附图片，逗号分隔（等价于多个 --image）。")
     p.add_argument("-n", "--max-iterations", type=int, default=None,
-                   help="ReAct 最大步数（显式给出即锁定，模型改不动）；"
+                   help="每轮 ReAct 最大步数（显式给出即锁定，模型改不动）；"
                         "不传则由 .openthree/limits.json 决定，再退回内核默认 200 —— "
-                        "模型运行期可用 set_limits 改它")
+                        "模型运行期可用 set_limits 改它。一轮没跑完会自动开下一轮，"
+                        "整场轮数由 --max-rounds 兜住")
+    p.add_argument("--max-rounds", type=int, default=None,
+                   help="一次任务最多跑几轮（每轮一次完整 ReAct 循环，各自有 --max-iterations 步预算）；"
+                        "显式给出即锁定，不传则由 .openthree/limits.json / 内核默认 3 决定，"
+                        "模型运行期可用 set_limits(max_rounds=…) 改它")
     p.add_argument("--context-window", default=None,
                    help="模型上下文窗口（token）。支持 1M/128k/200000 写法；"
                         "默认取 config 里的 context_window_tokens，再退回 1M")
@@ -93,8 +98,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-i", "--interactive", action="store_true",
                    help="交互模式：开一个进程内会话，多轮记忆（退出即忘）")
     p.add_argument("--auto", type=int, default=0, metavar="N",
-                   help="长任务自动推进：跑完一轮后若计划仍有未完成项，自动接力下一轮，"
-                        "最多 N 轮（0 = 关闭，默认）。常与 -i 联用。")
+                   help="长任务自动推进：一轮收尾后若计划仍有未完成项（或撞了本轮步数上限），"
+                        "就自动接力下一轮，最多 N 轮（0 = 关闭，默认）。常与 -i 联用。"
+                        "注意这与单次任务自带的「撞步数上限自动续轮」不同：后者只在没跑完时续，"
+                        "不看计划。")
     p.add_argument("--turns", type=int, default=4,
                    help="会话内保留最近多少轮（播种进上下文），0 关闭，-1 全部，默认 4")
     p.add_argument("--resume", type=int, default=0, metavar="N",
@@ -128,6 +135,7 @@ def main(argv=None) -> int:
         temperature=args.temperature,
         heartbeat=args.heartbeat,
         turns=args.turns,
+        max_rounds=args.max_rounds,
     )
 
     if args.init:
@@ -171,6 +179,8 @@ def main(argv=None) -> int:
             doc = rt.run_auto(task or None, rounds=args.auto, append=args.append,
                               images=images or None)
         else:
+            # --resume 时调用方自带会话（读到档案即已是会话），故 session=True 归调用方；
+            # 否则不给 session → run() 自带一个短命会话，供「撞步数上限自动续轮」轮间连续。
             doc = rt.run(task or None, append=args.append, images=images or None,
                          session=args.resume > 0)
     except RuntimeError as exc:
@@ -256,17 +266,18 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
                 doc = rt.run_auto(text or None, rounds=auto, append=append,
                                   images=images)
                 answers = doc.get("auto_answers") or []
-                if len(answers) > 1:
-                    print("\n" + "═" * 60)
-                    print(f"（本轮自动接力 {doc.get('auto_rounds', len(answers))} 轮，"
-                          f"逐轮结论如下）")
-                    print("═" * 60)
-                    for i, a in enumerate(answers, 1):
-                        print(f"\n──── 第 {i} 轮 ────\n{a}")
-                    print("═" * 60 + "\n")
-                    continue
             else:
                 doc = rt.run(text or None, append=append, images=images, session=True)
+                answers = doc.get("round_answers") or []
+            if len(answers) > 1:
+                print("\n" + "═" * 60)
+                print(f"（本次任务跑了 {len(answers)} 轮 —— 一轮没做完就自动续了下一轮，"
+                      f"逐轮结论如下）")
+                print("═" * 60)
+                for i, a in enumerate(answers, 1):
+                    print(f"\n──── 第 {i} 轮 ────\n{a}")
+                print("═" * 60 + "\n")
+                continue
             print("\n" + "─" * 60)
             print(doc.get("answer", ""))
             print("─" * 60 + "\n")

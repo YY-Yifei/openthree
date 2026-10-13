@@ -4,18 +4,25 @@
 
 极简的坚持：
   * 没有任何硬编码的智能。循环里没有 if「用户想干什么」的分支。
-  * 每一轮都重新组装 system（prompt.build_messages），
-    所以模型改提示词 / 造工具 / 压缩上下文，下一轮立刻生效 —— 这就是演化。
+  * 每一步都重新组装 system（prompt.build_messages），
+    所以模型改提示词 / 造工具 / 压缩上下文，下一步立刻生效 —— 这就是演化。
   * 一切所见所行都进 Recorder。
+
+步 / 轮 / 会话（三层，别混）：
+  * **步（step）** = ReAct 的一次「思 → 行」，由 `run()` 内的 while 循环推进。
+  * **轮（round）** = 一次完整的 ReAct 循环 = 本 Agent 的一次 `run()`；
+    **每轮有独立的一份步数预算**（`max_iterations` 只管一轮）。撞上限未 finish 时，
+    Runtime 会视情况新建一个 Agent 续下一轮，由 `max_rounds` 兜住整场成本。
+  * **会话（session）** = 进程内的多轮容器（-i / --auto），跨轮记忆长在这里。
 
 工程加固（不改变设计）：
   * 工具结果进 history 前统一截断，超长输出落盘，history 只留预览 + 路径，
-    避免同一份大输出被每轮重发（见 REVIEW.md P0-3.2）。
+    避免同一份大输出被每步重发（见 REVIEW.md P0-3.2）。
   * 上下文预算：超过阈值时自动把最老的若干 step 折叠成摘要，
     不再指望模型自觉调用 compact_context（见 REVIEW.md P0-3.1）。
-  * 运行边界：步数上限 / max_tokens / tool_result_limit / temperature 默认由内核给，
-    但模型可用 set_limits 写进 .openthree/limits.json 自管（tick 每轮重读）；显式启动
-    参数与 OPENTHREE_LIMITS_LOCK 是它绕不过的两层。与「自管上下文」同源同构。
+  * 运行边界：每轮步数上限 / max_tokens / tool_result_limit / temperature / 最多轮数
+    默认由内核给，但模型可用 set_limits 写进 .openthree/limits.json 自管（tick 每步
+    重读）；显式启动参数与 OPENTHREE_LIMITS_LOCK 是它绕不过的两层。与「自管上下文」同源同构。
   * finish 提交后，同批剩余 tool_calls 一律跳过（见 REVIEW.md P2-3.11）。
   * compact_context 的区间先在现有 history 上校验，如实返回成功/失败（P1-3.8）。
   * 进度回声：把「正在做什么」通过注入的 progress 打出去，CLI 不再长时间沉默。
@@ -25,7 +32,7 @@
     **Agent 自己不读磁盘** —— 没有会话（如单次任务）时 seed_turns 为空，
     历史就是空的，不会莫名背上上一轮的旧对话；会话记忆只活在进程内
     （见 runtime.begin_session / workspace.append_turn）。
-    system 依然每轮重组装，播种只发生在消息层，演化机制不受影响。
+    system 依然每一步重组装，播种只发生在消息层，演化机制不受影响。
 """
 from __future__ import annotations
 
@@ -66,6 +73,20 @@ CONTEXT_AUTOFOLD_ENV = "OPENTHREE_CONTEXT_AUTOFOLD"
 # 「运行边界」的硬闸：环境变量非空且为真值时，limits.json 里的一切旋钮都被冻结
 # （模型改不动）。这是它绕不过的一层 —— 与 OPENTHREE_CONTEXT_AUTOFOLD 对称。
 LIMITS_LOCK_ENV = "OPENTHREE_LIMITS_LOCK"
+
+# 「轮」的内核默认上限：一次任务最多自动接力几轮。
+#
+# 这里把「步」与「轮」两个层级分清楚（旧实现把它们混着叫「轮」，见 prompt.py）：
+#   * **步（step）** = ReAct 的一次「思 → 行」。
+#   * **轮（round）** = 一次完整的 ReAct 循环 = 一个 Agent 的生命周期。
+#     **每轮拥有独立的一份 step 预算**（新 Agent → 新 max_iterations）。
+#   * **会话（session）** = 进程内的多轮容器（-i / --auto）。
+#
+# 于是「200 步」不再是整场任务的硬墙，而是**一轮**的预算：还没做完（撞步数上限
+# 未 finish / 模型自己调了 next_round / 计划还有未完成项）就自动开下一轮，
+# 由 max_rounds 兜住总成本（默认 3 轮 ≈ 600 步）。模型可 set_limits 改它，
+# 人类可用 --max-rounds 锁定。
+DEFAULT_MAX_ROUNDS = 3
 
 
 def resolve_context_budget(context_budget_chars: Optional[int],
@@ -132,7 +153,10 @@ class Agent:
                  context_budget_chars: Optional[int] = None,
                  seed_turns: Optional[Sequence[Dict[str, Any]]] = None,
                  progress: Optional[Any] = None,
-                 max_truncations: int = 2) -> None:
+                 max_truncations: int = 2,
+                 max_rounds: Optional[int] = None,
+                 round_index: int = 1,
+                 autonomous: bool = False) -> None:
         self.ws = workspace
         self.reg = registry
         self.llm = llm
@@ -143,6 +167,7 @@ class Agent:
         self._explicit_tool_result_limit = tool_result_limit
         self._explicit_max_tokens = max_tokens
         self._explicit_temperature = temperature
+        self._explicit_max_rounds = max_rounds
         self._limits_env = os.environ.get(LIMITS_LOCK_ENV)
         # 生成参数的「内核默认」基线：**构造时快照一次，之后只读**。
         # 旧实现让 apply_limits 原地改 llm.config，而「默认值」又取自 llm.config，
@@ -155,8 +180,14 @@ class Agent:
             0.3, lo=0.0, hi=2.0)
         self._limits_file_data: Dict[str, Any] = {}
         self._reload_limits_file()
+        # 「轮」也是一条运行边界（第五个旋钮）：本 Agent 是第几轮、最多接力几轮。
+        # 步预算（max_iterations）属于**一轮**，轮预算（max_rounds）属于**整场任务**。
+        self.round_index = max(1, int(round_index))
+        # autonomous：本 Agent 是否处在「自动接力」里（Runtime 逐轮驱动）。
+        # 处境据此告诉模型「finish 之后还会不会有人接着跑」—— 单次任务时不会。
+        self.autonomous = bool(autonomous)
         (self.max_iterations, self.tool_result_limit, self.max_tokens,
-         self.temperature) = self._compute_limits()
+         self.temperature, self.max_rounds) = self._compute_limits()
         # 本轮用户输入携带的图片（绝对路径或 http/data URL）。
         # 在第一步注入成一条独立的 user 消息（与任务文本配对），供跨轮还原。
         self.current_images: List[str] = []
@@ -164,7 +195,7 @@ class Agent:
         self._images_injected = False
         # 上下文策略：预算与「是否自动折叠」。这是**模型可自管**的旋钮 ——
         # 来源优先级见 resolve_context_policy；模型用 context_budget 工具改策略文件，
-        # tick() 每轮重读，于是「改一下，下一轮就生效」。
+        # tick() 每步重读，于是「改一下，下一步就生效」。
         # 显式 --context-budget 是启动基调（模型不能越过它），策略文件里的预算受它夹取。
         self._explicit_budget = context_budget_chars
         self._env_autofold = os.environ.get(CONTEXT_AUTOFOLD_ENV)
@@ -183,6 +214,10 @@ class Agent:
         self.finished = False
         self.iteration = 0
         self.last_action = ""
+        # 撞到本轮的步数上限（没 finish 就退出循环）—— Runtime 据此决定是否续轮。
+        self.step_limit_hit = False
+        # 模型用 next_round 显式宣告「这一阶段做完了，开新一轮」。
+        self.wants_next_round = False
         self._compact_marks: List[Tuple[int, int, str]] = []
         # 累计发生过多少次折叠（模型折叠 + 内核兜底），供 context_usage 读数
         self._compaction_count = 0
@@ -231,14 +266,14 @@ class Agent:
         return f"按窗口 {win} token 推导"
 
     def tick(self) -> None:
-        """每轮开头重读「上下文策略」与「运行边界」—— 让「模型改了旋钮」下一轮就生效。
+        """每步开头重读「上下文策略」与「运行边界」—— 让「模型改了旋钮」下一步就生效。
 
-        与提示词/工具一样「每轮重组装」：改了就下一轮生效，不做缓存。
+        与提示词/工具一样「每步重组装」：改了就下一步生效，不做缓存。
         """
         budget, autofold = self._read_context_policy()
         if budget != self.context_budget_chars:
             self.rec.record("evolution",
-                            summary=f"上下文预算改为 {budget} 字符（上一轮 {self.context_budget_chars}）",
+                            summary=f"上下文预算改为 {budget} 字符（上一步 {self.context_budget_chars}）",
                             data={"action": "context_budget_changed",
                                   "from": self.context_budget_chars, "to": budget})
             self.progress.note(f"上下文预算改为 {budget} 字符")
@@ -249,7 +284,7 @@ class Agent:
             self.progress.note(f"自动折叠{'开启' if autofold else '关闭'}")
         self.context_budget_chars = budget
         self._auto_fold_enabled = autofold
-        self.apply_limits()               # 运行边界同样每轮重读、改一下下一轮生效
+        self.apply_limits()               # 运行边界同样每步重读、改一下下一步生效
 
     def set_context_budget(self, budget_chars: Optional[int] = None,
                            auto_fold: Optional[bool] = None) -> Tuple[bool, str]:
@@ -286,7 +321,7 @@ class Agent:
         """读 `.openthree/limits.json`（模型可写）到 `self._limits_file_data`。
 
         文件缺失/损坏时安静回退到空 dict（= 全部走内核默认）—— 自管不是必需品，
-        坏了也不能把循环拖死。只认已知的四个键。
+        坏了也不能把循环拖死。只认已知的五个键。
         """
         data: Dict[str, Any] = {}
         try:
@@ -305,12 +340,12 @@ class Agent:
         return (env is not None and str(env).strip() != ""
                 and str(env).strip().lower() not in ("0", "false", "off", "no"))
 
-    def _compute_limits(self) -> Tuple[int, int, int, float]:
-        """把「显式参数 / 策略文件 / 内核默认」折叠成四个边界值。
+    def _compute_limits(self) -> Tuple[int, int, int, float, int]:
+        """把「显式参数 / 策略文件 / 内核默认」折叠成五个边界值。
 
         优先级（越靠前越硬）：显式参数 > 策略文件 > 内核默认。
         环境硬闸开启时，策略文件整段被忽略 —— 只有显式参数与内核默认说话。
-        返回 (max_iterations, tool_result_limit, max_tokens, temperature)。
+        返回 (max_iterations, tool_result_limit, max_tokens, temperature, max_rounds)。
         """
         fd = {} if self.limits_locked() else self._limits_file_data
 
@@ -344,25 +379,29 @@ class Agent:
         tp = _pick(self._explicit_temperature, "temperature",
                    self._baseline_temperature,
                    lambda v: _clamp_float(v, self._baseline_temperature, lo=0.0, hi=2.0))
-        return int(mi), int(tr), int(mt), float(tp)
+        mr = _pick(self._explicit_max_rounds, "max_rounds", DEFAULT_MAX_ROUNDS,
+                   lambda v: _clamp_int(v, DEFAULT_MAX_ROUNDS, lo=1))
+        return int(mi), int(tr), int(mt), float(tp), int(mr)
 
     def apply_limits(self) -> None:
-        """重读「运行边界」并应用 —— 供 tick() 每轮调用（改一下下一轮生效）。"""
+        """重读「运行边界」并应用 —— 供 tick() 每步调用（改一下下一步生效）。"""
         self._reload_limits_file()
-        mi, tr, mt, tp = self._compute_limits()
+        mi, tr, mt, tp, mr = self._compute_limits()
         changed = (mi != self.max_iterations or tr != self.tool_result_limit
-                   or mt != self.max_tokens or tp != self.temperature)
+                   or mt != self.max_tokens or tp != self.temperature
+                   or mr != self.max_rounds)
         if changed:
             self.rec.record(
                 "evolution",
                 summary=(f"运行边界更新：步数上限 {mi}、生成上限 {mt}、"
-                         f"工具结果上限 {tr} 字符"),
+                         f"工具结果上限 {tr} 字符、最多 {mr} 轮"),
                 data={"action": "limits_changed", "max_iterations": mi,
                       "max_tokens": mt, "tool_result_limit": tr,
-                      "temperature": tp})
-            self.progress.note(f"运行边界更新：步数上限 {mi}、生成上限 {mt}")
+                      "temperature": tp, "max_rounds": mr})
+            self.progress.note(f"运行边界更新：步数上限 {mi}、生成上限 {mt}、最多 {mr} 轮")
         self.max_iterations, self.tool_result_limit = mi, tr
         self.max_tokens, self.temperature = mt, tp
+        self.max_rounds = mr
 
     def limits_stats(self) -> Dict[str, Any]:
         """把「运行边界」的读数交给模型 —— 自管的前提是看得见。"""
@@ -371,13 +410,14 @@ class Agent:
         # 文件里给了值、却解析不出数字的键（null = 有意交给内核默认，不算坏值）：
         # 它们实际走的是内核默认，标签如实写出来，免得「读数说模型自管、实际是默认」。
         bad = {k for k in ("max_iterations", "tool_result_limit", "max_tokens",
-                           "temperature")
+                           "temperature", "max_rounds")
                if fd.get(k) is not None and not _numeric(fd.get(k))}
         source: Dict[str, str] = {}
         for key, explicit in (("max_iterations", self._explicit_max_iterations),
                               ("tool_result_limit", self._explicit_tool_result_limit),
                               ("max_tokens", self._explicit_max_tokens),
-                              ("temperature", self._explicit_temperature)):
+                              ("temperature", self._explicit_temperature),
+                              ("max_rounds", self._explicit_max_rounds)):
             if explicit is not None:
                 source[key] = "显式（锁定）"
             elif fd.get(key) is not None and key not in bad:
@@ -391,6 +431,7 @@ class Agent:
             "max_tokens": self.max_tokens,
             "tool_result_limit": self.tool_result_limit,
             "temperature": self.temperature,
+            "max_rounds": self.max_rounds,
             "source": source,
             "locked": locked,
         }
@@ -398,28 +439,31 @@ class Agent:
     def set_limits(self, max_iterations: Optional[int] = None,
                    max_tokens: Optional[int] = None,
                    tool_result_limit: Optional[int] = None,
-                   temperature: Optional[float] = None) -> Tuple[bool, str]:
+                   temperature: Optional[float] = None,
+                   max_rounds: Optional[int] = None) -> Tuple[bool, str]:
         """写下「运行边界」（模型自管入口）。返回 (是否成功, 说明)。
 
         - 环境硬闸（OPENTHREE_LIMITS_LOCK）开启时拒绝写入：那是模型绕不过的一层。
         - 被启动参数显式锁定的旋钮拒绝写入：人类锁定后模型不许改。
-        - 其余写进 limits.json，`apply_limits()` 让它下一轮生效。
+        - 其余写进 limits.json，`apply_limits()` 让它下一步生效。
         """
         given = [(k, v) for k, v in (("max_iterations", max_iterations),
                                      ("max_tokens", max_tokens),
                                      ("tool_result_limit", tool_result_limit),
-                                     ("temperature", temperature))
+                                     ("temperature", temperature),
+                                     ("max_rounds", max_rounds))
                  if v is not None]
         if not given:
             return False, ("[错误] 至少给一个边界（max_iterations / max_tokens / "
-                           "tool_result_limit / temperature）")
+                           "tool_result_limit / temperature / max_rounds）")
         if self.limits_locked():
             return False, (f"[错误] 运行边界被环境变量 {LIMITS_LOCK_ENV} 冻结，"
                            f"模型改不动（这是硬闸）")
         explicit = {"max_iterations": self._explicit_max_iterations,
                     "max_tokens": self._explicit_max_tokens,
                     "tool_result_limit": self._explicit_tool_result_limit,
-                    "temperature": self._explicit_temperature}
+                    "temperature": self._explicit_temperature,
+                    "max_rounds": self._explicit_max_rounds}
         blocked = [k for k, _ in given if explicit.get(k) is not None]
         if blocked:
             return False, f"[错误] {'、'.join(blocked)} 已由启动参数显式锁定，模型改不动"
@@ -441,10 +485,14 @@ class Agent:
                 data[k] = fv
             else:
                 iv = int(v)
-                if iv < 0 or (k == "max_iterations" and iv < 1):
-                    return False, f"[错误] {k} 取值非法（max_iterations ≥ 1，其余 ≥ 0）"
+                # max_iterations / max_rounds 是「走多远」的预算，至少 1；
+                # max_tokens / tool_result_limit 允许 0（0 = 关掉该护栏）。
+                lo = 1 if k in ("max_iterations", "max_rounds") else 0
+                if iv < lo:
+                    return False, f"[错误] {k} 取值非法（{k} ≥ {lo}）"
                 data[k] = iv
-        for k in ("max_iterations", "max_tokens", "tool_result_limit", "temperature"):
+        for k in ("max_iterations", "max_tokens", "tool_result_limit",
+                  "temperature", "max_rounds"):
             data.setdefault(k, None)
         try:
             self.ws.dir.mkdir(parents=True, exist_ok=True)
@@ -456,9 +504,37 @@ class Agent:
         return True, (f"[ok] 已更新运行边界：步数上限 {self.max_iterations}、"
                       f"max_tokens {self.max_tokens}、"
                       f"工具结果上限 {self.tool_result_limit} 字符、"
-                      f"temperature {self.temperature}")
+                      f"temperature {self.temperature}、最多 {self.max_rounds} 轮")
 
     # ---------------------------------------------------------------- 用量读数
+    def round_stats(self) -> Dict[str, Any]:
+        """把「轮」的读数交给模型 —— 看得见「我在第几轮、会不会有下一轮」。
+
+        「步」是一轮的内部计数，「轮」是 Agent 的生命周期计数。模型只有看得见轮，
+        才谈得上「这一轮做不完就留着下一轮做」：否则它既不知道 finish 之后还有没有
+        人接着跑（`next`），也不知道这颗棋子还能走几格（`remaining`）。
+        """
+        remaining = max(0, int(self.max_rounds) - int(self.round_index))
+        return {
+            "index": self.round_index,
+            "max": self.max_rounds,
+            "remaining": remaining,
+            "autonomous": self.autonomous,
+            "next": bool(self.autonomous and remaining > 0),
+            "step": self.iteration,
+            "max_steps": self.max_iterations,
+        }
+
+    def next_round(self) -> None:
+        """（工具入口）宣告「这一阶段做完了，开新一轮」——替本条消息收尾，但不算 finish。
+
+        与 finish 的区别：finish 是「整件事做完」，next_round 是「这一轮先到这，
+        剩下的下一轮接着做」。只在自动接力（Runtime 逐轮驱动）里真正会开出下一轮；
+        单次任务里它只是把发言权交还，运行期如实告诉模型「没有下一轮」。
+        """
+        self.wants_next_round = True
+        self.finished = True
+
     def history_stats(self) -> Dict[str, Any]:
         """把「上下文用量的读数」交给模型 —— 自管的前提是看得见。"""
         used = _estimate_chars(self.history)
@@ -517,7 +593,7 @@ class Agent:
             self.iteration += 1
             self.rec.begin_step()
             self.progress.step(self.iteration, self.max_iterations)
-            self.tick()                        # 每轮重读「上下文策略」——改了就生效
+            self.tick()                        # 每一步重读「上下文策略 / 运行边界」——改了就生效
             self._apply_pending_compactions()
             self._auto_compact()
             self._inject_images()
@@ -533,6 +609,7 @@ class Agent:
                 fold_range=fold_range,
                 context_stats=self.history_stats(),
                 limits_stats=self.limits_stats(),
+                round_stats=self.round_stats(),
             )
             self.progress.llm_start(self.llm.config.model)
             result = self.llm.chat(messages, tools=self.reg.schemas() or None,
@@ -562,7 +639,7 @@ class Agent:
                             f"请**重发同样的一条消息**，但更精简：只调用最必要的一个工具，"
                             f"或把长内容拆成几步；不要重复已完成的步骤。"
                             f"若确需更长输出，你可以自己用 `set_limits(max_tokens=…)` 调大"
-                            f"生成上限（它会写进 .openthree/limits.json，下一轮生效）。")
+                            f"生成上限（它会写进 .openthree/limits.json，下一步生效）。")
                         self.progress.note(f"输出被截断，已要求重发（{self.truncations}/{self.max_truncations}）")
                         continue
                     self.answer = (f"[未能完成] 模型连续 {self.truncations} 次因 max_tokens 截断输出。"
@@ -598,9 +675,15 @@ class Agent:
             self._run_tool_calls(tool_calls)
 
         if not self.finished and self.answer is None:
-            self.answer = (f"[达到迭代上限 {self.max_iterations} 步，未显式 finish] "
+            # 撞到**本轮**的步数上限 —— 这不是整场任务的终点，而是「这一轮没跑完」。
+            # 是否续轮由 Runtime 决定（计划还有未完成项 / max_rounds 还有余额）。
+            self.step_limit_hit = True
+            self.answer = (f"[本轮达到步数上限 {self.max_iterations} 步，未显式 finish] "
                            f"以下是最后一条思考：\n{self.last_action}")
-            self.rec.record("error", summary="达到迭代上限", data={"max": self.max_iterations})
+            self.rec.record("error", summary="本轮达到步数上限",
+                            data={"max": self.max_iterations,
+                                  "round": self.round_index,
+                                  "max_rounds": self.max_rounds})
 
         return self.answer or ""
 
