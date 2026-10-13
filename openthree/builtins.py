@@ -11,7 +11,8 @@
     自省        list_prompt_versions / read_prompt_version / restore_system_prompt
     长任务      read_plan / write_plan（待办清单）
     管记忆      remember（写下）/ recall_memory（读回）
-    管上下文    compact_context / note
+    管上下文    context_usage（用量读数）/ context_budget（改预算与自动折叠）
+                compact_context（折叠/丢弃历史）
     收尾        finish
 
 真正的魔法在于：模型用 write_function 写出的新 py 文件，
@@ -1110,13 +1111,17 @@ def recall_memory(query: str = "", limit: int = 20) -> str:
     return "\n".join(lines)
 
 
-def compact_context(start: int, end: int, summary: str) -> str:
-    """折叠一段对话历史为一条摘要，释放上下文空间。
+def compact_context(start: int, end: int, summary: str = "") -> str:
+    """折叠一段对话历史，释放上下文空间。
+
+    `summary` 给了 → 折叠成一条保留关键信息的摘要；`summary` 留空 → **直接丢弃**
+    （最省，适合早期已无用的步骤）。折叠会**立即**生效，并如实返回省下多少字符。
+    折到哪里、要不要折，由你判断：先用 `context_usage` 看用量与可折范围。
 
     Args:
         start: 起始步骤号（含）
         end: 结束步骤号（含）
-        summary: 摘要，必须保留关键事实、数值、结论与未完成任务
+        summary: 摘要（保留关键事实/数值/结论/未完成任务）；留空 = 直接丢弃
     """
     ok, msg = False, "[错误] 内核未就绪"
     if KERNEL.agent is not None:
@@ -1126,7 +1131,58 @@ def compact_context(start: int, end: int, summary: str) -> str:
             "evolution" if ok else "error",
             summary=(f"压缩上下文 step {start}-{end}" if ok else msg[:200]),
             data={"action": "compact_context", "start": start, "end": end,
-                  "summary": summary, "ok": ok},
+                  "summary": summary, "ok": ok, "dropped": not (summary or "").strip()},
+        )
+    return msg
+
+
+def context_usage() -> str:
+    """看一眼「上下文用量」——你正在用多少、还剩多少、能折哪一段。
+
+    自管上下文的前提是看得见。它返回：已用 / 预算字符数、占比、当前 step 数、
+    可折叠的范围、自动折叠是否开启、以及已经折叠过几次。想调整预算或开关自动
+    折叠，用 `context_budget`。
+    """
+    if KERNEL.agent is None:
+        return "[错误] 内核未就绪"
+    s = KERNEL.agent.history_stats()
+    budget = s["budget_chars"]
+    if budget > 0:
+        head = f"已用 {s['used_chars']} / {budget} 字符（{s['ratio'] * 100:.1f}%）"
+    else:
+        head = f"已用 {s['used_chars']} 字符（预算 0 = 已关闭自动折叠）"
+    lines = [
+        head,
+        f"当前 {s['steps']} 个 step；可折叠范围：{s['fold_range'] or '（暂无，至少走完一个工具回合）'}",
+        f"自动折叠：{'开' if s['auto_fold'] else '关'}"
+        + ("（被环境变量 OPENTHREE_CONTEXT_AUTOFOLD 锁定，改不了）"
+           if s["auto_fold_env_locked"] else ""),
+        f"已折叠 {s['compactions']} 次",
+    ]
+    return "\n".join(lines)
+
+
+def context_budget(budget_chars: Optional[int] = None,
+                   auto_fold: Optional[bool] = None) -> str:
+    """调整「上下文策略」——改预算、开关自动折叠。下一轮即生效。
+
+    这是你自管上下文的旋钮：预算给多大、要不要内核兜底自动折叠，都由你决定。
+    `context_usage` 是它的读数。两个参数至少给一个。
+
+    Args:
+        budget_chars: 历史字符预算；0 = 关闭自动折叠。不传 = 不改预算。
+        auto_fold: 是否让内核在爆仓时兜底折叠；不传 = 不改。
+    """
+    if KERNEL.agent is None:
+        return "[错误] 内核未就绪"
+    ok, msg = KERNEL.agent.set_context_budget(budget_chars=budget_chars,
+                                              auto_fold=auto_fold)
+    if KERNEL.recorder is not None:
+        KERNEL.recorder.record(
+            "evolution" if ok else "error",
+            summary=f"调整上下文策略：{msg}" if ok else msg[:200],
+            data={"action": "context_budget", "budget_chars": budget_chars,
+                  "auto_fold": auto_fold, "ok": ok},
         )
     return msg
 
@@ -1485,6 +1541,8 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "remember": remember,
     "recall_memory": recall_memory,
     "compact_context": compact_context,
+    "context_usage": context_usage,
+    "context_budget": context_budget,
     "finish": finish,
     "get_time": get_time,
 }

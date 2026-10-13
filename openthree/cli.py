@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -64,7 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "默认取 config 里的 context_window_tokens，再退回 1M")
     p.add_argument("--context-budget", type=int, default=None,
                    help="历史累计字符数超此值自动折叠早期步骤，0 表示关闭；"
-                        "默认按上下文窗口推导（1M 窗口 → 100 万字符）")
+                        "默认按上下文窗口推导（1M 窗口 → 100 万字符）。"
+                        "模型运行期可用 context_budget 工具在 .openthree/context.json 里改它")
+    p.add_argument("--no-auto-fold", action="store_true",
+                   help="关闭内核兜底自动折叠（等价于环境变量 OPENTHREE_CONTEXT_AUTOFOLD=0）；"
+                        "模型仍可自己用 compact_context 折叠")
     p.add_argument("--tool-result-limit", type=int, default=4000,
                    help="单个工具结果进入历史的字符上限，超出落盘，默认 4000")
     p.add_argument("--heartbeat", type=float, default=15.0,
@@ -95,6 +100,11 @@ def main(argv=None) -> int:
     _force_utf8()
     args = build_parser().parse_args(argv)
     project_dir = Path(args.dir).resolve()
+
+    # --no-auto-fold：把自动折叠的「硬闸」环境变量在起 Runtime 前设好，
+    # 于是连 config 推导出来的默认预算也不会触发内核兜底折叠。
+    if getattr(args, "no_auto_fold", False):
+        os.environ["OPENTHREE_CONTEXT_AUTOFOLD"] = "0"
 
     rt = Runtime(
         project_dir,

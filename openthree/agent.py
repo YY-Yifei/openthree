@@ -27,12 +27,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .kernel import KERNEL
-from .llm import CHARS_PER_TOKEN, DEFAULT_CONTEXT_WINDOW_TOKENS, LLM
+from .llm import (CHARS_PER_TOKEN, DEFAULT_CONTEXT_WINDOW_TOKENS, LLM,
+                  parse_token_count)
 from .multimodal import (DEFAULT_DETAIL, ImageResult, build_content,
                          content_text, count_images, estimate_content_chars)
 from .progress import NullProgress
@@ -53,6 +55,10 @@ DEFAULT_CONTEXT_BUDGET_CHARS = 1_000_000
 MAX_CONTEXT_BUDGET_CHARS = 1_000_000
 # 历史至多占用上下文窗口的比例（留一半给 system/工具 schema/模型输出）。
 CONTEXT_BUDGET_RATIO = 0.5
+
+# 自动折叠的「硬闸」：设成 0/false/off 可在启动时彻底冻结自动折叠（模型改不了环境，
+# 所以这是真·不可被模型绕过的开关；不设则由策略文件说了算）。
+CONTEXT_AUTOFOLD_ENV = "OPENTHREE_CONTEXT_AUTOFOLD"
 
 
 def resolve_context_budget(context_budget_chars: Optional[int],
@@ -75,6 +81,41 @@ def resolve_context_budget(context_budget_chars: Optional[int],
     return int(min(derived, MAX_CONTEXT_BUDGET_CHARS))
 
 
+def resolve_context_policy(budget: Optional[int] = None,
+                           autofold: Optional[bool] = None, *,
+                           window_tokens: Optional[int] = None,
+                           explicit: Optional[int] = None,
+                           env_value: Optional[str] = None) -> Tuple[int, bool]:
+    """把「显式参数 / 策略文件 / 模型窗口 / 环境变量」折叠成一对 (预算, 是否自动折叠)。
+
+    优先级（越靠前越硬，模型改不了前面的）：
+      1. `env_value`（环境变量 OPENTHREE_CONTEXT_AUTOFOLD）：非空且为 0/false/off/no
+         → 自动折叠**彻底冻结**（预算仍可被模型调，只是内核不再兜底折叠）。
+      2. `explicit`（--context-budget）：显式启动参数一旦给出，它就是预算的上限/基调。
+      3. `budget`（策略文件里的值）：模型用 context_budget 写下的预算。
+      4. 窗口推导（window_tokens）：都没有时按模型窗口算。
+      0 = 关闭自动折叠（预算为 0 时自动折叠不再触发）。
+
+    返回 (budget_chars, allow_autofold)；两者都可被模型在运行期改写（策略文件），
+    但环境变量那一层才是真正意义上的「硬闸」。
+    """
+    if explicit is not None:
+        base = int(explicit)
+    elif budget is not None:
+        base = int(budget)
+    else:
+        base = resolve_context_budget(None, window_tokens)
+    allow = base > 0                      # 预算为 0 时，内核不自动折叠
+    if autofold is not None:
+        allow = bool(autofold) and base > 0
+    env = (env_value if env_value is not None
+           else os.environ.get(CONTEXT_AUTOFOLD_ENV))
+    if env is not None and str(env).strip() != "":
+        if str(env).strip().lower() in ("0", "false", "off", "no"):
+            allow = False
+    return base, allow
+
+
 class Agent:
     def __init__(self, workspace: Workspace, registry: Registry, llm: LLM,
                  recorder: Recorder, *, max_iterations: int = 200,
@@ -94,11 +135,15 @@ class Agent:
         self.current_images: List[str] = []
         self.task_text: str = ""
         self._images_injected = False
-        # 预算默认从模型上下文窗口推导（100M 窗口 → 1 亿字符）；
-        # 显式传值优先，0 表示关闭自动折叠。
-        self.context_budget_chars = resolve_context_budget(
-            context_budget_chars, getattr(getattr(llm, "config", None),
-                                          "context_window_tokens", None))
+        # 上下文策略：预算与「是否自动折叠」。这是**模型可自管**的旋钮 ——
+        # 来源优先级见 resolve_context_policy；模型用 context_budget 工具改策略文件，
+        # tick() 每轮重读，于是「改一下，下一轮就生效」。
+        # 显式 --context-budget 是启动基调（模型不能越过它），策略文件里的预算受它夹取。
+        self._explicit_budget = context_budget_chars
+        self._env_autofold = os.environ.get(CONTEXT_AUTOFOLD_ENV)
+        budget, autofold = self._read_context_policy()
+        self.context_budget_chars = budget
+        self._auto_fold_enabled = autofold
         # 跨轮记忆：本会话「之前几轮」的对话，由 Runtime 显式传入。
         # Agent 不读盘 —— 没有会话（单次任务）时这里就是空的，从零开跑。
         self.seed_turns: List[Dict[str, Any]] = [
@@ -112,9 +157,121 @@ class Agent:
         self.iteration = 0
         self.last_action = ""
         self._compact_marks: List[Tuple[int, int, str]] = []
+        # 累计发生过多少次折叠（模型折叠 + 内核兜底），供 context_usage 读数
+        self._compaction_count = 0
         # 输出被 max_tokens 截断时的重发次数（截断可恢复，不该杀死整场任务）
         self.max_truncations = max(0, int(max_truncations))
         self.truncations = 0
+
+    # ---------------------------------------------------------------- 上下文策略
+    def _read_context_policy(self) -> Tuple[int, bool]:
+        """读取「上下文策略」：`.openthree/context.json`（模型可写）+ 环境硬闸。
+
+        文件缺失/损坏时安静回退到「按模型窗口推导、自动折叠开启」—— 自管不是
+        必需品，坏了也不能把循环拖死。返回 (预算字符, 是否自动折叠)。
+        """
+        budget: Optional[int] = None
+        autofold: Optional[bool] = None
+        try:
+            fp = self.ws.context_policy_file
+            if fp.exists():
+                data = json.loads(fp.read_text(encoding="utf-8") or "{}")
+                if isinstance(data, dict):
+                    if data.get("budget_chars") is not None:
+                        budget = parse_token_count(data.get("budget_chars"))
+                    if data.get("auto_fold") is not None:
+                        autofold = bool(data.get("auto_fold"))
+        except Exception:  # noqa: BLE001
+            budget, autofold = None, None
+        window = getattr(getattr(self.llm, "config", None), "context_window_tokens", None)
+        return resolve_context_policy(
+            budget, autofold, window_tokens=window,
+            explicit=self._explicit_budget, env_value=self._env_autofold)
+
+    def context_budget_source(self) -> str:
+        """预算的来源说明（给人看，也可回显）—— 让「这预算谁定的」一目了然。"""
+        if self._explicit_budget is not None:
+            return "显式 --context-budget（模型不能越过）"
+        try:
+            fp = self.ws.context_policy_file
+            if fp.exists():
+                data = json.loads(fp.read_text(encoding="utf-8") or "{}")
+                if isinstance(data, dict) and data.get("budget_chars") is not None:
+                    return "策略文件 .openthree/context.json（模型可改）"
+        except Exception:  # noqa: BLE001
+            pass
+        win = getattr(getattr(self.llm, "config", None), "context_window_tokens", None)
+        return f"按窗口 {win} token 推导"
+
+    def tick(self) -> None:
+        """每轮开头重读上下文策略 —— 让「模型改了旋钮」下一轮就生效。
+
+        与提示词/工具一样「每轮重组装」：改了就下一轮生效，不做缓存。
+        """
+        budget, autofold = self._read_context_policy()
+        if budget != self.context_budget_chars:
+            self.rec.record("evolution",
+                            summary=f"上下文预算改为 {budget} 字符（上一轮 {self.context_budget_chars}）",
+                            data={"action": "context_budget_changed",
+                                  "from": self.context_budget_chars, "to": budget})
+            self.progress.note(f"上下文预算改为 {budget} 字符")
+        if autofold != self._auto_fold_enabled:
+            self.rec.record("evolution",
+                            summary=f"自动折叠{'开启' if autofold else '关闭'}",
+                            data={"action": "auto_fold_toggled", "auto_fold": autofold})
+            self.progress.note(f"自动折叠{'开启' if autofold else '关闭'}")
+        self.context_budget_chars = budget
+        self._auto_fold_enabled = autofold
+
+    def set_context_budget(self, budget_chars: Optional[int] = None,
+                           auto_fold: Optional[bool] = None) -> Tuple[bool, str]:
+        """写下上下文策略（模型自管入口）。返回 (是否成功, 说明)。"""
+        path = self.ws.context_policy_file
+        if budget_chars is None and auto_fold is None:
+            return False, "[错误] 至少给 budget_chars 或 auto_fold 之一"
+        data: Dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8") or "{}")
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception:  # noqa: BLE001
+                data = {}
+        if budget_chars is not None:
+            if int(budget_chars) < 0:
+                return False, "[错误] budget_chars 不能为负（0 = 关闭自动折叠）"
+            data["budget_chars"] = int(budget_chars)
+        if auto_fold is not None:
+            data["auto_fold"] = bool(auto_fold)
+        try:
+            self.ws.dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            return False, f"[错误] 无法写入 {path}：{exc}"
+        self.tick()
+        return True, (f"[ok] 已更新上下文策略：预算 {self.context_budget_chars} 字符、"
+                      f"自动折叠{'开' if self._auto_fold_enabled else '关'}")
+
+    # ---------------------------------------------------------------- 用量读数
+    def history_stats(self) -> Dict[str, Any]:
+        """把「上下文用量的读数」交给模型 —— 自管的前提是看得见。"""
+        used = _estimate_chars(self.history)
+        budget = int(self.context_budget_chars)
+        steps = _index_steps(self.history)
+        foldable = _foldable_steps(steps)
+        ratio = (used / budget) if budget > 0 else 0.0
+        return {
+            "used_chars": used,
+            "budget_chars": budget,
+            "ratio": round(ratio, 3),
+            "steps": len(steps),
+            "fold_range": (f"{foldable[0]}-{foldable[-1]}" if foldable else ""),
+            "auto_fold": self._auto_fold_enabled,
+            "auto_fold_env_locked": (self._env_autofold is not None
+                                     and str(self._env_autofold).strip() != ""),
+            "compactions": self._compaction_count,
+        }
 
     # ---------------------------------------------------------------- 跨轮记忆
     def _seed_history(self) -> List[Dict[str, Any]]:
@@ -155,6 +312,7 @@ class Agent:
             self.iteration += 1
             self.rec.begin_step()
             self.progress.step(self.iteration, self.max_iterations)
+            self.tick()                        # 每轮重读「上下文策略」——改了就生效
             self._apply_pending_compactions()
             self._auto_compact()
             self._inject_images()
@@ -168,6 +326,7 @@ class Agent:
                 max_iterations=self.max_iterations,
                 last_action=self.last_action,
                 fold_range=fold_range,
+                context_stats=self.history_stats(),
             )
             self.progress.llm_start(self.llm.config.model)
             result = self.llm.chat(messages, tools=self.reg.schemas() or None)
@@ -373,10 +532,12 @@ class Agent:
         return str(out), None
 
     # ---------------------------------------------------------------- 上下文压缩
-    def compact(self, start: int, end: int, summary: str) -> Tuple[bool, str]:
-        """登记一次折叠意图，并先在现有 history 上校验区间是否真的存在。
+    def compact(self, start: int, end: int, summary: Optional[str]) -> Tuple[bool, str]:
+        """折叠 step [start, end]：`summary` 非空则留摘要，为空则**直接丢弃**。
 
-        返回 (是否登记成功, 面向模型的说明)。
+        登记后**立刻**在现有 history 上落地 —— 于是返回值说的是「真的省了多少」，
+        而不是「已登记、下一轮再看」（旧实现报成功但可能什么也没发生，见 REVIEW.md P1-3.8）。
+        返回 (是否成功, 面向模型的说明)。
         """
         try:
             start, end = int(start), int(end)
@@ -388,16 +549,33 @@ class Agent:
         if not steps:
             return False, "[错误] 当前还没有可折叠的 step（至少要走完一个工具调用回合）"
         lo, hi = min(steps), max(steps)
-        if not any(start <= s <= end for s in steps):
+        chosen = sorted(s for s in steps if start <= s <= end)
+        if not chosen:
             return False, (f"[错误] step 区间 {start}-{end} 与现有 step {lo}-{hi} 不相交，"
                            f"未折叠。请用当前可折叠范围 {lo}-{hi}。")
-        self._compact_marks.append((start, end, summary))
-        return True, f"[ok] 已登记折叠 step {start}-{end}（当前范围 {lo}-{hi}），下一轮生效。"
+        # 最后一步不能折：它可能是你「正要走完」的那一步（工具结果还没全部回到
+        # history），折掉会让紧随其后的 tool 消息变成孤儿、消息序列非法。
+        last = max(steps)
+        if last in chosen:
+            if len(steps) == 1:
+                return False, "[错误] 只有 1 个 step（就是当前这一步），没有更早的历史可折。"
+            foldable = _foldable_steps(steps)
+            return False, (f"[错误] 最后一步 step {last} 不能折（你正在走它）；"
+                           f"请只折到 {last - 1}（当前可折 {foldable[0]}-{foldable[-1]}）。")
+        self._compact_marks.append((start, end, summary or ""))
+        before = _estimate_chars(self.history)
+        self._apply_pending_compactions()
+        after = _estimate_chars(self.history)
+        verb = "折叠" if (summary and summary.strip()) else "丢弃"
+        return True, (f"[ok] 已{verb} step {start}-{end}："
+                      f"{before} → {after} 字符（省 {max(0, before - after)}）。")
 
     def _apply_pending_compactions(self) -> None:
-        """把 compact_context 的意图落到 history 上（按 step 与 message 对齐）。
+        """把折叠意图落到 history 上（按 step 与 message 对齐）。
 
         一次性处理本批全部意图，避免逐条折叠后 step 重新编号导致区间错位。
+        summary 为空的意图做「纯丢弃」（不留任何占位）—— 这是最省的压缩，
+        模型自管时常用。
         """
         if not self._compact_marks:
             return
@@ -415,23 +593,34 @@ class Agent:
         lo_idx = min(steps[s][0] for s in chosen)
         hi_idx = max(steps[s][1] for s in chosen)
 
-        summary = "; ".join(f"step {st}-{en}: {sm}" for st, en, sm in marks)
+        # 有摘要的段落保留文字；空摘要的段落直接丢弃、不留痕迹。
+        parts = [f"step {st}-{en}: {sm}" for st, en, sm in marks if sm and sm.strip()]
         head = self.history[:lo_idx]
         tail = self.history[hi_idx + 1:]
-        node = {
-            "role": "assistant",
-            "content": f"[已折叠 step {lo}-{hi}] {summary}",
-        }
-        self.history = head + [node] + tail
-        self.rec.record("evolution", summary=f"已折叠 step {lo}-{hi} 为摘要",
+        if parts:
+            node = {"role": "assistant",
+                    "content": f"[已折叠 step {lo}-{hi}] " + "; ".join(parts)}
+            tail = [node] + tail
+        self.history = head + tail
+        self._compaction_count += 1
+        self.rec.record("evolution",
+                        summary=(f"已{'摘要折叠' if parts else '丢弃'} step {lo}-{hi}"),
                         data={"action": "compact_applied", "start": lo, "end": hi,
-                              "summary": summary})
+                              "summary": "; ".join(parts), "dropped": not parts})
 
     def _auto_compact(self) -> None:
-        """上下文超预算时自动折叠最老的 step（不依赖模型自觉）。"""
+        """内核对「上下文爆仓」的兜底折叠 —— 但开关与预算都交给模型（见 context_budget）。
+
+        这是「安全网」而不是「主控」：默认开着，好让第一次跑长任务不至于撞上限；
+        模型一旦想自己管（把预算调大 / 关掉自动折叠），先写策略文件即可。
+        环境变量 OPENTHREE_CONTEXT_AUTOFOLD=0 能从外面彻底冻结它（模型改不了）。
+        """
+        if not self._auto_fold_enabled:
+            return
         if self.context_budget_chars <= 0:
             return
-        if _estimate_chars(self.history) <= self.context_budget_chars:
+        before = _estimate_chars(self.history)
+        if before <= self.context_budget_chars:
             return
         steps = _index_steps(self.history)
         keys = sorted(steps)
@@ -440,25 +629,19 @@ class Agent:
         if not candidates:
             return
 
-        def size(msgs: List[Dict[str, Any]]) -> int:
-            return _estimate_chars(msgs)
-
-        base = size(self.history)
         lo = candidates[0]
         hi = lo
         for s in candidates:
             hi = s
-            lo_idx = steps[lo][0]
-            hi_idx = steps[s][1]
-            folded = self.history[:lo_idx] + self.history[hi_idx + 1:]
-            if size(folded) <= self.context_budget_chars:
+            folded = self.history[:steps[lo][0]] + self.history[steps[s][1] + 1:]
+            if _estimate_chars(folded) <= self.context_budget_chars:
                 break
-        self.rec.record("note", summary=f"上下文超预算（约 {base} 字符），自动折叠 step {lo}-{hi}",
+        self.rec.record("note",
+                        summary=f"上下文超预算（约 {before} 字符），自动折叠 step {lo}-{hi}",
                         data={"action": "auto_compact", "start": lo, "end": hi,
-                              "budget": self.context_budget_chars, "before_chars": base})
-        self.progress.note(f"上下文超预算（约 {base} 字符），自动折叠 step {lo}-{hi}")
+                              "budget": self.context_budget_chars, "before_chars": before})
+        self.progress.note(f"上下文超预算（约 {before} 字符），自动折叠 step {lo}-{hi}")
         self.compact(lo, hi, "（自动折叠：早期步骤，完整过程见 logs/ 与 steps/）")
-        self._apply_pending_compactions()
 
     # ---------------------------------------------------------------- 收尾
     def finish(self, answer: str) -> None:
@@ -556,3 +739,14 @@ def _index_steps(history: List[Dict[str, Any]]) -> Dict[int, Tuple[int, int]]:
         else:
             i += 1
     return steps
+
+
+def _foldable_steps(steps: Dict[int, Tuple[int, int]]) -> List[int]:
+    """可折叠的 step：**排除最后一个**。
+
+    最后一个 step 可能是「模型此刻正在走的这一步」（它的 tool 消息还没补齐），
+    折掉它会让紧随其后的 tool 消息变成孤儿、消息序列非法。排除它最省心，
+    也符合直觉：别折你正要走的那一步。
+    """
+    keys = sorted(steps)
+    return keys[:-1] if len(keys) > 1 else []

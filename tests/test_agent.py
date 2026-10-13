@@ -118,12 +118,32 @@ def test_compact_accepts_and_folds(make_agent):
     ag = make_agent()
     step(ag, 1)
     step(ag, 2)
+    # 折 step 1（带摘要）→ 立即生效：摘要节点 + 未折的 step 2
     ok, _ = ag.compact(1, 1, "第一步")
     assert ok
-    ag.compact(2, 2, "第二步")
-    ag._apply_pending_compactions()
-    assert len(ag.history) == 1
-    assert "已折叠" in ag.history[0]["content"]
+    assert len(ag.history) == 3
+    assert "已折叠 step 1-1" in ag.history[0]["content"]
+    assert ag.history[1]["content"] == "think 2"
+
+
+def test_compact_rejects_last_step(make_agent):
+    """最后一步（你正在走的）不许折，否则会孤儿化紧随其后的 tool 消息。"""
+    ag = make_agent()
+    for i in range(3):
+        step(ag, i)
+    ok, msg = ag.compact(3, 3, "最后一步")
+    assert not ok and "最后一步" in msg
+
+
+def test_compact_empty_summary_drops(make_agent):
+    """空摘要 = 直接丢弃：不留任何占位节点，省得最彻底。"""
+    ag = make_agent()
+    step(ag, 1)
+    step(ag, 2)
+    ok, msg = ag.compact(1, 1, "")
+    assert ok and "丢弃" in msg
+    assert len(ag.history) == 2          # 只剩 step 2 的 assistant + tool，没有摘要节点
+    assert not any("已折叠" in str(m.get("content")) for m in ag.history)
 
 
 # ---------------------------------------------------------------- finish 语义

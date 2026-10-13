@@ -74,11 +74,15 @@ class Runtime:
             if parsed_window:
                 self.config.context_window_tokens = int(parsed_window)
         self.context_window_tokens = int(self.config.context_window_tokens)
-        # 预算来源只有这里一处：显式 --context-budget 优先，否则按窗口推导。
+        # 预算来源只有这里一处：显式 --context-budget 优先，否则按窗口推导
+        # （模型仍可在运行期用 context_budget 在策略文件里改它，见 agent）。
         budget_arg = (None if self._context_budget_arg is None
                       else parse_token_count(self._context_budget_arg))
+        self._explicit_budget = budget_arg
         self.context_budget_chars = resolve_context_budget(
             budget_arg, self.context_window_tokens)
+        self.context_budget_source = ("显式 --context-budget" if budget_arg is not None
+                                      else f"按窗口 {_fmt_tokens(self.context_window_tokens)} 推导")
         self.registry = Registry(self.ws)
         for name, fn in BUILTIN_FUNCTIONS.items():
             self.registry.register_builtin(name, fn)
@@ -224,7 +228,9 @@ class Runtime:
         self.agent = Agent(self.ws, self.registry, self.llm, self.recorder,
                            max_iterations=self.max_iterations,
                            tool_result_limit=self.tool_result_limit,
-                           context_budget_chars=self.context_budget_chars,
+                           # 传**原始**显式参数（None = 未显式给）：Agent 据此决定
+                           # 「策略文件里的预算」能否生效；已推导的默认值不当覆写。
+                           context_budget_chars=self._explicit_budget,
                            seed_turns=self._effective_turns(),
                            progress=progress)
         self.agent.current_images = list(image_refs)
@@ -238,7 +244,8 @@ class Runtime:
         if image_refs:
             self.say(f"       本轮输入含 {len(image_refs)} 张图片（多模态）")
         self.say(f"       上下文窗口 {_fmt_tokens(self.context_window_tokens)} token"
-                 f" → 预算 {_fmt_chars(self.context_budget_chars)} 字符后自动折叠")
+                 f" → 预算 {_fmt_chars(self.agent.context_budget_chars)} 字符"
+                 f"（来源：{self.agent.context_budget_source()}；模型可用 context_budget 改）")
         if self.heartbeat > 0 and not self.quiet:
             self.say(f"       每 {self.heartbeat:g}s 打一次心跳，长任务不会看起来卡死")
 
@@ -392,6 +399,7 @@ class Runtime:
             f"工具     {len(reg)} 个（内置 {len(reg.builtins)} / 自造 {len(reg.user_tools())}）",
             f"上下文   窗口 {_fmt_tokens(self.context_window_tokens)} token"
             f" → 预算 {_fmt_chars(self.context_budget_chars)} 字符"
+            f"（{self.context_budget_source}；模型可用 context_budget 改）"
             + ("（已关闭自动折叠）" if self.context_budget_chars <= 0 else ""),
         ]
         for t in reg.user_tools():

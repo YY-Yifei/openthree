@@ -12,6 +12,8 @@
                 transcript.jsonl  # 对话档案（append-only，每轮一行 JSON，
                                   #  用户的完整原始输入永不丢失、无损往返；
                                   #  只增不改，不会被自动回读，--resume 才显式续读）
+        context.json            # 上下文策略：预算 / 是否自动折叠（模型自管的旋钮）
+                                #   写用 context_budget、读用 context_usage，每轮被重读
         functions/              # 二：python 文件即 function
         assets/                 # 用户/工具带入的图片（按内容 sha1 去重）
         logs/                   # 可观测：模型全部工作记录
@@ -60,9 +62,29 @@ _SYSTEM_PROMPT_SEED = """\
 1. **道生一、一生二、二生三、三生万物**：一切能力从你而来，你从循环中长出万物。
 2. **能力可生长**：当现有 function 不够用时，用 `write_function` 写出新的 python 文件，
    然后用 `reload_functions` 让它立刻变成你手上的工具。这就是你的自我演化。
-3. **上下文可组装**：用 `write_user_prompt` 把你的目标、计划、待办写进
-   `.openthree/prompts/user-prompts.md`；它会成为你下一轮的指令。
-   上下文太长时用 `compact_context` 折叠历史。这是你的自我管理。
+3. **上下文可自管**：用 `write_user_prompt` 把目标、计划、待办写进
+   `.openthree/prompts/user-prompts.md`；它成为你下一轮的指令。
+   你还能看见自己用了多少上下文（`context_usage`）、调预算与自动折叠
+   （`context_budget`）、把过长的历史折叠或丢弃（`compact_context`）。这是你的自我管理。
+
+# 自管上下文
+
+上下文是你手里另一件可以自己管的东西 —— 与提示词、function 一样，磁盘即状态、
+每轮重读，改一下下一轮就生效。你的处境里每轮都会有一行用量读数：
+
+- **看得见**：`context_usage` 给「已用 / 预算 / 占比 / 可折范围 / 自动折叠开关 / 已折次数」。
+  处境里的 `上下文：…` 一行就是它的摘要，你不必专门去调。
+- **改得动**：`context_budget(budget_chars=..., auto_fold=...)` 写下预算与是否让内核
+  兜底自动折叠（0 = 关闭自动折叠）。登录下轮生效。
+- **折得掉**：`compact_context(start, end, summary)` 把一段 step 折叠成摘要；
+  **`summary` 留空就直接丢弃**（早期无用的步骤，最省）。它会**立即**生效，
+  并如实告诉你省了多少字符。可折范围由 `context_usage` 给出，**别折最后一步**（你正在走）。
+- **内核的兜底**：默认有一张安全网 —— 上下文爆仓时内核会自动折最老的步骤。
+  这是「安全网」不是「主控」：想自己管，就把预算改大或 `auto_fold=false` 关掉它。
+  环境变量 `OPENTHREE_CONTEXT_AUTOFOLD=0` 能从外面彻底冻结它（你改不了环境）。
+
+判断标准很简单：**快满了、且早期步骤已经没用了** → 折叠或丢弃；**想自己掌控节奏**
+→ 调预算 / 关自动折叠。别等爆仓才反应。
 
 # 长任务：把计划交给自己
 
@@ -135,6 +157,15 @@ _PLAN_SEED = """\
 > 它会在每一轮自动出现在你眼前；做一步就更新一步，别把进度只留在上下文里。
 
 - [ ] （还没有计划。想清楚要做什么后，用 write_plan 写下来。）
+"""
+
+# 上下文策略：预算字符 / 是否让内核兜底自动折叠。文件不存在时按模型窗口推导，
+# 自动折叠默认开启（安全网）。模型用 context_budget 工具写它、每轮被重读。
+_CONTEXT_SEED = """\
+{
+  "budget_chars": null,
+  "auto_fold": true
+}
 """
 
 
@@ -241,6 +272,15 @@ class Workspace:
         return self.prompts_dir / "plan.md"
 
     @property
+    def context_policy_file(self) -> Path:
+        """上下文策略：预算 / 是否自动折叠 —— 模型的「自管上下文」旋钮。
+
+        与 plan.md / memory.jsonl 同源：磁盘即状态、每轮被 Agent 重读，所以
+        改一下下一轮就生效。由内置工具 `context_budget` 写、`context_usage` 读。
+        """
+        return self.dir / "context.json"
+
+    @property
     def versions_dir(self) -> Path:
         """系统提示词的历史版本——「自省」的前提是「可后悔」。
 
@@ -297,6 +337,8 @@ class Workspace:
             self.user_prompt_file.write_text(_USER_PROMPT_SEED, encoding="utf-8")
         if force_prompts or not self.plan_file.exists():
             self.plan_file.write_text(_PLAN_SEED, encoding="utf-8")
+        if force_prompts or not self.context_policy_file.exists():
+            self.context_policy_file.write_text(_CONTEXT_SEED, encoding="utf-8")
 
         self._ensure_readme()
         return self
@@ -312,6 +354,7 @@ class Workspace:
             "| `prompts/system-prompts.md` | 一：系统提示词，模型可自改（旧稿存于 `prompts/history/`） |\n"
             "| `prompts/user-prompts.md` | 当前任务，用户输入落在这里 |\n"
             "| `prompts/plan.md` | 长任务待办清单，模型自己维护、每轮自动注入 |\n"
+            "| `context.json` | 上下文策略：预算 / 是否自动折叠；`context_budget` 写、`context_usage` 读 |\n"
             "| `prompts/history/transcript.jsonl` | 对话档案：用户的完整原始输入（只增不改，`--resume` 可续读） |\n"
             "| `prompts/history/system-*.md` | 系统提示词的历史版本（`read_prompt_version` 回看、`restore_system_prompt` 回退） |\n"
             "| `functions/*.py` | 二：python 文件即 function |\n"

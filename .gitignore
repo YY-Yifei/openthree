@@ -18,6 +18,7 @@ _live/
 #           memory/               模型学到的经验
 #           prompts/system-prompts.md   它的自我认知
 #   不入库  config.yaml           含 api_key
+#           context.json          上下文策略（预算/自动折叠），运行时可被模型改写
 #           logs/                 工作记录，每次运行都变
 #           assets/               随任务带进来的图片等资产（体积大，不入库）
 #           three-report.html     由 openthree --report 生成
@@ -27,6 +28,7 @@ _live/
 #           prompts/history/            多轮对话档案，每次任务都在长
 # ---------------------------------------------------------------------------
 .openthree/config.yaml
+.openthree/context.json
 .openthree/logs/
 .openthree/assets/
 .openthree/three-report.html

@@ -189,18 +189,45 @@ openthree -i --auto 8 "把项目里的重复代码抽干净"
 一键回退（回退动作本身也会先存一版现稿）。自省的前提是**可后悔**。
 `read_prompts` 还会在开头先给出系统提示词的**章节索引**，一眼看清结构再决定改哪节。
 
+## 上下文：模型自己管
+
+设计哲学是**模型驱动**：提示词能自改（`write_system_prompt`）、能力能自造
+（`write_function`）——上下文当然也该是模型手里的一只手，而不是内核单方面的决定。
+
+于是上下文管理有一对「读写工具」，磁盘即状态、每轮重读：
+
+- **看得见**：`context_usage` 给出「已用 / 预算 / 占比 / 可折叠范围 / 自动折叠开关 /
+  已折次数」。你的**处境**里每轮也自动带一行 `上下文：…` 摘要，不必专门去调。
+- **改得动**：`context_budget(budget_chars=..., auto_fold=...)` 写下策略到
+  `.openthree/context.json`（`0` = 关闭自动折叠）。**改一下，下一轮就生效**。
+- **折得掉**：`compact_context(start, end, summary)` 把一段 step 折叠成摘要；
+  **`summary` 留空就直接丢弃**（早期无用的步骤，最省）。它**立即**生效，
+  并如实告诉你省了多少字符。可折范围由 `context_usage` 给出，最后一步（你正在走的）不可折。
+
+内核的**自动折叠是「安全网」而非「主控」**：默认开启，好让第一次跑长任务不至于撞上限；
+但它随时可被模型关掉（`auto_fold=false`）或调预算。真正兜底的是**环境变量**
+`OPENTHREE_CONTEXT_AUTOFOLD=0`（CLI 里是 `--no-auto-fold`）——模型改不了环境，
+所以想「我自己来，内核别插手」时它才是那道硬闸。
+
+```bash
+openthree --no-auto-fold "这个任务我自己管上下文"   # 彻底冻结内核兜底折叠
+```
+
 ## 长任务的健壮性
 
 openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已经能扛住长任务：
 
 - **工具结果有界入上下文。** 单个工具输出超过 4000 字符时，完整内容落盘到
   `logs/tool-output/`，history 只保留预览 + 文件路径。同一份大输出不会被每轮重发。
-- **上下文自动折叠。** 历史累计超过**预算**时，runtime 自动把最老的若干 step 折叠成
-  摘要——不依赖模型自觉调用 `compact_context`。预算不再写死：默认按**模型上下文窗口**
-  推导（窗口 × 50% × 2 字符/token）。默认窗口 **1M token → 预算 100 万字符**。
-  按你的模型调整窗口：`config.yaml` 里写 `llm.context_window_tokens: 4m`
-  （支持 `1M` / `128k` / `1000000`），或用 `--context-window` / `--context-budget` 覆盖；
-  `--context-budget 0` 关闭自动折叠。启动时会打印「窗口 → 预算」一行。
+- **上下文自己能管。** 历史累计超过**预算**时，内核会把最老的若干 step 折叠/丢弃；
+  但预算与「要不要内核兜底自动折叠」现在都由**模型自己**决定（`context_budget` 工具写
+  `.openthree/context.json`，每轮重读、改一下下一轮生效；`context_usage` 是它的读数）。
+  预算默认按**模型上下文窗口**推导（窗口 × 50% × 2 字符/token）：默认窗口
+  **1M token → 预算 100 万字符**。按你的模型调整窗口：`config.yaml` 里写
+  `llm.context_window_tokens: 4m`（支持 `1M` / `128k` / `1000000`），或用
+  `--context-window` / `--context-budget` 覆盖（显式参数是模型的起点）。
+  想让内核**彻底不插手**：`--no-auto-fold` 或环境变量 `OPENTHREE_CONTEXT_AUTOFOLD=0`
+  （模型改不了环境，这是真·硬闸）。详见「上下文：模型自己管」一节。
 - **LLM 调用会重试。** 网络抖动 / 限流 / 5xx 自动指数退避重试（默认 3 次）；
   参数错误、鉴权失败立即返回，不空转。
 - **输出被截断可恢复。** `finish_reason=length` 时如实报错，**并要求模型重发**那条消息
@@ -334,7 +361,7 @@ recall_memory(query="pytest")     # → 把写下的经验读回来
     steps/step-0001.json 逐步拆解
     events/events.jsonl  追加式事件流，一行一事件
     llm/llm-0001.json    每次模型调用的请求与响应原文
-    evolution.jsonl      自我演化史（写了什么 function、改了什么提示词）
+    evolution.jsonl      自我演化史（写了什么 function、改了什么提示词、调了什么上下文策略）
 ```
 
 ```bash
@@ -353,7 +380,7 @@ openthree/
 ├── workspace.py   .openthree/ 的读写与初始化
 ├── tool.py        函数 → Tool（类型注解 + docstring → JSON Schema）
 ├── registry.py    扫描 functions/*.py → 工具注册表
-├── builtins.py    种子 functions（看世界 / 改自己 / 记忆 / 收尾）
+├── builtins.py    种子 functions（看世界 / 改自己 / 记忆 / 上下文 / 收尾）
 ├── prompt.py      上下文组装（一 + 运行期处境 + 三）
 ├── llm.py         极薄 LLM 客户端
 ├── agent.py       ReAct 循环
@@ -371,7 +398,11 @@ self_test.py       端到端自测（桩模型）
 - **没有编排层。** 控制流由模型决定。硬编码的 `if 用户想做什么` 是智能的敌人。
 - **提示词是文件不是常量。** 模型能读到它，所以也能改写它。
 - **目录即注册表。** 不引入注册代码、不引入装饰器参数、不引入配置文件。
-- **每轮重装上下文。** 自我修改要立刻生效，就不能缓存。
+- **每轮重装上下文。** 自我修改要立刻生效，就不能缓存——提示词、工具、**上下文策略**
+  都是每轮重读磁盘。模型改一下，下一轮就是新的自己。
+- **上下文也是模型的一只手。** 预算与自动折叠不是内核的特权，而是可读（`context_usage`）、
+  可写（`context_budget`）、可折（`compact_context`）的磁盘状态；内核的自动折叠只是
+  一张**可被模型关掉**的安全网，环境变量才是它绕不过的硬闸。
 - **记录先落盘再返回。** 进程被 kill 也不丢已发生的思考。
 - **进度成回声。** 展示层与决策层分开：Agent 不认识终端，Progress 不认识 ReAct。
 

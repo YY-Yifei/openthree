@@ -33,7 +33,7 @@ RUNTIME_TEMPLATE = """\
 - 模型：{model}
 - 可用工具：{tool_count} 个（内置 {builtin_count} / 自造 {user_count}）
 - 本轮已是第 {iteration} 步（上限 {max_iterations}）
-- 当前可折叠的 step 范围：{fold_range}（compact_context 只能用这个范围）
+- 上下文：{context}（`context_usage` 看细节 / `context_budget` 调预算）
 
 # 你的工具（二）
 
@@ -65,7 +65,8 @@ RUNTIME_TEMPLATE = """\
 
 def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: int,
                         max_iterations: int, last_action: str = "",
-                        fold_range: str = "") -> str:
+                        fold_range: str = "",
+                        context_stats: Optional[Dict[str, Any]] = None) -> str:
     evolution = _recent_evolution(ws, limit=10)
     builtin = [t for t in reg.tools.values() if t.origin == "builtin"]
     user = [t for t in reg.tools.values() if t.origin == "user"]
@@ -79,7 +80,7 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         user_count=len(user),
         max_iterations=max_iterations,
         iteration=iteration,
-        fold_range=fold_range or "（暂无）",
+        context=_context_line(context_stats, fold_range),
         digest=reg.digest(),
         plan=_plan_block(ws),
         memory=_memory_block(ws),
@@ -87,6 +88,28 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         evolution=evolution,
         user_prompt=ws.read_user_prompt().strip() or "（空）",
     )
+
+
+def _context_line(stats: Optional[Dict[str, Any]], fold_range: str = "") -> str:
+    """一行上下文用量读数 —— 让模型每轮都知道「我在用多少、还能折哪段」。
+
+    有 stats（Agent 正常提供）就按真实用量拼；没有（老调用/测试）就退回到
+    只用 fold_range，保持向后兼容。
+    """
+    if not stats:
+        return (f"可折叠 step 范围 {fold_range or '（暂无）'}"
+                "（compact_context 只能用这个范围）")
+    used = int(stats.get("used_chars", 0))
+    budget = int(stats.get("budget_chars", 0))
+    ratio = float(stats.get("ratio", 0.0))
+    fr = stats.get("fold_range") or "（暂无）"
+    fold = "开" if stats.get("auto_fold") else "关"
+    if budget > 0:
+        head = f"已用 {used}/{budget} 字符（{ratio * 100:.0f}%）"
+    else:
+        head = f"已用 {used} 字符（预算 0 = 已关自动折叠）"
+    return (f"{head}；可折叠 step 范围 {fr}；自动折叠 {fold}"
+            f"；已折 {int(stats.get('compactions', 0))} 次")
 
 
 def _memory_block(ws: Workspace) -> str:
@@ -177,12 +200,13 @@ def _recent_evolution(ws: Workspace, limit: int = 10) -> str:
 
 def build_messages(ws: Workspace, reg: Registry, history: List[Dict[str, Any]], *,
                    model: str, iteration: int, max_iterations: int,
-                   last_action: str = "", fold_range: str = "") -> List[Dict[str, Any]]:
+                   last_action: str = "", fold_range: str = "",
+                   context_stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """组装完整 messages。system = 一 + 运行期三；history 是模型自己走过的路。"""
     system_prompt = ws.read_system_prompt().strip()
     runtime = build_runtime_block(ws, reg, model=model, iteration=iteration,
                                   max_iterations=max_iterations, last_action=last_action,
-                                  fold_range=fold_range)
+                                  fold_range=fold_range, context_stats=context_stats)
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": f"{system_prompt}\n\n{runtime}"}
     ]
