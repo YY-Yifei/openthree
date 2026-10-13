@@ -1281,8 +1281,10 @@ def next_round(summary: str = "") -> str:
                   "summary": summary},
         )
     if r.get("next"):
+        carried = "已把你的交接说明交给下一轮（它会出现在下一轮的开头）" if summary.strip() \
+            else "（这次没写交接说明，下一轮从头接着做）"
         return (f"[ok] 已结束第 {r['index']} 轮（本场共 {r['max']} 轮，还剩 {r['remaining']} 轮）。"
-                f"运行期将开下一轮；已把你的交接说明记入工作记录。")
+                f"运行期将开下一轮；{carried}。")
     return ("[ok] 已结束本轮 —— 但这是**单次任务，没有下一轮**：进程到此收尾。"
             "若事情没做完，请在 finish 里写清「还剩什么」；"
             "想要真正的多轮接力，需要用自动接力启动（CLI `--auto N`）。")
