@@ -5,7 +5,7 @@ registry / workspace / recorder，从而具备「自我演化」与「自省」�
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 class Kernel:

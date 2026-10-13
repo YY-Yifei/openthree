@@ -57,9 +57,7 @@ from .workspace import Workspace
 TOOL_RESULT_LIMIT = 4000
 # 上下文预算（历史累计字符数）默认由「模型上下文窗口」推导，见 resolve_context_budget。
 # 预算 ≈ min(窗口 token 数, MAX_CONTEXT_BUDGET_CHARS)：窗口越大给越多，但兜个上限。
-#   窗口 = 1M token（默认）→ 预算 = 1_000_000 字符（约 50 万 token 的历史）
-# 这里的 1_000_000 同时也是「不显式给窗口时」的等效默认预算。
-DEFAULT_CONTEXT_BUDGET_CHARS = 1_000_000
+#   窗口 = 1M token（默认，见 llm.DEFAULT_CONTEXT_WINDOW_TOKENS）→ 预算 = 1_000_000 字符。
 # 预算的硬上限（= 默认窗口的推导值）：窗口更大时不再线性放大，避免阈值离谱。
 # 想放开就调大这里，或用 --context-budget 显式给。
 MAX_CONTEXT_BUDGET_CHARS = 1_000_000

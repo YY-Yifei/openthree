@@ -154,7 +154,6 @@ def build_tool(func: Callable[..., Any], *, origin: str = "user",
         hints = {}
 
     doc = inspect.getdoc(func)
-    desc = _first_line(doc) or f"调用 {func.__name__}"
     long_doc = doc or ""
     arg_docs = _parse_args_section(doc)
 

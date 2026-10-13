@@ -204,10 +204,6 @@ class ImageResult:
     images: List[str] = field(default_factory=list)
     detail: str = DEFAULT_DETAIL
 
-    @property
-    def has_images(self) -> bool:
-        return bool(self.images)
-
     def brief(self) -> str:
         n = len(self.images)
         return f"{self.text}（+{n} 张图片）" if n else str(self.text)

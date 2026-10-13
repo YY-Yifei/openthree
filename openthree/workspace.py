@@ -38,8 +38,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .multimodal import (IMAGE_EXTS, ImageError, is_remote, resolve_path,
-                         save_asset)
+from .multimodal import ImageError, is_remote, save_asset
 
 DIRNAME = ".openthree"
 
@@ -683,15 +682,6 @@ class Workspace:
         cleaned = re.sub(re.escape(self._IMAGES_MARK) + r":\s*\[.*?\]\s*-->", "", text or "",
                          flags=re.S)
         return cleaned.strip()
-
-    def scan_image_paths(self, text: str) -> List[str]:
-        """从一段文本里找出看起来是图片的路径 / URL（用于 CLI 的便利解析）。"""
-        out: List[str] = []
-        for token in re.findall(r"[^\s\"']+", text or ""):
-            low = token.split("?")[0].lower()
-            if is_remote(token) or any(low.endswith(ext) for ext in IMAGE_EXTS):
-                out.append(token)
-        return out
 
     # ---------- 多轮对话档案 ----------
     def append_turn(self, user_input: str, answer: str = "", *,

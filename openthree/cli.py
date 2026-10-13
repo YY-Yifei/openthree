@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__
-from .kernel import KERNEL
 from .runtime import Runtime
 
 
@@ -92,7 +91,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--init", action="store_true", help="只初始化 .openthree/ 工作区，不调模型")
     p.add_argument("--force-prompts", action="store_true", help="初始化时覆盖已有的提示词（危险）")
     p.add_argument("--report", action="store_true", help="只重新生成 three-report.html")
-    p.add_argument("--report-only", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--inspect", action="store_true", help="看一眼自己当前的样子")
     p.add_argument("--functions", action="store_true", help="列出当前所有工具")
     p.add_argument("-i", "--interactive", action="store_true",
@@ -143,7 +141,7 @@ def main(argv=None) -> int:
         print(rt.self_inspect())
         return 0
 
-    if args.report or args.report_only:
+    if args.report:
         path = rt.report()
         print(f"[ok] 报告已生成 {path}")
         return 0

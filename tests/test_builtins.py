@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from openthree.builtins import _decode, _split_tags, _syntax_error, run_shell
+from openthree.builtins import _decode, _split_tags, run_shell
 from openthree.registry import Registry
 
 from conftest import *  # noqa: F401,F403  复用夹具
@@ -100,11 +100,6 @@ def test_run_shell_clamps_huge_timeout():
 
 
 # ---------------------------------------------------------------- write_function
-def test_syntax_error_detected():
-    assert "line" in _syntax_error("def broken(:\n  pass\n")
-    assert _syntax_error("def ok(a: int) -> int:\n    return a\n") == ""
-
-
 def test_write_function_rejects_bad_syntax(make_agent, ws):
     from openthree.builtins import write_function
     make_agent()

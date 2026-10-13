@@ -201,14 +201,6 @@ def test_submit_append_drops_stale_image_marker(ws, png):
     assert imgs == [str(png)]                    # 旧图标记被剥掉，只留本轮
 
 
-def test_scan_image_paths_from_free_text():
-    ws = Workspace(__import__("pathlib").Path("."))
-    got = ws.scan_image_paths("看看 ./a/b.png 和 http://x/y.jpg 以及 notes.txt")
-    assert "./a/b.png" in got
-    assert "http://x/y.jpg" in got
-    assert "notes.txt" not in got
-
-
 # ---------------------------------------------------------------- 日志脱敏
 def test_redact_strips_base64_from_logs(png):
     payload = {"messages": [{"role": "user", "content": [

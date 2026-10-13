@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from .kernel import KERNEL
 from .tool import Tool, build_tool
 from .workspace import Workspace
 

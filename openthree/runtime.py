@@ -31,8 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 from .agent import Agent, resolve_context_budget
 from .builtins import BUILTIN_FUNCTIONS
 from .kernel import KERNEL
-from .llm import (DEFAULT_CONTEXT_WINDOW_TOKENS, LLM, LLMConfig, load_config,
-                  parse_token_count)
+from .llm import LLM, LLMConfig, load_config, parse_token_count
 from .progress import Progress
 from .recorder import Recorder
 from .registry import Registry

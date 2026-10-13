@@ -1342,17 +1342,6 @@ def _decode(data: Any) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _syntax_error(code: str) -> str:
-    """返回语法错误描述；合法则返回空串。"""
-    try:
-        ast.parse(code)
-    except SyntaxError as exc:
-        return f"{type(exc).__name__}: {exc.msg} (line {exc.lineno})"
-    except Exception as exc:  # noqa: BLE001
-        return f"{type(exc).__name__}: {exc}"
-    return ""
-
-
 # 「高危调用」清单：只是**提醒**（很多合法的自造工具确实要起子进程），
 # 但值得让模型知道「你写的这行会动到系统」——写出来时就说清，胜过事后排查。
 _DANGEROUS_CALLS = frozenset({
@@ -1361,7 +1350,6 @@ _DANGEROUS_CALLS = frozenset({
     "os._exit", "shutil.rmtree", "subprocess.run", "subprocess.Popen",
     "subprocess.call", "subprocess.check_output", "socket.socket", "ctypes.CDLL",
 })
-_DANGEROUS_MODULES = ("subprocess", "ctypes", "socket")
 
 
 def _static_audit(code: str, builtin_names: Optional[set] = None) -> Dict[str, Any]:
@@ -1369,14 +1357,14 @@ def _static_audit(code: str, builtin_names: Optional[set] = None) -> Dict[str, A
 
     返回 dict：``syntax_error`` / ``functions``（可注册的公开函数名）/
     ``all_functions`` / ``shadows``（覆盖了同名内置工具的公开函数）/
-    ``dangerous``（高危调用，字符串形式）/ ``has_all``（是否声明了 __all__）。
+    ``dangerous``（高危调用，字符串形式）。
 
     注册器最终会 ``exec_module``、并按「本文件定义 + 不由 _ 开头」收函数，
     所以这里用**同一条规则**预先算一遍 —— 把「写错了」提前到写入那一刻。
     """
     result: Dict[str, Any] = {
         "syntax_error": "", "functions": [], "all_functions": [],
-        "shadows": [], "dangerous": [], "has_all": False,
+        "shadows": [], "dangerous": [],
     }
     try:
         tree = ast.parse(code)
@@ -1407,12 +1395,6 @@ def _static_audit(code: str, builtin_names: Optional[set] = None) -> Dict[str, A
         if label in _DANGEROUS_CALLS and label not in found:
             found.append(label)
     result["dangerous"] = found
-
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for t in node.targets:
-                if isinstance(t, ast.Name) and t.id == "__all__":
-                    result["has_all"] = True
     return result
 
 
