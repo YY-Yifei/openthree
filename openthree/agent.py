@@ -144,11 +144,19 @@ class Agent:
         self._explicit_max_tokens = max_tokens
         self._explicit_temperature = temperature
         self._limits_env = os.environ.get(LIMITS_LOCK_ENV)
+        # 生成参数的「内核默认」基线：**构造时快照一次，之后只读**。
+        # 旧实现让 apply_limits 原地改 llm.config，而「默认值」又取自 llm.config，
+        # 于是模型调大一次后，跨轮（-i / --auto 复用同一个 LLM）「内核默认」就被
+        # 它自己的值污染了 —— 基线必须与「模型能改的运行时值」分开。
+        self._baseline_max_tokens = _as_int(
+            getattr(getattr(self.llm, "config", None), "max_tokens", None), 8192, lo=1)
+        self._baseline_temperature = _as_float(
+            getattr(getattr(self.llm, "config", None), "temperature", None),
+            0.3, lo=0.0, hi=2.0)
         self._limits_file_data: Dict[str, Any] = {}
         self._reload_limits_file()
         (self.max_iterations, self.tool_result_limit, self.max_tokens,
          self.temperature) = self._compute_limits()
-        self._apply_generation_limits()
         # 本轮用户输入携带的图片（绝对路径或 http/data URL）。
         # 在第一步注入成一条独立的 user 消息（与任务文本配对），供跨轮还原。
         self.current_images: List[str] = []
@@ -306,30 +314,37 @@ class Agent:
         """
         fd = {} if self.limits_locked() else self._limits_file_data
 
-        def _pick(explicit: Any, key: str, default: Any, cast) -> Any:
+        def _pick(explicit: Any, key: str, base: Any, coerce) -> Any:
+            """显式参数 > 内核默认（基线）> 策略文件。
+
+            两条铁律：
+              * **基线不可写**。`base` 是构造时从 `llm.config` 快照一次的只读内核
+                默认，绝不回写 `llm.config` —— 旧实现原地改 config，又拿 config 当
+                默认值，跨轮（`-i` / `--auto` 复用同一个 LLM）就把它自己的值当成了
+                「内核默认」。基准与运行时值必须分开。
+              * **文件值才夹取**。`limits.json` 是模型/人能随手改的磁盘状态，坏值要
+                回退、越界要夹到合法区间，不能让循环崩、也不能把非法值直通模型。
+                显式参数是人类的**明确意图**（且 `set_limits` 根本改不动它），故原样
+                采信、不夹取 —— 与 `--context-budget` 的语义一致。
+            """
             if explicit is not None:
-                return cast(explicit)
-            if fd.get(key) is not None:
-                return cast(fd[key])
-            return cast(default)
+                return explicit
+            raw = fd.get(key)
+            if raw is not None:
+                return coerce(raw)
+            return base
 
         mi = _pick(self._explicit_max_iterations, "max_iterations", 200,
-                   lambda v: max(1, int(v)))
+                   lambda v: _clamp_int(v, 200, lo=1))
         tr = _pick(self._explicit_tool_result_limit, "tool_result_limit",
-                   TOOL_RESULT_LIMIT, lambda v: max(0, int(v)))
+                   TOOL_RESULT_LIMIT, lambda v: _clamp_int(v, TOOL_RESULT_LIMIT, lo=0))
         mt = _pick(self._explicit_max_tokens, "max_tokens",
-                   getattr(self.llm.config, "max_tokens", 8192), lambda v: max(1, int(v)))
+                   self._baseline_max_tokens,
+                   lambda v: _clamp_int(v, self._baseline_max_tokens, lo=1))
         tp = _pick(self._explicit_temperature, "temperature",
-                   getattr(self.llm.config, "temperature", 0.3), lambda v: float(v))
-        return mi, tr, mt, tp
-
-    def _apply_generation_limits(self) -> None:
-        """把生成参数推进 LLM 客户端 —— 让模型改的 max_tokens/temperature 立刻生效。"""
-        try:
-            self.llm.config.max_tokens = int(self.max_tokens)
-            self.llm.config.temperature = float(self.temperature)
-        except Exception:  # noqa: BLE001
-            pass
+                   self._baseline_temperature,
+                   lambda v: _clamp_float(v, self._baseline_temperature, lo=0.0, hi=2.0))
+        return int(mi), int(tr), int(mt), float(tp)
 
     def apply_limits(self) -> None:
         """重读「运行边界」并应用 —— 供 tick() 每轮调用（改一下下一轮生效）。"""
@@ -348,12 +363,16 @@ class Agent:
             self.progress.note(f"运行边界更新：步数上限 {mi}、生成上限 {mt}")
         self.max_iterations, self.tool_result_limit = mi, tr
         self.max_tokens, self.temperature = mt, tp
-        self._apply_generation_limits()
 
     def limits_stats(self) -> Dict[str, Any]:
         """把「运行边界」的读数交给模型 —— 自管的前提是看得见。"""
         locked = self.limits_locked()
         fd = {} if locked else self._limits_file_data
+        # 文件里给了值、却解析不出数字的键（null = 有意交给内核默认，不算坏值）：
+        # 它们实际走的是内核默认，标签如实写出来，免得「读数说模型自管、实际是默认」。
+        bad = {k for k in ("max_iterations", "tool_result_limit", "max_tokens",
+                           "temperature")
+               if fd.get(k) is not None and not _numeric(fd.get(k))}
         source: Dict[str, str] = {}
         for key, explicit in (("max_iterations", self._explicit_max_iterations),
                               ("tool_result_limit", self._explicit_tool_result_limit),
@@ -361,8 +380,10 @@ class Agent:
                               ("temperature", self._explicit_temperature)):
             if explicit is not None:
                 source[key] = "显式（锁定）"
-            elif fd.get(key) is not None:
+            elif fd.get(key) is not None and key not in bad:
                 source[key] = "模型自管"
+            elif key in bad:
+                source[key] = "内核默认（文件里的值无效）"
             else:
                 source[key] = "内核默认"
         return {
@@ -514,7 +535,9 @@ class Agent:
                 limits_stats=self.limits_stats(),
             )
             self.progress.llm_start(self.llm.config.model)
-            result = self.llm.chat(messages, tools=self.reg.schemas() or None)
+            result = self.llm.chat(messages, tools=self.reg.schemas() or None,
+                                   max_tokens=self.max_tokens,
+                                   temperature=self.temperature)
             msg = result.get("message") or {}
             self.progress.llm_done(result.get("elapsed_ms", 0.0), result.get("usage"),
                                    result.get("error"))
@@ -877,6 +900,57 @@ def _clip(text: str, limit: int = 4000) -> str:
 
 def _safe_name(name: str) -> str:
     return re.sub(r"[^0-9A-Za-z_.-]+", "_", name or "call")[:120] or "call"
+
+
+def _as_int(value: Any, default: int, *, lo: Optional[int] = None) -> int:
+    """安全转 int：解析不了就回退 `default`，低于 `lo` 就夹到 `lo`。
+
+    `limits.json` 是模型/人能随手改写的磁盘状态，坏值（"abc"、数组、负数）不该
+    把 ReAct 循环拖崩 —— 与 `_read_context_policy` 的「坏了也不能拖死」同一契约。
+    """
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    if lo is not None and out < lo:
+        return lo
+    return out
+
+
+def _as_float(value: Any, default: float, *, lo: Optional[float] = None,
+              hi: Optional[float] = None) -> float:
+    """安全转 float：解析不了回退 `default`，越界夹到 [lo, hi]。"""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if out != out or out in (float("inf"), float("-inf")):   # NaN / inf
+        return default
+    if lo is not None and out < lo:
+        return lo
+    if hi is not None and out > hi:
+        return hi
+    return out
+
+
+def _clamp_int(value: Any, default: int, *, lo: Optional[int] = None) -> int:
+    return _as_int(value, default, lo=lo)
+
+
+def _clamp_float(value: Any, default: float, *, lo: Optional[float] = None,
+                 hi: Optional[float] = None) -> float:
+    return _as_float(value, default, lo=lo, hi=hi)
+
+
+def _numeric(value: Any) -> bool:
+    """这个值能不能被当成数字？（用于「读数来源」诚实标注，不参与取值）。"""
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return False
+    return out == out and out not in (float("inf"), float("-inf"))
 
 
 def _is_truncation(result: Dict[str, Any]) -> bool:

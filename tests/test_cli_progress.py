@@ -19,7 +19,7 @@ class _SlowStubLLM:
         self.delay = delay
         self.answer = answer
 
-    def chat(self, messages, tools=None, tool_choice="auto"):
+    def chat(self, messages, tools=None, tool_choice="auto", **kwargs):
         time.sleep(self.delay)
         msg = {"role": "assistant", "content": "",
                "tool_calls": [{"id": "c1", "type": "function",

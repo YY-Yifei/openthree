@@ -181,7 +181,7 @@ def _stub_llm(results):
             context_window_tokens = 1_000_000
             max_tokens = 8192
 
-        def chat(self, messages, tools=None, tool_choice="auto"):
+        def chat(self, messages, tools=None, tool_choice="auto", **kwargs):
             calls["messages"].append(messages)
             r = results[min(calls["n"], len(results) - 1)]
             calls["n"] += 1

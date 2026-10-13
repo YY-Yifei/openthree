@@ -116,7 +116,7 @@ class _PlanStubLLM:
         self.plans = list(plans)
         self.round = 0
 
-    def chat(self, messages, tools=None, tool_choice="auto"):
+    def chat(self, messages, tools=None, tool_choice="auto", **kwargs):
         i = min(self.round, len(self.plans) - 1)
         plan = self.plans[i]
         self.round += 1

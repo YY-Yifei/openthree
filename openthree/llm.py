@@ -173,14 +173,26 @@ class LLM:
 
     def chat(self, messages: List[Dict[str, Any]],
              tools: Optional[List[Dict[str, Any]]] = None,
-             tool_choice: str = "auto") -> Dict[str, Any]:
-        """返回 {message, usage, elapsed_ms, raw_request, raw_response}。"""
+             tool_choice: str = "auto",
+             max_tokens: Optional[int] = None,
+             temperature: Optional[float] = None) -> Dict[str, Any]:
+        """返回 {message, usage, elapsed_ms, raw_request, raw_response}。
+
+        `max_tokens` / `temperature` 可**按次覆盖**配置里的值 —— 调用方（Agent）
+        由此把「模型自管的运行边界」按调用传进来，而不必去改 `self.config`。
+        这很关键：Runtime 在 `-i` / `--auto` 下复用同一个 LLM，若靠原地改 config，
+        这一轮写进去的边界会污染下一轮的「内核默认」。
+        """
         client = self._ensure_client()
+        eff_max_tokens = (self.config.max_tokens if max_tokens is None
+                          else int(max_tokens))
+        eff_temperature = (self.config.temperature if temperature is None
+                           else float(temperature))
         payload: Dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
-            "max_tokens": self.config.max_tokens,
-            "temperature": self.config.temperature,
+            "max_tokens": eff_max_tokens,
+            "temperature": eff_temperature,
         }
         for k, v in (self.config.extra or {}).items():
             payload.setdefault(k, v)
@@ -225,7 +237,7 @@ class LLM:
         error = None
         error_kind = None
         if finish_reason == "length":
-            error = (f"模型输出因 max_tokens={self.config.max_tokens} 被截断"
+            error = (f"模型输出因 max_tokens={eff_max_tokens} 被截断"
                      f"（finish_reason=length）")
             error_kind = "truncated"
 

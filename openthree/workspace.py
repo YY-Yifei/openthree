@@ -78,7 +78,7 @@ _SYSTEM_PROMPT_SEED = """\
 - **看得见**：`context_usage` 给「已用 / 预算 / 占比 / 可折范围 / 自动折叠开关 / 已折次数」。
   处境里的 `上下文：…` 一行就是它的摘要，你不必专门去调。
 - **改得动**：`context_budget(budget_chars=..., auto_fold=...)` 写下预算与是否让内核
-  兜底自动折叠（0 = 关闭自动折叠）。登录下轮生效。
+  兜底自动折叠（0 = 关闭自动折叠）。下一轮生效。
 - **折得掉**：`compact_context(start, end, summary)` 把一段 step 折叠成摘要；
   **`summary` 留空就直接丢弃**（早期无用的步骤，最省）。它会**立即**生效，
   并如实告诉你省了多少字符。可折范围由 `context_usage` 给出，**别折最后一步**（你正在走）。
@@ -395,6 +395,7 @@ class Workspace:
             "| `prompts/user-prompts.md` | 当前任务，用户输入落在这里 |\n"
             "| `prompts/plan.md` | 长任务待办清单，模型自己维护、每轮自动注入 |\n"
             "| `context.json` | 上下文策略：预算 / 是否自动折叠；`context_budget` 写、`context_usage` 读 |\n"
+            "| `limits.json` | 运行边界：步数 / 生成长度 / 工具结果宽度；`set_limits` 写、`limits_usage` 读 |\n"
             "| `prompts/history/transcript.jsonl` | 对话档案：用户的完整原始输入（只增不改，`--resume` 可续读） |\n"
             "| `prompts/history/system-*.md` | 系统提示词的历史版本（`read_prompt_version` 回看、`restore_system_prompt` 回退） |\n"
             "| `functions/*.py` | 二：python 文件即 function |\n"

@@ -136,7 +136,7 @@ class _RecordingLLM:
         self.answer = answer
         self.calls: list = []
 
-    def chat(self, messages, tools=None, tool_choice="auto"):
+    def chat(self, messages, tools=None, tool_choice="auto", **kwargs):
         self.calls.append(messages)
         msg = {"role": "assistant", "content": "",
                "tool_calls": [{"id": "c1", "type": "function",

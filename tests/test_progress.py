@@ -87,7 +87,7 @@ class _StubLLM:
         self.config = LLMConfig(api_key="k", base_url="u", model="stub-model")
         self.n = 0
 
-    def chat(self, messages, tools=None, tool_choice="auto"):
+    def chat(self, messages, tools=None, tool_choice="auto", **kwargs):
         self.n += 1
         if self.n == 1:
             msg = {"role": "assistant", "content": "先看一眼时间。",

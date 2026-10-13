@@ -109,7 +109,7 @@ def screenshot(url: str) -> ImageResult:
 
 ```
 道生一  工作区 <你的项目>\.openthree
-一生二  16 个工具（内置 16 / 自造 0）
+一生二  33 个工具（内置 30 / 自造 3）
 二生三  ReAct 循环开始（上限 200 步，模型 deepseek-v4.1-flash）
        每 15s 打一次心跳，长任务不会看起来卡死
 
@@ -260,7 +260,8 @@ openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已
   参数错误、鉴权失败立即返回，不空转。
 - **输出被截断可恢复。** `finish_reason=length` 时如实报错，**并要求模型重发**那条消息
   （更精简），最多 2 次——而不是把半截 `tool_calls` 当成正常回复、或白白杀死整场任务。
-  连续重发仍截断才失败，并提示调大 `config.yaml: llm.max_tokens`。
+  连续重发仍截断才失败，并提示模型用 `set_limits(max_tokens=…)` 自己调大生成上限
+  （若该旋钮已被启动参数或环境变量锁定，才需要人类改 `config.yaml`）。
 - **`run_shell` 跨平台，且不会挂死。** Windows 中文环境（GBK）下的输出不再乱码；
   命令超时后**连同子孙进程一起强杀**（Windows `taskkill /T`、POSIX `killpg`），
   再给 5s 管道收尾宽限，仍收不回就直接放弃读取返回——所以绝不会因为某个后台

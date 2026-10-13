@@ -251,7 +251,7 @@ class _EchoLLM:
         self.config = cfg
         self.seen = []
 
-    def chat(self, messages, tools=None, tool_choice="auto"):
+    def chat(self, messages, tools=None, tool_choice="auto", **kwargs):
         self.seen = messages
         msg = {"role": "assistant", "content": "",
                "tool_calls": [{"id": "c1", "type": "function",

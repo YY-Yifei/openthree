@@ -38,7 +38,7 @@ class StubLLM:
         self.config = cfg
         self.step = 0
 
-    def chat(self, messages, tools=None, tool_choice="auto"):
+    def chat(self, messages, tools=None, tool_choice="auto", **kwargs):
         self.step += 1
         tool_names = {t["function"]["name"] for t in (tools or [])}
 

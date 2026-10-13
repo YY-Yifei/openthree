@@ -21,11 +21,12 @@ class _Resp:
 
 
 def _client(fail_times=0, exc_factory=None, resp=None):
-    state = {"calls": 0}
+    state = {"calls": 0, "payloads": []}
 
     class Completions:
         def create(self, **payload):
             state["calls"] += 1
+            state["payloads"].append(payload)
             if state["calls"] <= fail_times:
                 raise (exc_factory or (lambda: TimeoutError("read timed out")))()
             return resp or _Resp()
@@ -71,6 +72,36 @@ def test_finish_reason_length_is_reported():
     r = _llm(client).chat([{"role": "user", "content": "hi"}])
     assert r["error"] and "length" in r["error"]
     assert r["finish_reason"] == "length"
+
+
+# ---------------------------------------------------------------- 生成参数按调用覆盖
+def test_chat_per_call_max_tokens_and_temperature():
+    """按次覆盖不动 config —— Agent 靠它传「模型自管的运行边界」，避免跨轮污染。"""
+    client, state = _client()
+    llm = _llm(client)
+    llm.config.max_tokens, llm.config.temperature = 8192, 0.3
+    llm.chat([{"role": "user", "content": "hi"}],
+             max_tokens=1234, temperature=1.5)
+    p = state["payloads"][0]
+    assert p["max_tokens"] == 1234 and p["temperature"] == 1.5
+    # 配置本身没被改写
+    assert llm.config.max_tokens == 8192 and llm.config.temperature == 0.3
+
+
+def test_chat_falls_back_to_config_when_not_overridden():
+    client, state = _client()
+    llm = _llm(client)
+    llm.chat([{"role": "user", "content": "hi"}])
+    p = state["payloads"][0]
+    assert p["max_tokens"] == llm.config.max_tokens
+    assert p["temperature"] == llm.config.temperature
+
+
+def test_truncation_error_reports_effective_max_tokens():
+    """截断报错要说实话：用本次调用真正生效的边界，而非 config。"""
+    client, _ = _client(resp=_Resp(finish_reason="length"))
+    r = _llm(client).chat([{"role": "user", "content": "hi"}], max_tokens=777)
+    assert r["error"] and "777" in r["error"]
 
 
 def test_retryable_classifier():
