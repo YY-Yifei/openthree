@@ -34,6 +34,7 @@ RUNTIME_TEMPLATE = """\
 - 可用工具：{tool_count} 个（内置 {builtin_count} / 自造 {user_count}）
 - 本轮已是第 {iteration} 步（上限 {max_iterations}）
 - 上下文：{context}（`context_usage` 看细节 / `context_budget` 调预算）
+- 运行边界：{limits}（`limits_usage` 看细节 / `set_limits` 调）
 
 # 你的工具（二）
 
@@ -66,7 +67,8 @@ RUNTIME_TEMPLATE = """\
 def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: int,
                         max_iterations: int, last_action: str = "",
                         fold_range: str = "",
-                        context_stats: Optional[Dict[str, Any]] = None) -> str:
+                        context_stats: Optional[Dict[str, Any]] = None,
+                        limits_stats: Optional[Dict[str, Any]] = None) -> str:
     evolution = _recent_evolution(ws, limit=10)
     builtin = [t for t in reg.tools.values() if t.origin == "builtin"]
     user = [t for t in reg.tools.values() if t.origin == "user"]
@@ -81,6 +83,7 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         max_iterations=max_iterations,
         iteration=iteration,
         context=_context_line(context_stats, fold_range),
+        limits=_limits_line(limits_stats, max_iterations),
         digest=reg.digest(),
         plan=_plan_block(ws),
         memory=_memory_block(ws),
@@ -110,6 +113,20 @@ def _context_line(stats: Optional[Dict[str, Any]], fold_range: str = "") -> str:
         head = f"已用 {used} 字符（预算 0 = 已关自动折叠）"
     return (f"{head}；可折叠 step 范围 {fr}；自动折叠 {fold}"
             f"；已折 {int(stats.get('compactions', 0))} 次")
+
+
+def _limits_line(stats: Optional[Dict[str, Any]], max_iterations: int) -> str:
+    """一行运行边界读数 —— 让模型每轮都知道「能走多远、生成多长、结果留多宽」。
+
+    有 stats（Agent 正常提供）就按真实值拼；没有（老调用/测试）就退回到只报步数上限。
+    """
+    if not stats:
+        return f"步数上限 {max_iterations}"
+    lock = "；被环境冻结，改不动" if stats.get("locked") else ""
+    return (f"步数 ≤ {stats.get('max_iterations', max_iterations)}；"
+            f"生成 ≤ {stats.get('max_tokens', '?')} token；"
+            f"工具结果 ≤ {stats.get('tool_result_limit', '?')} 字符；"
+            f"temperature {stats.get('temperature', '?')}{lock}")
 
 
 def _memory_block(ws: Workspace) -> str:
@@ -201,12 +218,14 @@ def _recent_evolution(ws: Workspace, limit: int = 10) -> str:
 def build_messages(ws: Workspace, reg: Registry, history: List[Dict[str, Any]], *,
                    model: str, iteration: int, max_iterations: int,
                    last_action: str = "", fold_range: str = "",
-                   context_stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                   context_stats: Optional[Dict[str, Any]] = None,
+                   limits_stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """组装完整 messages。system = 一 + 运行期三；history 是模型自己走过的路。"""
     system_prompt = ws.read_system_prompt().strip()
     runtime = build_runtime_block(ws, reg, model=model, iteration=iteration,
                                   max_iterations=max_iterations, last_action=last_action,
-                                  fold_range=fold_range, context_stats=context_stats)
+                                  fold_range=fold_range, context_stats=context_stats,
+                                  limits_stats=limits_stats)
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": f"{system_prompt}\n\n{runtime}"}
     ]

@@ -59,7 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="随任务附一张图片（多模态）：本地路径或 http(s) 链接；可重复。")
     p.add_argument("--images", default=None, metavar="A,B,C",
                    help="随任务附图片，逗号分隔（等价于多个 --image）。")
-    p.add_argument("-n", "--max-iterations", type=int, default=200, help="ReAct 最大步数，默认 200")
+    p.add_argument("-n", "--max-iterations", type=int, default=None,
+                   help="ReAct 最大步数（显式给出即锁定，模型改不动）；"
+                        "不传则由 .openthree/limits.json 决定，再退回内核默认 200 —— "
+                        "模型运行期可用 set_limits 改它")
     p.add_argument("--context-window", default=None,
                    help="模型上下文窗口（token）。支持 1M/128k/200000 写法；"
                         "默认取 config 里的 context_window_tokens，再退回 1M")
@@ -70,8 +73,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-auto-fold", action="store_true",
                    help="关闭内核兜底自动折叠（等价于环境变量 OPENTHREE_CONTEXT_AUTOFOLD=0）；"
                         "模型仍可自己用 compact_context 折叠")
-    p.add_argument("--tool-result-limit", type=int, default=4000,
-                   help="单个工具结果进入历史的字符上限，超出落盘，默认 4000")
+    p.add_argument("--tool-result-limit", type=int, default=None,
+                   help="单个工具结果进入历史的字符上限（显式给出即锁定），超出落盘；"
+                        "不传则由 .openthree/limits.json / 内核默认 4000 决定，模型可用 set_limits 改")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="单次生成 token 上限（显式给出即锁定）；"
+                        "不传则由 config.yaml 的 llm.max_tokens / limits.json 决定，模型可用 set_limits 改")
+    p.add_argument("--temperature", type=float, default=None,
+                   help="采样温度（显式给出即锁定）；不传则由 config.yaml / limits.json 决定")
     p.add_argument("--heartbeat", type=float, default=15.0,
                    help="长等待（模型/工具）期间每隔多少秒打印一次心跳，0 关闭，默认 15")
     p.add_argument("--append", action="store_true", help="把任务追加到 user-prompts.md 而不覆盖")
@@ -115,6 +124,8 @@ def main(argv=None) -> int:
         context_budget_chars=args.context_budget,
         context_window_tokens=args.context_window,
         tool_result_limit=args.tool_result_limit,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
         heartbeat=args.heartbeat,
         turns=args.turns,
     )

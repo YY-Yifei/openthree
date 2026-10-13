@@ -3,8 +3,8 @@
 > 道生一，一生二，二生三，三生万物。
 
 一个**极简的 LLM Agent Harness**：`.openthree/functions/*.py` 里的每个 python 文件
-都会变成模型可以调用的工具；模型可以自己写新文件、改自己的提示词——
-**能力因此可以生长**。
+都会变成模型可以调用的工具；模型可以自己写新文件、改自己的提示词、记自己的长期记忆、
+管自己的上下文与运行边界——**能力因此可以生长**。
 
 没有框架，没有 DSL，没有注册装饰器。**类型注解是 Schema，docstring 是描述，文件名是工具名。**
 
@@ -213,12 +213,40 @@ openthree -i --auto 8 "把项目里的重复代码抽干净"
 openthree --no-auto-fold "这个任务我自己管上下文"   # 彻底冻结内核兜底折叠
 ```
 
+## 运行边界：模型自己定
+
+同样的道理再往前推一步：「上下文」管的是**还能装多少**，「运行边界」管的是
+**还能走多远、一次生成多长、单条工具结果留多宽**——本质同构，所以也该是模型的一只手。
+
+于是运行边界也有一对「读写工具」，写进 `.openthree/limits.json`、每轮重读：
+
+- **看得见**：`limits_usage` 给出「步数上限 / `max_tokens` / 工具结果字符上限 /
+  `temperature`」，以及每个值**谁定的**（内核默认 / 模型自管 / 人类锁定）。处境里每轮
+  也自动带一行 `运行边界：…` 摘要。
+- **改得动**：`set_limits(max_iterations=…, max_tokens=…, tool_result_limit=…, temperature=…)`
+  写下边界。**改一下，下一轮就生效** —— 长任务被步数卡住就 `set_limits(max_iterations=…)`
+  给自己续路；输出被 `max_tokens` 截断就自己调大，不必等谁来改配置文件。
+- **内核默认只是起点**：`max_iterations=200`、`max_tokens=8192`、`tool_result_limit=4000`
+  都是**默认值**，不是天花板。模型改了 `limits.json`，下一轮 `run()` 开头就应用。
+
+与上下文一样，模型绕不过两层：**启动参数显式锁定**（`--max-iterations` / `--max-tokens` /
+`--tool-result-limit` / `--temperature` 一旦给出，该旋钮模型就改不动）与**环境硬闸**
+`OPENTHREE_LIMITS_LOCK`（非空真值 = 整体冻结，模型怎么写 `limits.json` 都无效）。
+「人类把边界收回去了」这件事，对模型是**可读**的（`limits_usage` 会如实标出「显式（锁定）」
+或「被环境冻结，改不动」）。
+
+```bash
+openthree --max-iterations 500 "这个长任务我允许它多走几步"   # 显式锁定步数上限
+OPENTHREE_LIMITS_LOCK=1 openthree "运行边界谁也不许动"        # 整体冻结
+```
+
 ## 长任务的健壮性
 
 openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已经能扛住长任务：
 
-- **工具结果有界入上下文。** 单个工具输出超过 4000 字符时，完整内容落盘到
-  `logs/tool-output/`，history 只保留预览 + 文件路径。同一份大输出不会被每轮重发。
+- **工具结果有界入上下文。** 单个工具输出超过 `tool_result_limit`（默认 4000）字符时，
+  完整内容落盘到 `logs/tool-output/`，history 只保留预览 + 文件路径。同一份大输出不会被
+  每轮重发。这个上限也不是死的——模型可用 `set_limits(tool_result_limit=…)` 自己调。
 - **上下文自己能管。** 历史累计超过**预算**时，内核会把最老的若干 step 折叠/丢弃；
   但预算与「要不要内核兜底自动折叠」现在都由**模型自己**决定（`context_budget` 工具写
   `.openthree/context.json`，每轮重读、改一下下一轮生效；`context_usage` 是它的读数）。
@@ -380,7 +408,7 @@ openthree/
 ├── workspace.py   .openthree/ 的读写与初始化
 ├── tool.py        函数 → Tool（类型注解 + docstring → JSON Schema）
 ├── registry.py    扫描 functions/*.py → 工具注册表
-├── builtins.py    种子 functions（看世界 / 改自己 / 记忆 / 上下文 / 收尾）
+├── builtins.py    种子 functions（看世界 / 改自己 / 记忆 / 上下文 / 边界 / 收尾）
 ├── prompt.py      上下文组装（一 + 运行期处境 + 三）
 ├── llm.py         极薄 LLM 客户端
 ├── agent.py       ReAct 循环
@@ -403,6 +431,10 @@ self_test.py       端到端自测（桩模型）
 - **上下文也是模型的一只手。** 预算与自动折叠不是内核的特权，而是可读（`context_usage`）、
   可写（`context_budget`）、可折（`compact_context`）的磁盘状态；内核的自动折叠只是
   一张**可被模型关掉**的安全网，环境变量才是它绕不过的硬闸。
+- **运行边界也是模型的一只手。** 步数 / 生成长度 / 工具结果宽度同样可读（`limits_usage`）、
+  可写（`set_limits`）、每轮重读；默认值只是起点，启动参数显式锁定与环境变量
+  `OPENTHREE_LIMITS_LOCK` 才是收回去的那两层。「还能走多远」与「还能装多少」是同一类问题，
+  所以给它们同一套机制。
 - **记录先落盘再返回。** 进程被 kill 也不丢已发生的思考。
 - **进度成回声。** 展示层与决策层分开：Agent 不认识终端，Progress 不认识 ReAct。
 

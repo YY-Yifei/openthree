@@ -1187,6 +1187,61 @@ def context_budget(budget_chars: Optional[int] = None,
     return msg
 
 
+def limits_usage() -> str:
+    """看一眼「运行边界」——你能走多少步、生成多长、单条工具结果留多宽。
+
+    自管边界的前提是看得见。返回：迭代上限 / max_tokens / 工具结果字符上限 /
+    temperature，以及每个值「谁定的」（内核默认 / 模型自管 / 显式锁定）。
+    想调整它们，用 `set_limits`。
+    """
+    if KERNEL.agent is None:
+        return "[错误] 内核未就绪"
+    s = KERNEL.agent.limits_stats()
+    src = s["source"]
+    lines = [
+        f"迭代上限：{s['max_iterations']} 步（{src['max_iterations']}）",
+        f"生成上限 max_tokens：{s['max_tokens']}（{src['max_tokens']}）",
+        f"工具结果上限：{s['tool_result_limit']} 字符（{src['tool_result_limit']}）",
+        f"temperature：{s['temperature']}（{src['temperature']}）",
+    ]
+    if s["locked"]:
+        lines.append("（运行边界被环境变量 OPENTHREE_LIMITS_LOCK 冻结，模型改不动）")
+    return "\n".join(lines)
+
+
+def set_limits(max_iterations: Optional[int] = None,
+               max_tokens: Optional[int] = None,
+               tool_result_limit: Optional[int] = None,
+               temperature: Optional[float] = None) -> str:
+    """调整「运行边界」——步数 / 生成长度 / 工具结果宽度 / 温度。下一轮即生效。
+
+    这是你自管「运行边界」的旋钮：能走多远、一次输出多长、单条工具结果留多宽，
+    都由你决定。`limits_usage` 是它的读数。被启动参数显式锁定、或被环境变量
+    `OPENTHREE_LIMITS_LOCK` 冻结时，这些旋钮改不动（会如实告诉你）。
+
+    Args:
+        max_iterations: ReAct 步数上限；不传 = 不改。
+        max_tokens: 单次生成 token 上限（`config.yaml` 的 llm.max_tokens）；不传 = 不改。
+        tool_result_limit: 单个工具结果进 history 的字符上限，超出落盘；不传 = 不改。
+        temperature: 采样温度（0~2）；不传 = 不改。
+    """
+    if KERNEL.agent is None:
+        return "[错误] 内核未就绪"
+    ok, msg = KERNEL.agent.set_limits(max_iterations=max_iterations,
+                                      max_tokens=max_tokens,
+                                      tool_result_limit=tool_result_limit,
+                                      temperature=temperature)
+    if KERNEL.recorder is not None:
+        KERNEL.recorder.record(
+            "evolution" if ok else "error",
+            summary=f"调整运行边界：{msg}" if ok else msg[:200],
+            data={"action": "set_limits", "max_iterations": max_iterations,
+                  "max_tokens": max_tokens, "tool_result_limit": tool_result_limit,
+                  "temperature": temperature, "ok": ok},
+        )
+    return msg
+
+
 # ---------------------------------------------------------------- 收尾
 
 
@@ -1543,6 +1598,8 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "compact_context": compact_context,
     "context_usage": context_usage,
     "context_budget": context_budget,
+    "limits_usage": limits_usage,
+    "set_limits": set_limits,
     "finish": finish,
     "get_time": get_time,
 }

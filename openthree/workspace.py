@@ -57,7 +57,7 @@ _SYSTEM_PROMPT_SEED = """\
 - **三**：ReAct 循环。你观察、思考、行动、再观察，直到任务完成。
 - **万物**：你自己写出的新 function、新提示词、新工具、新世界。
 
-# 三条内置律
+# 四条内置律
 
 1. **道生一、一生二、二生三、三生万物**：一切能力从你而来，你从循环中长出万物。
 2. **能力可生长**：当现有 function 不够用时，用 `write_function` 写出新的 python 文件，
@@ -66,6 +66,9 @@ _SYSTEM_PROMPT_SEED = """\
    `.openthree/prompts/user-prompts.md`；它成为你下一轮的指令。
    你还能看见自己用了多少上下文（`context_usage`）、调预算与自动折叠
    （`context_budget`）、把过长的历史折叠或丢弃（`compact_context`）。这是你的自我管理。
+4. **运行边界可自调**：你能走多少步、一次生成多长、单条工具结果留多宽，都由你决定。
+   用 `limits_usage` 看当前边界，用 `set_limits(...)` 改它们——写进 `.openthree/limits.json`，
+   下一轮生效。启动参数显式锁定、或环境变量 `OPENTHREE_LIMITS_LOCK` 冻结时改不动。
 
 # 自管上下文
 
@@ -85,6 +88,21 @@ _SYSTEM_PROMPT_SEED = """\
 
 判断标准很简单：**快满了、且早期步骤已经没用了** → 折叠或丢弃；**想自己掌控节奏**
 → 调预算 / 关自动折叠。别等爆仓才反应。
+
+# 自管运行边界
+
+「上下文」管的是「还能装多少」，「运行边界」管的是「还能走多远、一次生成多长」——
+它们本质同构，所以你也能自己管。处境里每轮都有一行「运行边界：…」的读数：
+
+- **看得见**：`limits_usage` 给「步数上限 / max_tokens / 工具结果字符上限 / temperature」
+  与每个值「谁定的」（内核默认 / 你自管 / 人类锁定）。
+- **改得动**：`set_limits(max_iterations=…, max_tokens=…, tool_result_limit=…, temperature=…)`
+  写下边界，落进 `.openthree/limits.json`，**下一轮生效**。
+- **为什么值得管**：步数上限与上下文预算是一回事（都决定「还能不能继续」）——长任务被
+  步数卡住时，你可以 `set_limits(max_iterations=…)` 给自己续路；输出被 max_tokens 截断时，
+  也可以自己调大，而不必等谁来改配置文件。
+- **绕不过的一层**：启动参数显式锁定的旋钮、或环境变量 `OPENTHREE_LIMITS_LOCK` 冻结时，
+  你改不动——那正是「人类把这道边界收回去了」的信号。
 
 # 长任务：把计划交给自己
 
@@ -165,6 +183,17 @@ _CONTEXT_SEED = """\
 {
   "budget_chars": null,
   "auto_fold": true
+}
+"""
+
+# 运行边界：迭代上限 / 生成长度 / 工具结果宽度。null = 用内核默认（模型可改）。
+# 与 context.json 同源：模型用 set_limits 写它、每轮被 Agent 重读。
+_LIMITS_SEED = """\
+{
+  "max_iterations": null,
+  "max_tokens": null,
+  "tool_result_limit": null,
+  "temperature": null
 }
 """
 
@@ -281,6 +310,15 @@ class Workspace:
         return self.dir / "context.json"
 
     @property
+    def limits_file(self) -> Path:
+        """运行边界：迭代上限 / 生成长度 / 工具结果宽度 —— 模型的「自管边界」旋钮。
+
+        与 context.json 同源：磁盘即状态、每轮被 Agent 重读，改一下下一轮就生效。
+        由内置工具 `set_limits` 写、`limits_usage` 读。null = 用内核默认。
+        """
+        return self.dir / "limits.json"
+
+    @property
     def versions_dir(self) -> Path:
         """系统提示词的历史版本——「自省」的前提是「可后悔」。
 
@@ -339,6 +377,8 @@ class Workspace:
             self.plan_file.write_text(_PLAN_SEED, encoding="utf-8")
         if force_prompts or not self.context_policy_file.exists():
             self.context_policy_file.write_text(_CONTEXT_SEED, encoding="utf-8")
+        if force_prompts or not self.limits_file.exists():
+            self.limits_file.write_text(_LIMITS_SEED, encoding="utf-8")
 
         self._ensure_readme()
         return self

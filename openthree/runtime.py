@@ -43,18 +43,22 @@ from .workspace import Workspace
 class Runtime:
     def __init__(self, project_dir: Optional[Path] = None, *,
                  model: Optional[str] = None,
-                 max_iterations: int = 200,
+                 max_iterations: Optional[int] = None,
                  force_prompts: bool = False,
                  quiet: bool = False,
-                 tool_result_limit: int = 4000,
+                 tool_result_limit: Optional[int] = None,
+                 max_tokens: Optional[int] = None,
+                 temperature: Optional[float] = None,
                  context_budget_chars: Optional[int] = None,
                  context_window_tokens: Optional[int] = None,
                  heartbeat: float = 15.0,
                  turns: Optional[int] = None) -> None:
         self.project_dir = Path(project_dir or Path.cwd()).resolve()
         self.quiet = quiet
-        self.max_iterations = max_iterations
-        self.tool_result_limit = tool_result_limit
+        self.max_iterations = max_iterations          # None = 交给模型（.openthree/limits.json）
+        self.tool_result_limit = tool_result_limit    # 同上：显式才锁，否则模型可自管
+        self.max_tokens = max_tokens
+        self.temperature = temperature
         # 先记住是否显式给了预算/窗口，等 config 读出来后再统一解析。
         self._context_budget_arg = context_budget_chars
         self._context_window_arg = context_window_tokens
@@ -228,6 +232,8 @@ class Runtime:
         self.agent = Agent(self.ws, self.registry, self.llm, self.recorder,
                            max_iterations=self.max_iterations,
                            tool_result_limit=self.tool_result_limit,
+                           max_tokens=self.max_tokens,
+                           temperature=self.temperature,
                            # 传**原始**显式参数（None = 未显式给）：Agent 据此决定
                            # 「策略文件里的预算」能否生效；已推导的默认值不当覆写。
                            context_budget_chars=self._explicit_budget,
@@ -240,12 +246,15 @@ class Runtime:
         self.say(f"道生一  工作区 {self.ws.dir}")
         self.say(f"一生二  {len(self.registry)} 个工具"
                  f"（内置 {len(self.registry.builtins)} / 自造 {len(self.registry.user_tools())}）")
-        self.say(f"二生三  ReAct 循环开始（上限 {self.max_iterations} 步，模型 {self.config.model}）")
+        self.say(f"二生三  ReAct 循环开始（上限 {self.agent.max_iterations} 步，模型 {self.config.model}）")
         if image_refs:
             self.say(f"       本轮输入含 {len(image_refs)} 张图片（多模态）")
         self.say(f"       上下文窗口 {_fmt_tokens(self.context_window_tokens)} token"
                  f" → 预算 {_fmt_chars(self.agent.context_budget_chars)} 字符"
                  f"（来源：{self.agent.context_budget_source()}；模型可用 context_budget 改）")
+        self.say(f"       运行边界：步数 ≤ {self.agent.max_iterations}、"
+                 f"生成 ≤ {self.agent.max_tokens} token、工具结果 ≤ {self.agent.tool_result_limit} 字符"
+                 f"（模型可用 set_limits 改）")
         if self.heartbeat > 0 and not self.quiet:
             self.say(f"       每 {self.heartbeat:g}s 打一次心跳，长任务不会看起来卡死")
 

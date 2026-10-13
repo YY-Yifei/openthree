@@ -13,6 +13,9 @@
     避免同一份大输出被每轮重发（见 REVIEW.md P0-3.2）。
   * 上下文预算：超过阈值时自动把最老的若干 step 折叠成摘要，
     不再指望模型自觉调用 compact_context（见 REVIEW.md P0-3.1）。
+  * 运行边界：步数上限 / max_tokens / tool_result_limit / temperature 默认由内核给，
+    但模型可用 set_limits 写进 .openthree/limits.json 自管（tick 每轮重读）；显式启动
+    参数与 OPENTHREE_LIMITS_LOCK 是它绕不过的两层。与「自管上下文」同源同构。
   * finish 提交后，同批剩余 tool_calls 一律跳过（见 REVIEW.md P2-3.11）。
   * compact_context 的区间先在现有 history 上校验，如实返回成功/失败（P1-3.8）。
   * 进度回声：把「正在做什么」通过注入的 progress 打出去，CLI 不再长时间沉默。
@@ -59,6 +62,10 @@ CONTEXT_BUDGET_RATIO = 0.5
 # 自动折叠的「硬闸」：设成 0/false/off 可在启动时彻底冻结自动折叠（模型改不了环境，
 # 所以这是真·不可被模型绕过的开关；不设则由策略文件说了算）。
 CONTEXT_AUTOFOLD_ENV = "OPENTHREE_CONTEXT_AUTOFOLD"
+
+# 「运行边界」的硬闸：环境变量非空且为真值时，limits.json 里的一切旋钮都被冻结
+# （模型改不动）。这是它绕不过的一层 —— 与 OPENTHREE_CONTEXT_AUTOFOLD 对称。
+LIMITS_LOCK_ENV = "OPENTHREE_LIMITS_LOCK"
 
 
 def resolve_context_budget(context_budget_chars: Optional[int],
@@ -118,8 +125,10 @@ def resolve_context_policy(budget: Optional[int] = None,
 
 class Agent:
     def __init__(self, workspace: Workspace, registry: Registry, llm: LLM,
-                 recorder: Recorder, *, max_iterations: int = 200,
-                 tool_result_limit: int = TOOL_RESULT_LIMIT,
+                 recorder: Recorder, *, max_iterations: Optional[int] = None,
+                 tool_result_limit: Optional[int] = None,
+                 max_tokens: Optional[int] = None,
+                 temperature: Optional[float] = None,
                  context_budget_chars: Optional[int] = None,
                  seed_turns: Optional[Sequence[Dict[str, Any]]] = None,
                  progress: Optional[Any] = None,
@@ -128,8 +137,18 @@ class Agent:
         self.reg = registry
         self.llm = llm
         self.rec = recorder
-        self.max_iterations = max_iterations
-        self.tool_result_limit = max(0, int(tool_result_limit))
+        # 运行边界：显式传入即「上锁」（模型改不动）；None = 交给模型/内核默认。
+        # 与上下文预算同一套哲学：模型能读、能改（limits.json），除非人类显式锁定。
+        self._explicit_max_iterations = max_iterations
+        self._explicit_tool_result_limit = tool_result_limit
+        self._explicit_max_tokens = max_tokens
+        self._explicit_temperature = temperature
+        self._limits_env = os.environ.get(LIMITS_LOCK_ENV)
+        self._limits_file_data: Dict[str, Any] = {}
+        self._reload_limits_file()
+        (self.max_iterations, self.tool_result_limit, self.max_tokens,
+         self.temperature) = self._compute_limits()
+        self._apply_generation_limits()
         # 本轮用户输入携带的图片（绝对路径或 http/data URL）。
         # 在第一步注入成一条独立的 user 消息（与任务文本配对），供跨轮还原。
         self.current_images: List[str] = []
@@ -204,7 +223,7 @@ class Agent:
         return f"按窗口 {win} token 推导"
 
     def tick(self) -> None:
-        """每轮开头重读上下文策略 —— 让「模型改了旋钮」下一轮就生效。
+        """每轮开头重读「上下文策略」与「运行边界」—— 让「模型改了旋钮」下一轮就生效。
 
         与提示词/工具一样「每轮重组装」：改了就下一轮生效，不做缓存。
         """
@@ -222,6 +241,7 @@ class Agent:
             self.progress.note(f"自动折叠{'开启' if autofold else '关闭'}")
         self.context_budget_chars = budget
         self._auto_fold_enabled = autofold
+        self.apply_limits()               # 运行边界同样每轮重读、改一下下一轮生效
 
     def set_context_budget(self, budget_chars: Optional[int] = None,
                            auto_fold: Optional[bool] = None) -> Tuple[bool, str]:
@@ -252,6 +272,170 @@ class Agent:
         self.tick()
         return True, (f"[ok] 已更新上下文策略：预算 {self.context_budget_chars} 字符、"
                       f"自动折叠{'开' if self._auto_fold_enabled else '关'}")
+
+    # ---------------------------------------------------------------- 运行边界
+    def _reload_limits_file(self) -> None:
+        """读 `.openthree/limits.json`（模型可写）到 `self._limits_file_data`。
+
+        文件缺失/损坏时安静回退到空 dict（= 全部走内核默认）—— 自管不是必需品，
+        坏了也不能把循环拖死。只认已知的四个键。
+        """
+        data: Dict[str, Any] = {}
+        try:
+            fp = self.ws.limits_file
+            if fp.exists():
+                loaded = json.loads(fp.read_text(encoding="utf-8") or "{}")
+                if isinstance(loaded, dict):
+                    data = loaded
+        except Exception:  # noqa: BLE001
+            data = {}
+        self._limits_file_data = data
+
+    def limits_locked(self) -> bool:
+        """环境硬闸 OPENTHREE_LIMITS_LOCK 是否把「运行边界」整体冻结。"""
+        env = self._limits_env
+        return (env is not None and str(env).strip() != ""
+                and str(env).strip().lower() not in ("0", "false", "off", "no"))
+
+    def _compute_limits(self) -> Tuple[int, int, int, float]:
+        """把「显式参数 / 策略文件 / 内核默认」折叠成四个边界值。
+
+        优先级（越靠前越硬）：显式参数 > 策略文件 > 内核默认。
+        环境硬闸开启时，策略文件整段被忽略 —— 只有显式参数与内核默认说话。
+        返回 (max_iterations, tool_result_limit, max_tokens, temperature)。
+        """
+        fd = {} if self.limits_locked() else self._limits_file_data
+
+        def _pick(explicit: Any, key: str, default: Any, cast) -> Any:
+            if explicit is not None:
+                return cast(explicit)
+            if fd.get(key) is not None:
+                return cast(fd[key])
+            return cast(default)
+
+        mi = _pick(self._explicit_max_iterations, "max_iterations", 200,
+                   lambda v: max(1, int(v)))
+        tr = _pick(self._explicit_tool_result_limit, "tool_result_limit",
+                   TOOL_RESULT_LIMIT, lambda v: max(0, int(v)))
+        mt = _pick(self._explicit_max_tokens, "max_tokens",
+                   getattr(self.llm.config, "max_tokens", 8192), lambda v: max(1, int(v)))
+        tp = _pick(self._explicit_temperature, "temperature",
+                   getattr(self.llm.config, "temperature", 0.3), lambda v: float(v))
+        return mi, tr, mt, tp
+
+    def _apply_generation_limits(self) -> None:
+        """把生成参数推进 LLM 客户端 —— 让模型改的 max_tokens/temperature 立刻生效。"""
+        try:
+            self.llm.config.max_tokens = int(self.max_tokens)
+            self.llm.config.temperature = float(self.temperature)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def apply_limits(self) -> None:
+        """重读「运行边界」并应用 —— 供 tick() 每轮调用（改一下下一轮生效）。"""
+        self._reload_limits_file()
+        mi, tr, mt, tp = self._compute_limits()
+        changed = (mi != self.max_iterations or tr != self.tool_result_limit
+                   or mt != self.max_tokens or tp != self.temperature)
+        if changed:
+            self.rec.record(
+                "evolution",
+                summary=(f"运行边界更新：步数上限 {mi}、生成上限 {mt}、"
+                         f"工具结果上限 {tr} 字符"),
+                data={"action": "limits_changed", "max_iterations": mi,
+                      "max_tokens": mt, "tool_result_limit": tr,
+                      "temperature": tp})
+            self.progress.note(f"运行边界更新：步数上限 {mi}、生成上限 {mt}")
+        self.max_iterations, self.tool_result_limit = mi, tr
+        self.max_tokens, self.temperature = mt, tp
+        self._apply_generation_limits()
+
+    def limits_stats(self) -> Dict[str, Any]:
+        """把「运行边界」的读数交给模型 —— 自管的前提是看得见。"""
+        locked = self.limits_locked()
+        fd = {} if locked else self._limits_file_data
+        source: Dict[str, str] = {}
+        for key, explicit in (("max_iterations", self._explicit_max_iterations),
+                              ("tool_result_limit", self._explicit_tool_result_limit),
+                              ("max_tokens", self._explicit_max_tokens),
+                              ("temperature", self._explicit_temperature)):
+            if explicit is not None:
+                source[key] = "显式（锁定）"
+            elif fd.get(key) is not None:
+                source[key] = "模型自管"
+            else:
+                source[key] = "内核默认"
+        return {
+            "max_iterations": self.max_iterations,
+            "max_tokens": self.max_tokens,
+            "tool_result_limit": self.tool_result_limit,
+            "temperature": self.temperature,
+            "source": source,
+            "locked": locked,
+        }
+
+    def set_limits(self, max_iterations: Optional[int] = None,
+                   max_tokens: Optional[int] = None,
+                   tool_result_limit: Optional[int] = None,
+                   temperature: Optional[float] = None) -> Tuple[bool, str]:
+        """写下「运行边界」（模型自管入口）。返回 (是否成功, 说明)。
+
+        - 环境硬闸（OPENTHREE_LIMITS_LOCK）开启时拒绝写入：那是模型绕不过的一层。
+        - 被启动参数显式锁定的旋钮拒绝写入：人类锁定后模型不许改。
+        - 其余写进 limits.json，`apply_limits()` 让它下一轮生效。
+        """
+        given = [(k, v) for k, v in (("max_iterations", max_iterations),
+                                     ("max_tokens", max_tokens),
+                                     ("tool_result_limit", tool_result_limit),
+                                     ("temperature", temperature))
+                 if v is not None]
+        if not given:
+            return False, ("[错误] 至少给一个边界（max_iterations / max_tokens / "
+                           "tool_result_limit / temperature）")
+        if self.limits_locked():
+            return False, (f"[错误] 运行边界被环境变量 {LIMITS_LOCK_ENV} 冻结，"
+                           f"模型改不动（这是硬闸）")
+        explicit = {"max_iterations": self._explicit_max_iterations,
+                    "max_tokens": self._explicit_max_tokens,
+                    "tool_result_limit": self._explicit_tool_result_limit,
+                    "temperature": self._explicit_temperature}
+        blocked = [k for k, _ in given if explicit.get(k) is not None]
+        if blocked:
+            return False, f"[错误] {'、'.join(blocked)} 已由启动参数显式锁定，模型改不动"
+
+        data: Dict[str, Any] = {}
+        path = self.ws.limits_file
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8") or "{}")
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception:  # noqa: BLE001
+                data = {}
+        for k, v in given:
+            if k == "temperature":
+                fv = float(v)
+                if not (0.0 <= fv <= 2.0):
+                    return False, "[错误] temperature 需在 0~2 之间"
+                data[k] = fv
+            else:
+                iv = int(v)
+                if iv < 0 or (k == "max_iterations" and iv < 1):
+                    return False, f"[错误] {k} 取值非法（max_iterations ≥ 1，其余 ≥ 0）"
+                data[k] = iv
+        for k in ("max_iterations", "max_tokens", "tool_result_limit", "temperature"):
+            data.setdefault(k, None)
+        try:
+            self.ws.dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            return False, f"[错误] 无法写入 {path}：{exc}"
+        self.apply_limits()
+        return True, (f"[ok] 已更新运行边界：步数上限 {self.max_iterations}、"
+                      f"max_tokens {self.max_tokens}、"
+                      f"工具结果上限 {self.tool_result_limit} 字符、"
+                      f"temperature {self.temperature}")
 
     # ---------------------------------------------------------------- 用量读数
     def history_stats(self) -> Dict[str, Any]:
@@ -327,6 +511,7 @@ class Agent:
                 last_action=self.last_action,
                 fold_range=fold_range,
                 context_stats=self.history_stats(),
+                limits_stats=self.limits_stats(),
             )
             self.progress.llm_start(self.llm.config.model)
             result = self.llm.chat(messages, tools=self.reg.schemas() or None)
@@ -349,14 +534,17 @@ class Agent:
                                           "max": self.max_truncations})
                     if self.truncations <= self.max_truncations:
                         self.last_action = (
-                            f"你上一条回复被 max_tokens={self.llm.config.max_tokens} 截断了"
+                            f"你上一条回复被 max_tokens={self.max_tokens} 截断了"
                             f"（finish_reason=length），tool_calls 可能是半截非法 JSON。"
                             f"请**重发同样的一条消息**，但更精简：只调用最必要的一个工具，"
-                            f"或把长内容拆成几步；不要重复已完成的步骤。")
+                            f"或把长内容拆成几步；不要重复已完成的步骤。"
+                            f"若确需更长输出，你可以自己用 `set_limits(max_tokens=…)` 调大"
+                            f"生成上限（它会写进 .openthree/limits.json，下一轮生效）。")
                         self.progress.note(f"输出被截断，已要求重发（{self.truncations}/{self.max_truncations}）")
                         continue
-                    self.answer = (f"[未能完成] 模型连续 {self.truncations} 次因 max_tokens 截断输出，"
-                                   f"请调大 max_tokens（config.yaml 的 llm.max_tokens）后重试。")
+                    self.answer = (f"[未能完成] 模型连续 {self.truncations} 次因 max_tokens 截断输出。"
+                                   f"可用 `set_limits(max_tokens=…)` 调大生成上限后重试"
+                                   f"（若已被启动参数或环境锁定，则需在 config.yaml 调大）。")
                     break
                 self.rec.record("error", summary="LLM 调用失败", data={"error": result["error"]})
                 self.answer = f"[未能完成] 模型调用失败：{result['error']}"
