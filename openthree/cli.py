@@ -10,7 +10,6 @@
     openthree --report                只重建 three-report.html
     openthree --inspect               看一眼自己当前的样子（不调模型）
     openthree --functions             列出所有工具
-    openthree --serve                 起一个 HTTP 服务看报告（可选）
 
 跨轮记忆只在**会话**里存在（`-i` / `--auto`）；单次任务从零开跑，绝不读磁盘上
 上一次的对话。对话原文仍 append 到 transcript.jsonl 作档案，想续读就用 --resume。
@@ -66,7 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-rounds", type=int, default=None,
                    help="一次任务最多跑几轮（每轮一次完整 ReAct 循环，各自有 --max-iterations 步预算）；"
                         "显式给出即锁定，不传则由 .openthree/limits.json / 内核默认 3 决定，"
-                        "模型运行期可用 set_limits(max_rounds=…) 改它")
+                        "模型运行期可用 set_limits(max_rounds=…) 改它。"
+                        "这是「整场最多几轮」，与 --auto N 说的是同一件事（同时给就取较小者）")
     p.add_argument("--context-window", default=None,
                    help="模型上下文窗口（token）。支持 1M/128k/200000 写法；"
                         "默认取 config 里的 context_window_tokens，再退回 1M")
@@ -97,7 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="交互模式：开一个进程内会话，多轮记忆（退出即忘）")
     p.add_argument("--auto", type=int, default=0, metavar="N",
                    help="长任务自动推进：一轮收尾后若计划仍有未完成项（或撞了本轮步数上限），"
-                        "就自动接力下一轮，最多 N 轮（0 = 关闭，默认）。常与 -i 联用。"
+                        "就自动接力下一轮，最多 N 轮（0 = 关闭，默认）—— 它直接决定本场 "
+                        "max_rounds。常与 -i 联用。"
                         "注意这与单次任务自带的「撞步数上限自动续轮」不同：后者只在没跑完时续，"
                         "不看计划。")
     p.add_argument("--turns", type=int, default=4,

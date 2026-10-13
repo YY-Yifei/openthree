@@ -38,7 +38,7 @@ RUNTIME_TEMPLATE = """\
 - 当前时间：{now}
 - 模型：{model}
 - 可用工具：{tool_count} 个（内置 {builtin_count} / 自造 {user_count}）
-- 这是第 {round_index} 轮（本场最多 {max_rounds} 轮），本轮第 {iteration} 步（上限 {max_iterations}）
+- 这是第 {round_index} 轮（本场最多 {max_rounds} 轮{next_hint}），本轮第 {iteration} 步（上限 {max_iterations}）
 - 上下文：{context}（`context_usage` 看细节 / `context_budget` 调预算）
 - 运行边界：{limits}（`limits_usage` 看细节 / `set_limits` 调）
 
@@ -79,6 +79,7 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
     evolution = _recent_evolution(ws, limit=10)
     builtin = [t for t in reg.tools.values() if t.origin == "builtin"]
     user = [t for t in reg.tools.values() if t.origin == "user"]
+    stats = round_stats or {}
     return RUNTIME_TEMPLATE.format(
         cwd=Path.cwd(),
         wsdir=ws.dir,
@@ -89,8 +90,9 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         user_count=len(user),
         max_iterations=max_iterations,
         iteration=iteration,
-        round_index=int((round_stats or {}).get("index", 1)),
-        max_rounds=int((round_stats or {}).get("max", 1)),
+        round_index=int(stats.get("index", 1)),
+        max_rounds=int(stats.get("max", 1)),
+        next_hint=_next_round_hint(stats),
         context=_context_line(context_stats, fold_range),
         limits=_limits_line(limits_stats, max_iterations),
         digest=reg.digest(),
@@ -100,6 +102,17 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         evolution=evolution,
         user_prompt=ws.read_user_prompt().strip() or "（空）",
     )
+
+
+def _next_round_hint(stats: Dict[str, Any]) -> str:
+    """处境行里「下一轮」的提示 —— 兑现「处境会告诉你 next」的承诺。
+
+    有 stats 且还有轮预算 → 「，这一轮收尾后还有下一轮」；
+    没有（轮预算用尽或老调用）→ 空串，不加尾巴（如实：没有下一轮）。
+    """
+    if stats.get("next"):
+        return "，这一轮收尾后还有下一轮"
+    return ""
 
 
 def _context_line(stats: Optional[Dict[str, Any]], fold_range: str = "") -> str:

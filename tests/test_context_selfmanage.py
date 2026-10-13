@@ -77,6 +77,18 @@ def test_set_context_budget_rejects_empty(make_agent):
     assert not ok and "至少" in msg
 
 
+def test_set_context_budget_honestly_refuses_locked_budget(make_agent):
+    """显式 --context-budget 锁定预算时，诚实拒绝（与 set_limits 同一契约）。"""
+    ag = make_agent(context_budget_chars=5000)
+    assert ag.context_budget_chars == 5000
+    ok, msg = ag.set_context_budget(budget_chars=999999)
+    assert not ok and "锁定" in msg
+    assert ag.context_budget_chars == 5000          # 没被改
+    # 自动折叠仍可单独调（锁的是预算，不是开关）
+    ok2, _ = ag.set_context_budget(auto_fold=False)
+    assert ok2 and ag._auto_fold_enabled is False
+
+
 def test_env_lock_freezes_autofold(make_agent, monkeypatch):
     monkeypatch.setenv("OPENTHREE_CONTEXT_AUTOFOLD", "0")
     ag = make_agent()

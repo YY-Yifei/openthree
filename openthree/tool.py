@@ -106,16 +106,6 @@ class Tool:
         return f"<Tool {self.name} args={list(self.parameters)}>"
 
 
-def _first_line(doc: Optional[str]) -> str:
-    if not doc:
-        return ""
-    for line in doc.strip().splitlines():
-        line = line.strip()
-        if line:
-            return line
-    return ""
-
-
 def _parse_args_section(doc: Optional[str]) -> Dict[str, str]:
     """解析 docstring 的 Args 段落 → {参数名: 说明}。"""
     out: Dict[str, str] = {}

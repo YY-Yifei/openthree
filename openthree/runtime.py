@@ -125,6 +125,16 @@ class Runtime:
             )
         return None
 
+    def _effective_max_rounds(self) -> int:
+        """读一次**生效的** max_rounds（显式 --max-rounds > limits.json > 内核默认）。
+
+        用一个零成本 Agent 读一次边界（不跑 ReAct），读到的值与真正执行时同源。
+        run() 用它给轮循环定死本场轮预算，使「模型看见的轮数 = 循环执行的轮数」。
+        """
+        probe = Agent(self.ws, self.registry, self.llm, self.recorder,
+                      max_rounds=self.max_rounds)
+        return max(1, int(probe.max_rounds))
+
     # ---------------------------------------------------------------- 会话
     def begin_session(self, *, resume: int = 0, with_history: bool = True) -> int:
         """开一个进程内会话：后续每一轮都能看到「本次会话内之前几轮」。
@@ -210,7 +220,11 @@ class Runtime:
             owns_session = True
 
         docs: List[Dict[str, Any]] = []
-        budget: Optional[int] = (max(1, int(rounds)) if rounds is not None else None)
+        # 本场**生效轮预算**在开头就定死，之后各轮都把这个数交给 Agent —— 于是
+        # 「模型看见的本场最多 M 轮」= 「循环真正执行的轮数」，不再有两份打架的真相。
+        # 显式 rounds 优先；否则读一次生效的旋钮（--max-rounds > limits.json > 内核默认）。
+        budget: int = (max(1, int(rounds)) if rounds is not None
+                       else self._effective_max_rounds())
         prev_summary = ""
         try:
             while True:
@@ -223,14 +237,11 @@ class Runtime:
                     session=True,
                     round_index=len(docs) + 1,
                     first_round=first,
-                    autonomous=True,
+                    round_budget=budget,
                     next_round_summary=prev_summary,
                 )
                 docs.append(doc)
                 prev_summary = doc.get("next_round_summary") or ""
-                # 首轮跑完才知道整场轮预算（显式 --max-rounds / limits.json / 内核默认）
-                if budget is None:
-                    budget = max(1, int(getattr(self.agent, "max_rounds", 1) or 1))
                 status = str(doc.get("status") or "")
 
                 if status in ("error", "interrupted"):
@@ -258,12 +269,13 @@ class Runtime:
                    images: Optional[Sequence[Union[str, Path]]] = None,
                    session: bool = False, round_index: int = 1,
                    first_round: bool = True,
-                   autonomous: bool = False,
+                   round_budget: Optional[int] = None,
                    next_round_summary: str = "") -> Dict[str, Any]:
         """跑**一轮**：建 Agent → 起 ReAct → finalize，返回本轮的会话文档。
 
         一次任务由若干轮组成（见 run / run_auto）；本函数只管一轮。
-        `round_index` 是本轮序号，`autonomous` 表示处在自动接力里（供处境告知模型）；
+        `round_index` 是本轮序号；`round_budget` 是本场**生效轮预算**（Runtime 真正
+        会执行的轮数，传给 Agent 后进处境，保证「模型看见的轮数 = 实际执行的轮数」）；
         `next_round_summary` 是上一轮 `next_round(summary=…)` 留下的交接说明，会播种进
         本轮 Agent 的历史开头 —— 让「交给下一轮的自己」真的能交接。
         """
@@ -320,7 +332,7 @@ class Runtime:
                            progress=progress,
                            max_rounds=self.max_rounds,
                            round_index=round_index,
-                           autonomous=autonomous,
+                           round_budget=round_budget,
                            next_round_summary=next_round_summary)
         self.agent.current_images = list(image_refs)
         self.agent.task_text = self.user_text
@@ -408,8 +420,10 @@ class Runtime:
                  images: Optional[Sequence[Union[str, Path]]] = None) -> Dict[str, Any]:
         """长任务自主推进：跑一轮，若计划里还有未完成项，就自动接力下一轮。
 
-        `rounds` 是自动接力的**总轮数上限**（含首轮）。每轮都是一次完整的
-        ReAct 循环；轮与轮之间靠三样东西自然接续：
+        `rounds` 是自动接力的**总轮数上限**（含首轮）；若人类另用 `--max-rounds`
+        显式锁定了整场轮数，则取二者较小者（两个数都在说同一件事：整场最多几轮）。
+        实际执行 `min(rounds, 显式 max_rounds)` 轮。每轮都是一次完整的 ReAct 循环；
+        轮与轮之间靠三样东西自然接续：
 
           * 会话内的跨轮记忆（模型记得住本次接力里说过什么）；
           * 每轮重新组装的 system（含模型自己维护的 plan.md 待办）；
@@ -426,6 +440,10 @@ class Runtime:
             最后一轮的会话文档，额外带 `auto_rounds` 与 `auto_answers` 两个字段。
         """
         rounds = max(1, int(rounds or 1))
+        # 只有人类**显式**给了 --max-rounds 才把它当硬顶；否则 --auto N 就是 N 轮
+        # （默认旋钮值不该悄悄把 --auto 5 截成 3）。生效轮数随后交给 Agent 进处境。
+        if self.max_rounds is not None:
+            rounds = min(rounds, max(1, int(self.max_rounds)))
         # 自己开的会话，接力结束就关掉；沿用已有会话（如 -i 的）时不动它。
         owns_session = not self._session_active
         if owns_session:
@@ -444,7 +462,7 @@ class Runtime:
                         session=True,
                         round_index=i + 1,
                         first_round=first,
-                        autonomous=True,
+                        round_budget=rounds,
                         next_round_summary=prev_summary,
                     )
                 except RuntimeError as exc:

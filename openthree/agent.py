@@ -154,7 +154,7 @@ class Agent:
                  max_truncations: int = 2,
                  max_rounds: Optional[int] = None,
                  round_index: int = 1,
-                 autonomous: bool = False,
+                 round_budget: Optional[int] = None,
                  next_round_summary: str = "") -> None:
         self.ws = workspace
         self.reg = registry
@@ -182,11 +182,19 @@ class Agent:
         # 「轮」也是一条运行边界（第五个旋钮）：本 Agent 是第几轮、最多接力几轮。
         # 步预算（max_iterations）属于**一轮**，轮预算（max_rounds）属于**整场任务**。
         self.round_index = max(1, int(round_index))
-        # autonomous：本 Agent 是否处在「自动接力」里（Runtime 逐轮驱动）。
-        # 处境据此告诉模型「finish 之后还会不会有人接着跑」—— 单次任务时不会。
-        self.autonomous = bool(autonomous)
+        # 本场的**生效轮预算**：Runtime 逐轮驱动时显式传入（run 的 budget / run_auto 的
+        # rounds），此时它就是 `max_rounds`，且**整场固定**（tick 不再被 limits.json 改写）。
+        # 单独构造（测试 / 单轮）时传 None → 走旋钮默认，行为与以前一致。
+        # 只有一个真相：`self.max_rounds` 同时进「处境轮读数」与「运行边界读数」。
+        self._round_budget_fixed = round_budget is not None
         (self.max_iterations, self.tool_result_limit, self.max_tokens,
          self.temperature, self.max_rounds) = self._compute_limits()
+        if round_budget is not None:
+            self.max_rounds = max(1, int(round_budget))
+        # autonomous：finish / next_round 之后还会不会有人接着跑 ——
+        # 即本 Agent 是否处在「运行期逐轮驱动」里（Runtime 显式给了轮预算）。
+        # 单次任务（自带短命会话续轮）同样有人接着跑，故也为 True。
+        self.autonomous = self._round_budget_fixed
         # 本轮用户输入携带的图片（绝对路径或 http/data URL）。
         # 在第一步注入成一条独立的 user 消息（与任务文本配对），供跨轮还原。
         self.current_images: List[str] = []
@@ -292,10 +300,18 @@ class Agent:
 
     def set_context_budget(self, budget_chars: Optional[int] = None,
                            auto_fold: Optional[bool] = None) -> Tuple[bool, str]:
-        """写下上下文策略（模型自管入口）。返回 (是否成功, 说明)。"""
+        """写下上下文策略（模型自管入口）。返回 (是否成功, 说明)。
+
+        与 `set_limits` 同一套契约：启动参数显式锁定的旋钮（`--context-budget`）
+        模型改不动 —— 此时**诚实拒绝**，而不是写下去却无效（那会让模型以为改成了）。
+        自动折叠仍可单独调（`--context-budget` 锁的是预算，不是开关）。
+        """
         path = self.ws.context_policy_file
         if budget_chars is None and auto_fold is None:
             return False, "[错误] 至少给 budget_chars 或 auto_fold 之一"
+        if budget_chars is not None and self._explicit_budget is not None:
+            return False, ("[错误] 上下文预算已由启动参数 --context-budget 显式锁定，"
+                           "模型改不动（自动折叠仍可用 auto_fold 单独调）")
         data: Dict[str, Any] = {}
         if path.exists():
             try:
@@ -391,6 +407,11 @@ class Agent:
         """重读「运行边界」并应用 —— 供 tick() 每步调用（改一下下一步生效）。"""
         self._reload_limits_file()
         mi, tr, mt, tp, mr = self._compute_limits()
+        # 本场轮预算一旦由 Runtime 定死（逐轮驱动），tick 不再被 limits.json 改写 ——
+        # 否则模型在某一轮里 set_limits(max_rounds=N) 会让「处境说的本场最多几轮」
+        # 与「循环真正执行的轮数」错位（同一句话里出现两个数）。其余四个旋钮照常。
+        if self._round_budget_fixed:
+            mr = self.max_rounds
         changed = (mi != self.max_iterations or tr != self.tool_result_limit
                    or mt != self.max_tokens or tp != self.temperature
                    or mr != self.max_rounds)
@@ -517,14 +538,19 @@ class Agent:
         「步」是一轮的内部计数，「轮」是 Agent 的生命周期计数。模型只有看得见轮，
         才谈得上「这一轮做不完就留着下一轮做」：否则它既不知道 finish 之后还有没有
         人接着跑（`next`），也不知道这颗棋子还能走几格（`remaining`）。
+
+        `max` 是本场**生效轮预算** `max_rounds`（Runtime 真正会执行的轮数），
+        与运行边界读数里的 max_rounds 是同一个数 —— 不再有两份互相打架的真相
+        （旧实现里 `--auto 5` 实际跑 5 轮、处境却常说 3 轮）。
         """
-        remaining = max(0, int(self.max_rounds) - int(self.round_index))
+        total = int(self.max_rounds)
+        remaining = max(0, total - int(self.round_index))
         return {
             "index": self.round_index,
-            "max": self.max_rounds,
+            "max": total,
             "remaining": remaining,
             "autonomous": self.autonomous,
-            "next": bool(self.autonomous and remaining > 0),
+            "next": bool(remaining > 0),
             "step": self.iteration,
             "max_steps": self.max_iterations,
         }
@@ -533,8 +559,8 @@ class Agent:
         """（工具入口）宣告「这一阶段做完了，开新一轮」——替本条消息收尾，但不算 finish。
 
         与 finish 的区别：finish 是「整件事做完」，next_round 是「这一轮先到这，
-        剩下的下一轮接着做」。只在自动接力（Runtime 逐轮驱动）里真正会开出下一轮；
-        单次任务里它只是把发言权交还，运行期如实告诉模型「没有下一轮」。
+        剩下的下一轮接着做」。只要本场还有轮预算（`next` 为真），运行期就会开下一轮；
+        轮预算用尽时它只是把发言权交还，运行期如实告诉你「没有下一轮」。
 
         `summary` 由 Runtime 带到下一轮、播种在本轮历史开头（见 _seed_history），
         于是「交给下一轮的自己」是真能交接的，而不是只落在日志里。

@@ -101,8 +101,18 @@ def test_prompt_shows_round_and_step_line(ws, registry):
         ws, registry, model="m", iteration=7, max_iterations=200,
         round_stats={"index": 2, "max": 3, "remaining": 1,
                      "autonomous": True, "next": True})
-    assert "这是第 2 轮（本场最多 3 轮）" in block
+    assert "这是第 2 轮（本场最多 3 轮，这一轮收尾后还有下一轮）" in block
     assert "本轮第 7 步（上限 200）" in block
+
+
+def test_prompt_hides_next_hint_when_budget_exhausted(ws, registry):
+    """轮预算用尽（next=False）时，处境不再写「还有下一轮」。"""
+    block = build_runtime_block(
+        ws, registry, model="m", iteration=1, max_iterations=200,
+        round_stats={"index": 3, "max": 3, "remaining": 0,
+                     "autonomous": True, "next": False})
+    assert "这是第 3 轮（本场最多 3 轮）" in block
+    assert "还有下一轮" not in block
 
 
 def test_prompt_round_line_backcompat_without_stats(ws, registry):
@@ -119,6 +129,58 @@ def test_prompt_limits_line_mentions_rounds(ws, registry):
 
 
 # ---------------------------------------------------------------- 撞步数上限自动续轮
+# ---------------------------------------------------------------- 轮预算「一个真相」
+class _CountRoundsLLM:
+    """永远只调 get_time —— 必然撞步数上限，逼运行期开满轮预算。"""
+
+    def __init__(self, cfg):
+        self.config = cfg
+        self.calls = 0
+
+    def chat(self, messages, tools=None, tool_choice="auto", **kwargs):
+        self.calls += 1
+        self.last_messages = messages
+        msg = {"role": "assistant", "content": "继续",
+               "tool_calls": [{"id": f"c{self.calls}", "type": "function",
+                               "function": {"name": "get_time", "arguments": "{}"}}]}
+        return {"message": msg, "usage": {}, "elapsed_ms": 0.0, "raw_request": {},
+                "raw_response": {"choices": [{"message": msg}]}, "error": None}
+
+
+def test_rounds_arg_takes_precedence_over_knob(tmp_path):
+    """显式 rounds 就是本场轮预算：`run(rounds=4)` 跑满 4 轮，旋钮默认不改它。"""
+    rt = _rt(tmp_path, llm_cls=_CountRoundsLLM, max_iterations=1, max_rounds=2)
+    doc = rt.run("长任务", rounds=4)
+    assert doc["rounds_run"] == 4
+    assert doc["max_rounds"] == 4        # 处境告诉模型的本场轮数也就是 4
+
+
+def test_prompt_reports_effective_round_budget(tmp_path):
+    """处境里的「本场最多 M 轮」= 运行期真正执行的轮数（不再是旋钮默认）。"""
+    import re
+    rt = _rt(tmp_path, llm_cls=_CountRoundsLLM, max_iterations=1, max_rounds=2)
+    rt.run("长任务", rounds=3)
+    blob = json.dumps(rt.llm.last_messages, ensure_ascii=False)
+    assert re.search(r"本场最多 3 轮", blob)                    # 与 rounds=3 一致
+    assert re.search(r"最多 3 轮（整场）", blob)                # 运行边界读数同数
+
+
+def test_run_auto_min_with_explicit_max_rounds(tmp_path):
+    """`--max-rounds M` 与 `--auto N` 都在说「整场几轮」——同时给取较小者。"""
+    rt = _rt(tmp_path, llm_cls=_NeverFinishLLM, max_iterations=1, max_rounds=4)
+    rt.ws.write_plan("# P\n- [ ] 永远没完\n")
+    doc = rt.run_auto("长任务", rounds=9)
+    assert doc["auto_rounds"] == 4                              # min(9, 4)
+
+
+def test_run_auto_without_explicit_max_rounds_uses_auto_n(tmp_path):
+    """默认旋钮（非显式）不该悄悄把 `--auto 5` 截成 3。"""
+    rt = _rt(tmp_path, llm_cls=_NeverFinishLLM, max_iterations=1)   # 未传 max_rounds
+    rt.ws.write_plan("# P\n - [ ] 永远没完\n")
+    doc = rt.run_auto("长任务", rounds=5)
+    assert doc["auto_rounds"] == 5
+
+
 def test_single_run_continues_round_on_step_limit(tmp_path):
     """核心回归：单次任务撞步数上限不再直接死，而是在轮预算内自动开下一轮。"""
     rt = _rt(tmp_path, max_iterations=3, max_rounds=2)
@@ -173,11 +235,11 @@ def test_run_auto_reports_step_limit_hit(tmp_path):
 
 
 # ---------------------------------------------------------------- next_round
-def _agent(ws, registry, llm, *, round_index=1, autonomous=False, max_rounds=3):
+def _agent(ws, registry, llm, *, round_index=1, round_budget=None, max_rounds=3):
     rec = Recorder(ws, user_input="t", model="s")
     from openthree.agent import Agent
     ag = Agent(ws, registry, llm, rec, round_index=round_index,
-               autonomous=autonomous, max_rounds=max_rounds)
+               round_budget=round_budget, max_rounds=max_rounds)
     KERNEL.workspace = ws
     KERNEL.registry = registry
     KERNEL.recorder = rec
@@ -189,22 +251,33 @@ def test_round_stats_shape(ws, registry, make_agent):
     ag = make_agent(max_rounds=3)
     st = ag.round_stats()
     assert st["index"] == 1 and st["max"] == 3 and st["remaining"] == 2
-    assert st["autonomous"] is False and st["next"] is False
+    # 没有轮预算（单轮）时 next=False；给了预算就有下一轮
+    assert st["autonomous"] is False and st["next"] is True
+
+
+def test_round_stats_next_reflects_budget_not_autonomous(ws, registry):
+    """next 只取决于「还有没有轮预算」—— 单次任务也有下一轮（不再绑 autonomous）。"""
+    from openthree.llm import LLM, LLMConfig
+    ag = _agent(ws, registry, LLM(LLMConfig(api_key="k", base_url="u")),
+                round_index=1, round_budget=3)
+    st = ag.round_stats()
+    assert st["max"] == 3 and st["next"] is True and st["autonomous"] is True
 
 
 def test_next_round_marks_wants_next(ws, registry):
     from openthree.llm import LLM, LLMConfig
     ag = _agent(ws, registry, LLM(LLMConfig(api_key="k", base_url="u")),
-                round_index=1, autonomous=True, max_rounds=3)
+                round_index=1, round_budget=3, max_rounds=3)
     out = next_round(summary="做完一半")
     assert ag.wants_next_round is True and ag.finished is True
     assert "下一轮" in out and "第 1 轮" in out
 
 
-def test_next_round_without_autonomy_says_so(ws, registry):
+def test_next_round_without_budget_says_no_next(ws, registry):
+    """轮预算用尽（round_budget=1，已是第 1 轮）时，next_round 如实说没有下一轮。"""
     from openthree.llm import LLM, LLMConfig
     ag = _agent(ws, registry, LLM(LLMConfig(api_key="k", base_url="u")),
-                round_index=1, autonomous=False, max_rounds=3)
+                round_index=1, round_budget=1, max_rounds=3)
     out = next_round(summary="x")
     assert "没有下一轮" in out
     assert ag.wants_next_round is True
@@ -215,7 +288,7 @@ def test_next_round_summary_is_stored_round_write(ws, registry):
     """next_round(summary=…) 不只是记日志 —— 说明必须存下来，供下一轮取用。"""
     from openthree.llm import LLM, LLMConfig
     ag = _agent(ws, registry, LLM(LLMConfig(api_key="k", base_url="u")),
-                round_index=1, autonomous=True)
+                round_index=1, round_budget=3)
     next_round(summary="做完一半，下一轮收尾")
     assert ag.next_round_summary == "做完一半，下一轮收尾"
 
