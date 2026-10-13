@@ -104,6 +104,10 @@ def _ok(msg):
 
 def _fresh_dir(path: Path) -> Path:
     """清空并重建沙箱（重试以对抗 Windows 文件句柄延迟释放）。"""
+    # 先清扫上次回退时遗留的带时间戳沙箱目录，别让残渣无声堆积。
+    for stale in path.parent.glob(f"{path.name}-[0-9]*"):
+        if stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
     if path.exists():
         for _ in range(3):
             try:
@@ -113,7 +117,11 @@ def _fresh_dir(path: Path) -> Path:
                 time.sleep(0.4)
         else:
             # 退而求其次：换一个带时间戳的目录，保证测试能跑
-            path = path.with_name(f"{path.name}-{int(time.time())}")
+            # （正常路径上面已清空，能走到这里说明目录仍被占用）
+            fallback = path.with_name(f"{path.name}-{int(time.time())}")
+            print(f"警告：无法清空 {path}（句柄未释放），改用 {fallback}",
+                  file=sys.stderr)
+            path = fallback
     path.mkdir(parents=True)
     return path
 
