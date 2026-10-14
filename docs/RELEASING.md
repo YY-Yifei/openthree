@@ -151,6 +151,16 @@ python -m twine upload dist/*
 > **首版提示**：若用账户级 token 上传，上传成功后会收到一封 “A new release has been
 > created” 邮件；建议随后把账户级 token 撤销、换成项目级 token。
 
+### 实际发布记录
+
+- **2026-10-14**：`openthree 0.1.0` 已正式上传 PyPI（`twine upload` 输出
+  `View at: https://pypi.org/project/openthree/0.1.0/`）。
+  发布前把 README 里会原样渲染到 PyPI 页面的 `<repo>` 占位符去掉了，并**重建产物**后重传。
+- 之后从 PyPI 全新 venv 实装 `openthree` 成功，`openthree --inspect` → 31 工具就绪。
+- 遗留小事（留待 `0.1.1`）：本项目**尚未配置 git remote**，故 `pyproject.toml`
+  未加 `[project.urls]` —— PyPI 侧栏的 Project Links（Homepage/Repository）暂缺。
+  等仓库有了公开地址，补上 `[project.urls]` 再发一版即可。
+
 ---
 
 ## 5. 发布后验证
@@ -195,6 +205,7 @@ PyPI 上的版本不能删除，只能 *yank*（标记为“不建议使用”�
 | `403 Invalid or non-existent authentication` | token 写错，或用户名没写成 `__token__`。 |
 | `400 The description failed to render` | README 里有 PyPI 渲染不支持的语法；跑 `twine check` 复现。 |
 | TestPyPI 装不上依赖 | 加 `--extra-index-url https://pypi.org/simple/`。 |
+| 刚发布却 `Could not find a version ... (from versions: none)` | 多半是 pip 走了**国内镜像**（如 `mirrors.aliyun.com`）尚未同步。用 `pip config list` 确认；临时直连官方源验证：`pip install --index-url https://pypi.org/simple/ openthree`。官方索引已收录可查 <https://pypi.org/simple/openthree/>。 |
 | sdist 缺 `tests/conftest.py` 之类 | 由 `MANIFEST.in` 控制；本项目已 `recursive-include tests *.py`。 |
 | 误把 `.openthree/`（含 API key）打进包 | 本项目 `MANIFEST.in` 已 `prune .openthree`；上传前仍应跑第 2 节第 5 步复核。 |
 | README/描述渲染乱码 | `pyproject.toml` 里 `description` 含中文没问题，但确保文件都是 UTF-8。 |
