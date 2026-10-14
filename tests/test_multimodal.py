@@ -221,7 +221,7 @@ def test_record_llm_redacts_base64_in_disk_log(ws, png):
     payload = {"model": "stub", "messages": [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": to_data_url(png)}}]}]}
     rec.record_llm(payload, {"choices": []}, 1.0)
-    logs = list((ws.logs_dir / "llm").glob("llm-*.json"))
+    logs = list(rec.llm_dir.glob("llm-*.json"))
     blob = logs[-1].read_text(encoding="utf-8")
     assert base64.b64encode(PNG_BYTES).decode() not in blob
     assert "省略" in blob

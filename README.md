@@ -418,9 +418,9 @@ recall_memory(query="pytest")     # → 把写下的经验读回来
 ```
 .openthree/logs/
     session-<id>.json   整场会话（元信息 + 全部事件 + 统计）
-    steps/step-0001.json 逐步拆解
+    sessions/<id>/steps/step-0001.json  逐步拆解（按会话分目录）
+    sessions/<id>/llm/llm-0001.json     每次模型调用的请求与响应原文
     events/events.jsonl  追加式事件流，一行一事件
-    llm/llm-0001.json    每次模型调用的请求与响应原文
     evolution.jsonl      自我演化史（写了什么 function、改了什么提示词、调了什么上下文策略）
 ```
 

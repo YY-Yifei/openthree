@@ -6,11 +6,14 @@
 
 落盘分类（`.openthree/logs/`）：
 
-    session-<id>.json     整场会话（元信息 + 全部事件 + 统计）
-    steps/step-0001.json  每一步（一个 assistant turn + 其工具结果）
-    events/events.jsonl   追加式事件流，一行一事件（便于 tail / 流式消费）
-    llm/llm-0001.json     每次模型调用的请求与响应原文（含耗时/token）
-    evolution.jsonl       自我演化史：写 function、改提示词、压缩上下文
+    session-<id>.json                   整场会话（元信息 + 全部事件 + 统计）
+    sessions/<id>/steps/step-0001.json  每一步（一个 assistant turn + 其工具结果）
+    sessions/<id>/llm/llm-0001.json     每次模型调用的请求与响应原文（含耗时/token）
+    events/events.jsonl                 追加式事件流，一行一事件（便于 tail / 流式消费）
+    evolution.jsonl                     自我演化史：写 function、改提示词、压缩上下文
+
+`steps/` 与 `llm/` 的编号都是**会话内序号**，所以它们按会话分目录 —— 若放在共享
+目录里，后一场会话会从 0001 重来、整体覆盖前一场（日志静默丢失）。
 """
 from __future__ import annotations
 
@@ -33,6 +36,11 @@ def _now() -> str:
 # session json 落盘节流（避免每条事件全量重写，O(n^2) 写放大）
 FLUSH_EVERY = 5        # 满 N 条事件至少刷一次
 FLUSH_INTERVAL = 2.0   # 至少间隔多少秒
+
+# 会话的合法终态：finalize 只认这些，其余（含 "running"）一律回落成 "done"。
+# 落盘的 status 必须如实：把 unfinished/interrupted/error 压成 running，
+# 事后就分不清「真收尾了但状态写错」与「进程被 kill」。
+_TERMINAL_STATUSES = ("done", "unfinished", "interrupted", "error")
 
 
 def _jsonable(obj: Any) -> Any:
@@ -85,13 +93,20 @@ class Recorder:
         self._step_buf: List[Event] = []
         self._llm_count = 0
         self._final_answer: Optional[str] = None
+        self._status = "running"          # 真实终态；finalize 时落成 done/unfinished/interrupted/error
+        self.ended_at: Optional[str] = None
         self._lock = threading.Lock()
         self._dirty = False
         self._flush_since = 0
         self._last_flush = time.time()
 
         self.ws.logs_dir.mkdir(parents=True, exist_ok=True)
-        (self.ws.logs_dir / "llm").mkdir(parents=True, exist_ok=True)
+        # 逐步 / 逐次 LLM 原文按会话分目录：编号是会话内序号，共享目录会跨会话覆盖。
+        self.session_dir = self.ws.session_dir(self.session_id)
+        self.steps_dir = self.session_dir / "steps"
+        self.llm_dir = self.session_dir / "llm"
+        self.steps_dir.mkdir(parents=True, exist_ok=True)
+        self.llm_dir.mkdir(parents=True, exist_ok=True)
         self.session_file = self.ws.logs_dir / f"{self.session_id}.json"
         self.events_file = self.ws.events_dir / "events.jsonl"
         self.evolution_file = self.ws.logs_dir / "evolution.jsonl"
@@ -105,14 +120,16 @@ class Recorder:
 
         每次事件后都刷一遍：进程被 kill 也不丢已发生的思考。
         """
+        if final:
+            self._status = self._status if self._status != "running" else "done"
         doc = {
             "session_id": self.session_id,
             "model": self.model,
-            "status": "done" if final else "running",
+            "status": self._status,
             "started_at": self.started_at,
-            "ended_at": getattr(self, "ended_at", None),
+            "ended_at": self.ended_at,
             "user_input": self.user_input,
-            "answer": getattr(self, "_final_answer", None),
+            "answer": self._final_answer,
             "stats": self.stats(),
             "steps": self.steps,
             "events": [e.to_dict() for e in self.events],
@@ -152,7 +169,7 @@ class Recorder:
             "events": [e.to_dict() for e in self._step_buf],
         }
         self.steps.append(step_obj)
-        path = self.ws.steps_dir / f"step-{self._step:04d}.json"
+        path = self.steps_dir / f"step-{self._step:04d}.json"
         path.write_text(json.dumps(step_obj, ensure_ascii=False, indent=2), encoding="utf-8")
         self._flush_session()
 
@@ -195,7 +212,7 @@ class Recorder:
             "usage": usage or {},
             "error": error,
         }
-        path = self.ws.logs_dir / "llm" / f"llm-{idx:04d}.json"
+        path = self.llm_dir / f"llm-{idx:04d}.json"
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self._append_line(self.trace_file, {
             "index": idx, "ts": payload["ts"], "elapsed_ms": payload["elapsed_ms"],
@@ -220,9 +237,10 @@ class Recorder:
         self._close_step()
         self.ended_at = _now()
         self._final_answer = answer
+        self._status = status if status in _TERMINAL_STATUSES else "done"
         self._dirty = True
         self._maybe_flush(force=True)
-        self._flush_session(final=(status == "done"))
+        self._flush_session(final=True)
         return {
             "session_id": self.session_id,
             "model": self.model,

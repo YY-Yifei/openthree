@@ -74,7 +74,39 @@ def test_step_files_written(ws):
     rec.begin_step()
     rec.record("note", summary="b")
     rec.finalize()
-    assert len(list(ws.steps_dir.glob("step-*.json"))) == 2
+    # 逐步文件按会话分目录，防止后一场会话覆盖前一场
+    assert len(list(rec.steps_dir.glob("step-*.json"))) == 2
+    assert rec.steps_dir.parent.name == rec.session_id
+
+
+def test_step_files_survive_across_sessions(ws):
+    """回归：两场会话的 step/llm 原文必须各留各的，不能跨会话覆盖。"""
+    first = Recorder(ws, user_input="t1", model="m")
+    first.begin_step()
+    first.record("note", summary="会话一")
+    first.record_llm({"model": "m", "messages": []}, {"choices": []}, 1.0)
+    first.finalize(answer="一")
+
+    second = Recorder(ws, user_input="t2", model="m")   # 新会话，序号从 0001 重来
+    second.begin_step()
+    second.record("note", summary="会话二")
+    second.record_llm({"model": "m", "messages": []}, {"choices": []}, 1.0)
+    second.finalize(answer="二")
+
+    assert len(list(ws.sessions_dir.glob("*/steps/step-0001.json"))) == 2
+    assert len(list(ws.sessions_dir.glob("*/llm/llm-0001.json"))) == 2
+
+
+def test_finalize_keeps_real_status(ws):
+    """回归：真实终态必须落盘，不能被压成 running（否则事后分不清真终态与被 kill）。"""
+    for status in ("done", "unfinished", "interrupted", "error"):
+        ws2 = Workspace(ws.root / status)
+        rec = Recorder(ws2, user_input="t", model="m")
+        rec.record("note", summary="x")
+        rec.finalize(answer="a", status=status)
+        saved = json.loads(rec.session_file.read_text(encoding="utf-8"))
+        assert saved["status"] == status
+        assert saved["ended_at"]
 
 
 # ---------------------------------------------------------------- 报告

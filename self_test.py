@@ -164,13 +164,13 @@ def main() -> int:
     check("工具调用 4 次", doc["stats"]["tool_calls"] == 4, f"={doc['stats']['tool_calls']}")
     check("最终答复含结论", "55" in doc["answer"] or "演化成功" in doc["answer"])
 
-    # 4 可观测
+    # 4 可观测（逐步/逐次原文按会话分目录：logs/sessions/<id>/{steps,llm}/）
     logs = SANDBOX / ".openthree" / "logs"
     check("session json", len(list(logs.glob("session-*.json"))) == 1)
     check("events.jsonl", (logs / "events" / "events.jsonl").exists())
-    check("steps json", len(list(logs.glob("steps/step-*.json"))) == 4,
-          f"{len(list(logs.glob('steps/step-*.json')))} 个")
-    check("llm json", len(list(logs.glob("llm/llm-*.json"))) == 4)
+    check("steps json", len(list(logs.glob("sessions/*/steps/step-*.json"))) == 4,
+          f"{len(list(logs.glob('sessions/*/steps/step-*.json')))} 个")
+    check("llm json", len(list(logs.glob("sessions/*/llm/llm-*.json"))) == 4)
     check("evolution.jsonl", (logs / "evolution.jsonl").exists())
 
     evo = [json.loads(l) for l in (logs / "evolution.jsonl").read_text(encoding="utf-8").splitlines()]

@@ -21,7 +21,8 @@
         logs/                   # 可观测：模型全部工作记录
             session-*.json
             trace.jsonl
-            steps/
+            sessions/<id>/steps/  # 每场会话的逐步拆解（按会话分目录，防止跨会话覆盖）
+            sessions/<id>/llm/    # 每场会话的逐次 LLM 请求/响应原文
             events/
         memory/                 # 模型自省产生的长期记忆（可选）
             memory.jsonl        #   append-only：一行一条 {ts, content, tags}
@@ -30,6 +31,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -212,6 +214,9 @@ _LIMITS_SEED = """\
 """
 
 
+_SESSION_SEQ = itertools.count(1)
+
+
 def _now_stamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -276,7 +281,21 @@ class Workspace:
         return self.dir / "logs"
 
     @property
+    def sessions_dir(self) -> Path:
+        """按会话分目录的逐步 / 逐次 LLM 原文：`logs/sessions/<session_id>/{steps,llm}/`。
+
+        之所以分目录：`step-NNNN.json` / `llm-NNNN.json` 的编号是**会话内序号**，
+        放在共享目录里，后一场会话会从 0001 重来、整体覆盖前一场的原文。
+        """
+        return self.logs_dir / "sessions"
+
+    def session_dir(self, session_id: str) -> Path:
+        safe = re.sub(r"[^0-9A-Za-z._-]+", "_", str(session_id)) or "session"
+        return self.sessions_dir / safe
+
+    @property
     def steps_dir(self) -> Path:
+        """**遗留**共享目录（旧数据结构，只读；新数据写在 session_dir() 里）。"""
         return self.logs_dir / "steps"
 
     @property
@@ -375,7 +394,7 @@ class Workspace:
             self.functions_dir,
             self.assets_dir,
             self.logs_dir,
-            self.steps_dir,
+            self.sessions_dir,
             self.events_dir,
             self.memory_dir,
             self.transcript_dir,
@@ -817,7 +836,13 @@ class Workspace:
 
     # ---------- 日志 ----------
     def new_session_id(self) -> str:
-        return f"session-{_now_stamp()}-{os.getpid()}"
+        """会话 id：`session-<时间戳>-<pid>-<进程内序号>`。
+
+        序号是必须的：同一进程（如 `-i` 交互、测试）里一秒内可以开多场会话，
+        只靠「秒 + pid」会撞名，于是逐场会话的目录互相覆盖 —— 又把刚修好的
+        跨会话覆盖在进程内重新引入了一遍。
+        """
+        return f"session-{_now_stamp()}-{os.getpid()}-{next(_SESSION_SEQ)}"
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Workspace {self.dir}>"
