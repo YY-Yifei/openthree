@@ -38,6 +38,11 @@ dependencies = [
     "json_repair>=0.30",
 ]
 
+[project.urls]
+Homepage = "https://github.com/YY-Yifei/openthree"
+Source = "https://github.com/YY-Yifei/openthree"
+Issues = "https://github.com/YY-Yifei/openthree/issues"
+
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 
