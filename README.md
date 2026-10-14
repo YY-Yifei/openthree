@@ -18,6 +18,9 @@ git clone <repo> && cd openthree && pip install -e .
 
 可选：`pip install json_repair`（模型返回非法 JSON 参数时自动修复）。
 
+在 WSL 里部署（git 跟随更新 + 内网网关模型）：见 [docs/wsl-setup.md](docs/wsl-setup.md)，
+或一键 `bash scripts/wsl-setup.sh`（需先在仓库根目录）。
+
 ## 配置
 
 优先级：**环境变量 < 用户级 < 项目级**。
