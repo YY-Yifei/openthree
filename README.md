@@ -44,7 +44,7 @@ llm:
 
 ```bash
 openthree "把 utils.py 里的重复代码抽出来"   # 就地初始化 .openthree/，写任务，开跑（单次）
-openthree                                   # 沿用上次的 user-prompts.md 继续（单次）
+openthree                                   # 沿用当前任务（current-task.json 的干净原文）继续（单次）
 openthree -i                                # 交互模式（进程内会话，多轮记忆）
 openthree -i --auto 5                       # 长任务自主推进：计划未完成就自动接力，最多 5 轮
 openthree --name 小问 "帮我把日志查清楚"      # 给它起个名字（只在它还没名字时作为种子）
@@ -390,8 +390,11 @@ openthree --resume 4    # 或：显式把档案里最近 4 轮读回，作为会
   每轮把 `(用户原文, openthree 结论)` 追加成一行 JSON，一个字都不删、不改。
   用 JSONL 而非 markdown，是因为用户输入里可能包含任何字符（换行、`### 用户`、
   甚至一行看起来像 `## 2020-01-01T00:00:00` 的文本），JSON 编码保证无损往返。
-  `.openthree/prompts/user-prompts.md` 则是「单槽位」，只装当前任务、会被覆写，
-  它是模型能自己改写的工作台，不当档案。
+  `.openthree/prompts/user-prompts.md` 则是**渲染层**（单槽位、会被覆写，含
+  `# 当前任务` 头 / `_提交于 …_` 尾 / append 的 `---` 累积块），给人看、模型可改，
+  **不当输入读、也不当档案**。机器读的「当前任务」是它的结构化真源
+  `.openthree/prompts/current-task.json`（`{text, images, ts}`，`text` 永远是干净原文）；
+  两者由 `submit` 一起写。于是「读用户输入」读到的绝不会是文件的存储格式。
 - **读（记忆，只在进程内会话）**：每轮都是新 `Agent`，历史不继承；运行期把
   **本会话累积的轮次**以 `user` / `assistant` 消息播种进它的历史——**记忆在消息层，
   不在 system 层**，所以「system 每步重组装」的演化机制毫发无损。

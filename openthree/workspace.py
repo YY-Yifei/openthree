@@ -6,7 +6,8 @@
         prompts/
             system-prompts.md   # 一：系统提示词（柔性骨架，模型可自改）
             plan.md             # 长任务待办清单，模型自己维护、每一步自动注入
-            user-prompts.md     # 当前任务，用户输入落在这里，模型可自行改写
+            user-prompts.md     # 当前任务的渲染层（给人看；含头尾 / 累积块，勿当输入读）
+            current-task.json   # 当前任务的结构化真源（{text, images, ts}）—— 读输入只认它
             versions/           # 系统提示词的历史版本（可回滚）
             history/
                 transcript.jsonl  # 对话档案（append-only，每轮对话一行 JSON，
@@ -188,6 +189,17 @@ _USER_PROMPT_SEED = """\
 （等待用户输入……）
 """
 
+# 当前任务的**结构化真源**：机器只读它，user-prompts.md 只是它的 markdown 渲染
+# （给人看 / 自省）。于是「读用户输入」读到的是干净原文，绝不会把文件的存储格式
+# （`# 当前任务` 头 / `_提交于 …_` 尾 / `---` 累积块）当成用户输入。
+_CURRENT_TASK_SEED = """\
+{
+  "text": "",
+  "images": [],
+  "ts": null
+}
+"""
+
 _PLAN_SEED = """\
 # 当前计划
 
@@ -260,6 +272,25 @@ def _version_header(reason: str = "") -> str:
 
 
 _VERSION_RE = re.compile(r"^system-(\d{8}-\d{6})(?:-(\d+))?$")
+
+
+def _clean_task_markdown(text: str, images_mark: str = "<!-- openthree:images") -> str:
+    """从 user-prompts.md 的 markdown **渲染层**里取出干净任务正文。
+
+    这是「旧工作区迁移」与「模型手改 user_prompt 后回同步」的兜底解析：剥掉
+    `# 当前任务` 头、`_提交于 …_` 尾、图片注释，并在累积块里取**最后一次**的任务
+    （append 语义下最新的才是「当前任务」）。种子占位符返回空串。
+    """
+    if not text:
+        return ""
+    body = re.split(r"\n\s*---\s*\n", text)[-1]          # 取最后一个累积块
+    body = re.sub(r"^\s*#\s*当前任务\s*\n", "", body)     # 头
+    body = re.sub(r"\n+_提交于 [^_\n]*_\s*$", "", body)   # 尾
+    body = re.sub(re.escape(images_mark) + r":\s*\[.*?\]\s*-->", "", body, flags=re.S)
+    body = body.strip()
+    if body == "（等待用户输入……）":
+        return ""
+    return body
 
 
 def _version_sort_key(path: Path) -> "tuple":
@@ -351,6 +382,17 @@ class Workspace:
     @property
     def user_prompt_file(self) -> Path:
         return self.prompts_dir / "user-prompts.md"
+
+    @property
+    def current_task_file(self) -> Path:
+        """当前任务的**结构化真源**：`{text, images, ts}`。
+
+        与 user-prompts.md 的分工：那个 markdown 文件是**渲染**（给人看 / 自省 /
+        模型可改写），这个 JSON 是**真相**（机器读）。写任务时两者一起写；
+        读「当前任务」只读这里 —— 于是读到的永远是干净原文，而不是文件的
+        存储格式（`# 当前任务` 头 / `_提交于 …_` 尾 / `---` 累积块）。
+        """
+        return self.prompts_dir / "current-task.json"
 
     @property
     def plan_file(self) -> Path:
@@ -445,6 +487,12 @@ class Workspace:
             self.system_prompt_file.write_text(_SYSTEM_PROMPT_SEED, encoding="utf-8")
         if force_prompts or not self.user_prompt_file.exists():
             self.user_prompt_file.write_text(_USER_PROMPT_SEED, encoding="utf-8")
+        if not self.current_task_file.exists():
+            # 新工作区：若 user-prompts.md 已有真实任务（旧工作区），迁进结构化真源；
+            # 否则落种子。之后「读当前任务」只认这个 JSON，不再读 markdown 渲染层。
+            self.write_current_task(_clean_task_markdown(self.read_user_prompt()),
+                                    images=self.parse_images_from_prompt(
+                                        self.read_user_prompt()))
         if force_prompts or not self.plan_file.exists():
             self.plan_file.write_text(_PLAN_SEED, encoding="utf-8")
         if force_prompts or not self.context_policy_file.exists():
@@ -466,7 +514,8 @@ class Workspace:
             "这是 openthree 智能体的工作区。\n\n"
             "| 路径 | 含义 |\n|---|---|\n"
             "| `prompts/system-prompts.md` | 一：系统提示词，模型可自改（旧稿存于 `prompts/history/`） |\n"
-            "| `prompts/user-prompts.md` | 当前任务，用户输入落在这里 |\n"
+            "| `prompts/user-prompts.md` | 当前任务的渲染层（给人看，含 `# 当前任务` 头 / 累积块） |\n"
+            "| `prompts/current-task.json` | 当前任务的**结构化真源**（`{text, images, ts}`）；机器读用户输入只认它 |\n"
             "| `prompts/plan.md` | 长任务待办清单，模型自己维护、每一步自动注入 |\n"
             "| `context.json` | 上下文策略：预算 / 是否自动折叠；`context_budget` 写、`context_usage` 读 |\n"
             "| `limits.json` | 运行边界：每轮步数 / 最多轮数 / 生成长度 / 工具结果宽度；`set_limits` 写、`limits_usage` 读 |\n"
@@ -503,20 +552,71 @@ class Workspace:
         self.system_prompt_file.write_text(text, encoding="utf-8")
 
     def read_user_prompt(self) -> str:
+        """读回 user-prompts.md 的**原始 markdown**（渲染层，供自省 / read_prompts）。
+
+        ⚠ 这是「给人看的那份」，包含 `# 当前任务` 头 / `_提交于 …_` 尾 / `---` 累积块。
+        **不要拿它当「用户输入」**——那正是历史 bug 的根源。要任务正文请用
+        `current_task_text()`（读结构化真源）。
+        """
         if not self.user_prompt_file.exists():
             return ""
         return self.user_prompt_file.read_text(encoding="utf-8")
 
     def write_user_prompt(self, text: str) -> None:
+        """覆写渲染层 markdown；同时把**正文**同步进结构化真源（模型可改任务）。"""
         self.user_prompt_file.parent.mkdir(parents=True, exist_ok=True)
         self.user_prompt_file.write_text(text, encoding="utf-8")
+        body = _clean_task_markdown(text)
+        if body or self.current_task_file.exists():
+            self.write_current_task(body, images=self.parse_images_from_prompt(text))
+
+    def read_current_task(self) -> Dict[str, Any]:
+        """读「当前任务」的结构化真源 → `{text, images, ts}`（机器唯一该读的口径）。
+
+        文件缺失（旧工作区）时从 user-prompts.md 兜底迁移：剥掉头尾与累积块，
+        取出正文与图片标记。返回的 `text` 永远是**干净原文**。
+        """
+        try:
+            if self.current_task_file.exists():
+                data = json.loads(self.current_task_file.read_text(encoding="utf-8") or "{}")
+                if isinstance(data, dict):
+                    imgs = data.get("images")
+                    return {
+                        "text": str(data.get("text") or ""),
+                        "images": [str(x) for x in imgs] if isinstance(imgs, list) else [],
+                        "ts": data.get("ts"),
+                    }
+        except Exception:  # noqa: BLE001
+            pass
+        # 旧工作区兜底：从 markdown 渲染层还原
+        md = self.read_user_prompt()
+        return {"text": _clean_task_markdown(md),
+                "images": self.parse_images_from_prompt(md), "ts": None}
+
+    def write_current_task(self, text: str, images: Optional[List[str]] = None,
+                           ts: Optional[str] = None) -> Path:
+        """写结构化真源（不碰 user-prompts.md —— 那由 submit / write_user_prompt 管）。"""
+        doc = {
+            "text": (text or "").strip(),
+            "images": [str(x) for x in (images or []) if str(x).strip()],
+            "ts": ts or datetime.now().isoformat(timespec="seconds"),
+        }
+        self.current_task_file.parent.mkdir(parents=True, exist_ok=True)
+        self.current_task_file.write_text(
+            json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        return self.current_task_file
+
+    def current_task_text(self) -> str:
+        """当前任务的**干净正文**（剥掉 markdown 头尾与图片标记）—— 读用户输入走这里。"""
+        return self.strip_images_marker(self.read_current_task().get("text") or "")
+
+    def current_task_images(self) -> List[str]:
+        """当前任务携带的图片清单（结构化真源里的，或从渲染层标记兜底还原）。"""
+        return list(self.read_current_task().get("images") or [])
 
     def has_task(self) -> bool:
-        """当前是否有真实任务（而不是种子文案）。"""
-        text = self.read_user_prompt().strip()
-        if not text:
-            return False
-        return "等待用户输入" not in text
+        """当前是否有真实任务（结构化判据，不靠「等待用户输入」四个字猜）。"""
+        return bool(self.current_task_text().strip())
 
     # ---------- 计划（长任务的待办） ----------
     def read_plan(self) -> str:
@@ -722,26 +822,28 @@ class Workspace:
     # ---------- 用户输入 ----------
     def submit(self, user_input: str, append: bool = False,
                images: Optional[List[str]] = None) -> Path:
-        """把用户输入写进 user-prompts.md，开启 ReAct。
+        """把用户输入同时写进**结构化真源**（current-task.json）与**渲染层**（user-prompts.md）。
 
         Args:
-            user_input: 任务描述
-            append: True 时追加到已有任务之后，而不是覆盖
-            images: 本轮携带的图片路径 / URL；以 HTML 注释形式附在文末，
-                    既不影响人读，又能被 parse_images_from_prompt 还原。
+            user_input: 任务描述（干净原文，存进 current-task.json 的就是它）
+            append: True 时把上一任务留在渲染层作历史；**真源只保留本轮任务**
+                    （「当前任务」永远只有一条，不复读旧任务）
+            images: 本轮携带的图片路径 / URL；渲染层以 HTML 注释形式附在文末，
+                    **真源里以 images 列表存**，两份都由 parse/read 还原。
         """
         text = user_input.strip()
-        block = f"# 当前任务\n\n{text}\n\n_提交于 {datetime.now().isoformat(timespec='seconds')}_\n"
+        stamp = datetime.now().isoformat(timespec="seconds")
+        block = f"# 当前任务\n\n{text}\n\n_提交于 {stamp}_\n"
         if append:
-            old = self.read_user_prompt()
-            if "等待用户输入" in old:      # 种子占位符不算历史任务
-                old = ""
-            # 旧任务里的图片标记属于上一轮，剥掉，避免图片越滚越多
+            # 仅渲染层累积历史（给人看）；判据用结构化真源，不再靠字符串猜
+            old = self.read_user_prompt() if self.has_task() else ""
             old = re.sub(re.escape(self._IMAGES_MARK) + r":\s*\[.*?\]\s*-->", "", old, flags=re.S)
             if old.strip():
                 block = old.rstrip() + "\n\n---\n\n" + block
         block += self.images_marker(images or [])
-        self.write_user_prompt(block)
+        self.user_prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        self.user_prompt_file.write_text(block, encoding="utf-8")
+        self.write_current_task(text, images=images, ts=stamp)   # 真源：干净原文 + 本轮图片
         return self.user_prompt_file
 
     # ---------- 图片资产 ----------

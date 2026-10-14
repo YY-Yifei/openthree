@@ -102,7 +102,7 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         memory=_memory_block(ws),
         last_action=last_action or "（这是第一步）",
         evolution=evolution,
-        user_prompt=ws.read_user_prompt().strip() or "（空）",
+        user_prompt=ws.current_task_text().strip() or "（空）",
     )
 
 

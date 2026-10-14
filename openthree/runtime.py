@@ -242,9 +242,10 @@ class Runtime:
 
         `rounds` 可显式给整场轮数上限；None = 用 `max_rounds`（显式参数 > limits.json > 内核默认）。
 
-        user_input 为 None 时沿用已有的 user-prompts.md。images 是本轮携带的图片
-        （本地路径或 http/data URL）。session 为 True（或已开会话）时，跨轮播种来自
-        进程内会话；否则从零开跑，**不读磁盘**。
+        user_input 为 None 时：首轮沿用磁盘上已有的「当前任务」（结构化真源
+        current-task.json 的干净原文），续轮不读盘、不重复播种。images 是本轮携带
+        的图片（本地路径或 http/data URL）。session 为 True（或已开会话）时，跨轮
+        播种来自进程内会话；否则从零开跑，**不读磁盘**。
         """
         problem = self.check()
         if problem:
@@ -277,6 +278,7 @@ class Runtime:
                     first_round=first,
                     round_budget=budget,
                     next_round_summary=prev_summary,
+                    reuse_task=(first and user_input is None),
                 )
                 docs.append(doc)
                 prev_summary = doc.get("next_round_summary") or ""
@@ -308,8 +310,14 @@ class Runtime:
                    session: bool = False, round_index: int = 1,
                    first_round: bool = True,
                    round_budget: Optional[int] = None,
-                   next_round_summary: str = "") -> Dict[str, Any]:
+                   next_round_summary: str = "",
+                   reuse_task: bool = False) -> Dict[str, Any]:
         """跑**一轮**：建 Agent → 起 ReAct → finalize，返回本轮的会话文档。
+
+        `user_input=None` 有**两种**语义，必须显式区分（历史 bug 的根源就是它俩
+        曾被混为一谈）：
+          * `reuse_task=True` —— 显式沿用磁盘上的「当前任务」（`openthree` 无参数续跑）；
+          * `reuse_task=False` —— 本轮**没有新输入**（多轮续跑）：不读盘、不重复播种。
 
         一次任务由若干轮组成（见 run / run_auto）；本函数只管一轮。
         `round_index` 是本轮序号；`round_budget` 是本场**生效轮预算**（Runtime 真正
@@ -333,22 +341,24 @@ class Runtime:
                 self.say(f"[提示] 有图片未能归档：{self.ws._last_image_error}")
 
         if user_input is not None:
-            self.ws.submit(user_input, append=append, images=image_refs or None)
-        elif image_refs:
-            # 沿用已有任务但补了图：把图片标记挂到当前 user-prompts.md 上
-            base = self.ws.read_user_prompt()
-            marker = self.ws.images_marker(image_refs)
-            if marker and marker.strip() not in base:
-                self.ws.write_user_prompt(base.rstrip() + "\n" + marker)
+            task_text = user_input.strip()
+            self.ws.submit(task_text, append=append, images=image_refs or None)
+        elif reuse_task:
+            # 显式沿用磁盘上的「当前任务」：只读**结构化真源**（干净原文），
+            # 绝不读 user-prompts.md 的 markdown 渲染层（含头尾 / 累积块）。
+            task_text = self.ws.current_task_text()
+            if image_refs:
+                self.ws.write_current_task(task_text, images=image_refs)
+            else:
+                image_refs = self.ws.current_task_images()
+        else:
+            # 多轮续跑：本轮**没有新输入** —— 不读盘、不重复播种（同一用户输入只播种一次）
+            task_text = ""
+            image_refs = []
 
-        # 本轮用户输入：显式传入就用原文（完整保留），否则沿用 user-prompts.md
-        self.user_input = (user_input if user_input is not None
-                           else self.ws.read_user_prompt())
-        # 图片清单：显式传入优先；否则从 user-prompts.md 的标记里还原
-        if not image_refs:
-            image_refs = self.ws.parse_images_from_prompt(self.user_input)
-        # 入档用的用户原文：剥掉图片标记（图片单独落在 transcript 的 images 字段）
-        self.user_text = self.ws.strip_images_marker(self.user_input)
+        # 本轮用户输入 = 干净原文（不含 markdown 头尾 / 图片标记）
+        self.user_input = task_text
+        self.user_text = task_text
 
         self.recorder = Recorder(self.ws, session_id=session_id,
                                  user_input=self.user_text or self.user_input,
@@ -419,9 +429,14 @@ class Runtime:
         doc["next_round_summary"] = self.agent.next_round_summary
 
         # 本轮对话入档：用户的完整原始输入 append 进 transcript，永不丢失。
-        # 这只写不读（档案/可观测）；跨轮记忆走进程内会话，见 _effective_turns。
+        # **一次任务只入档一次**：多轮任务里同一用户输入绝不被重复写 N 次
+        # （历史 bug：续轮把上一条输入又当新的一条 append 进去）。
+        # 续轮（没有新输入）只记本轮结论。
         try:
-            self.ws.append_turn(self.user_text, answer, images=image_refs or None)
+            if first_round:
+                self.ws.append_turn(self.user_text, answer, images=image_refs or None)
+            else:
+                self.ws.append_turn("", answer)
         except Exception as exc:  # noqa: BLE001
             if self.recorder:
                 self.recorder.record("error", summary="对话记录写入失败",
@@ -429,11 +444,12 @@ class Runtime:
 
         # 会话内累积本轮 (用户原文, 结论)，供同一会话的后续轮次播种。
         # 没有会话（单次任务）时不累积，于是收尾即忘、不留痕。
+        # 续轮没有新输入：只累积结论，不再把同一条任务重复塞进记忆。
         if session or self._session_active:
             self._session_turns.append({
-                "user": self.user_text,
+                "user": self.user_text if first_round else "",
                 "answer": answer or "",
-                "images": list(image_refs),
+                "images": list(image_refs) if first_round else [],
             })
 
         # 每轮结束都刷新报告 —— 可观测是常态，不是事后
@@ -501,6 +517,7 @@ class Runtime:
                         first_round=first,
                         round_budget=rounds,
                         next_round_summary=prev_summary,
+                        reuse_task=(first and user_input is None),
                     )
                 except RuntimeError as exc:
                     self.say(f"[auto] 第 {i + 1} 轮启动失败：{exc}")
