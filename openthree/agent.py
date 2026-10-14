@@ -652,10 +652,10 @@ class Agent:
                                    temperature=self.temperature)
             msg = result.get("message") or {}
             self.progress.llm_done(result.get("elapsed_ms", 0.0), result.get("usage"),
-                                   result.get("error"))
+                                   result.get("error"), result.get("attempts", 1))
             self.rec.record_llm(result.get("raw_request", {}), result.get("raw_response", {}),
                                 result.get("elapsed_ms", 0.0), result.get("usage"),
-                                result.get("error"))
+                                result.get("error"), result.get("attempts", 1))
 
             if result.get("error"):
                 # 被 max_tokens 截断：这是**可恢复**的 —— tool_calls 极可能是半截

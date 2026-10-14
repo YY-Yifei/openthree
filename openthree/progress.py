@@ -36,7 +36,7 @@ class NullProgress:
     def llm_start(self, model: str) -> None: ...
 
     def llm_done(self, elapsed_ms: float, usage: Optional[Dict[str, Any]] = None,
-                 error: Optional[str] = None) -> None: ...
+                 error: Optional[str] = None, attempts: int = 1) -> None: ...
 
     def thought(self, content: str) -> None: ...
 
@@ -113,17 +113,19 @@ class Progress:
         self._start_heartbeat("等待模型返回")
 
     def llm_done(self, elapsed_ms: float, usage: Optional[Dict[str, Any]] = None,
-                 error: Optional[str] = None) -> None:
+                 error: Optional[str] = None, attempts: int = 1) -> None:
         self._stop_heartbeat()
         secs = (elapsed_ms or 0) / 1000
+        # 只有真的重试过（attempts>1）才提示，免得每步都刷一条噪声
+        tries = f" · 共 {attempts} 次尝试" if attempts and attempts > 1 else ""
         if error:
-            self._say(f"  ✗ 模型调用失败 ({secs:.1f}s)：{_one_line(error, 200)}")
+            self._say(f"  ✗ 模型调用失败 ({secs:.1f}s{tries})：{_one_line(error, 200)}")
             return
         u = usage or {}
         extra = ""
         if u:
             extra = f" · in={u.get('prompt_tokens', '?')} out={u.get('completion_tokens', '?')}"
-        self._say(f"  · LLM 返回 ({secs:.1f}s{extra})")
+        self._say(f"  · LLM 返回 ({secs:.1f}s{extra}{tries})")
 
     def thought(self, content: str) -> None:
         text = _one_line(content, 160)

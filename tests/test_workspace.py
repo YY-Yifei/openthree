@@ -97,6 +97,18 @@ def test_step_files_survive_across_sessions(ws):
     assert len(list(ws.sessions_dir.glob("*/llm/llm-0001.json"))) == 2
 
 
+def test_record_llm_persists_attempts(ws):
+    """可观测：真正打了几次（含重试）要落进 llm-*.json 与 trace，事后能看出重试过。"""
+    rec = Recorder(ws, user_input="t", model="m")
+    rec.record_llm({"model": "m", "messages": []}, {"choices": []}, 1.0,
+                   attempts=3)
+    saved = json.loads((rec.llm_dir / "llm-0001.json").read_text(encoding="utf-8"))
+    assert saved["attempts"] == 3
+    trace = [json.loads(l) for l in rec.trace_file.read_text(encoding="utf-8").splitlines()]
+    assert trace[-1]["attempts"] == 3
+
+
+
 def test_finalize_keeps_real_status(ws):
     """回归：真实终态必须落盘，不能被压成 running（否则事后分不清真终态与被 kill）。"""
     for status in ("done", "unfinished", "interrupted", "error"):

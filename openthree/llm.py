@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,7 +49,15 @@ class LLMConfig:
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     temperature: float = 0.3
     timeout: float = 600.0
+    # connect 阶段单独设一个短超时：read=600s 是合理的（等模型生成），
+    # 但「连不上主机」跟「模型想得久」是两回事——不分开就会把 connect 也
+    # 抬到 600s，一次重试要干等 10 分钟。见 LLM._ensure_client。
+    connect_timeout: float = 5.0
     retries: int = 3
+    # openai SDK 自带的传输层重试。默认 0：重试只在 openthree 这一层发生，
+    # 次数才可预期（retries=3 就是最多 4 次调用）。若交给 SDK 兜底，
+    # 两层会相乘：真实 HTTP 次数 = (retries+1) × (sdk_max_retries+1)。
+    max_retries: int = 0
     extra: Dict[str, Any] = field(default_factory=dict)
     source: str = "env"
 
@@ -143,7 +152,9 @@ def load_config(project_dir: Optional[Path] = None, model_override: Optional[str
         context_window_tokens=int(window),
         temperature=float(merged.get("temperature", 0.3) or 0.3),
         timeout=float(merged.get("timeout", 600) or 600),
+        connect_timeout=float(merged.get("connect_timeout", 5) or 5),
         retries=int(merged.get("retries", 3) or 0),
+        max_retries=int(merged.get("max_retries", 0) or 0),
         extra=dict(merged.get("extra") or {}),
     )
     return cfg
@@ -165,7 +176,19 @@ class LLM:
             raise RuntimeError(
                 "缺少 openai 依赖，请执行： pip install openai"
             ) from exc
-        kwargs: Dict[str, Any] = {"api_key": self.config.api_key, "timeout": self.config.timeout}
+        kwargs: Dict[str, Any] = {"api_key": self.config.api_key}
+        # 关键的分离：只给一个 float 超时，httpx 会把它同时当作 read / write /
+        # pool / **connect** 的超时——于是「连不上主机」也要等整整 600s。
+        # 显式构造 httpx.Timeout：connect 用短超时快速失败，其余沿用 timeout。
+        try:
+            import httpx
+            kwargs["timeout"] = httpx.Timeout(
+                self.config.timeout, connect=self.config.connect_timeout)
+        except Exception:  # noqa: BLE001  # pragma: no cover
+            # httpx 缺席（罕见）时退回 float，行为不比从前差
+            kwargs["timeout"] = self.config.timeout
+        # 显式钉死 SDK 自带重试：默认 0，让重试只发生在 openthree 这一层。
+        kwargs["max_retries"] = max(0, int(self.config.max_retries or 0))
         if self.config.base_url:
             kwargs["base_url"] = self.config.base_url
         self._client = OpenAI(**kwargs)
@@ -176,7 +199,10 @@ class LLM:
              tool_choice: str = "auto",
              max_tokens: Optional[int] = None,
              temperature: Optional[float] = None) -> Dict[str, Any]:
-        """返回 {message, usage, elapsed_ms, raw_request, raw_response}。
+        """返回 {message, usage, elapsed_ms, raw_request, raw_response, attempts}。
+
+        `attempts` 是**本次调用真正打到线上的次数**（含重试；>1 说明重试过且最终
+        成功/放弃）。失败与成功两条路径都会带上它，供日志与进度显示用。
 
         `max_tokens` / `temperature` 可**按次覆盖**配置里的值 —— 调用方（Agent）
         由此把「模型自管的运行边界」按调用传进来，而不必去改 `self.config`。
@@ -202,8 +228,10 @@ class LLM:
 
         started = time.time()
         attempts = max(0, self.config.retries) + 1
+        used = 0
         resp = None
         for attempt in range(attempts):
+            used = attempt + 1
             try:
                 resp = client.chat.completions.create(**payload)
                 break
@@ -218,6 +246,7 @@ class LLM:
                         "raw_request": _redact(payload),
                         "raw_response": {"error": f"{type(exc).__name__}: {exc}"},
                         "error": f"{type(exc).__name__}: {exc}",
+                        "attempts": used,
                     }
                 time.sleep(_backoff(attempt))
         elapsed = (time.time() - started) * 1000
@@ -250,21 +279,28 @@ class LLM:
             "error": error,
             "error_kind": error_kind,
             "finish_reason": finish_reason,
+            "attempts": used,
         }
 
 
+# 可重试的信号。用**词边界正则**而不是裸子串：裸 "500" 会把 "5000 tokens"
+# 这类无关文本误判成 5xx，词边界能挡掉它。
 _RETRYABLE_MARKERS = (
     "timeout", "timedout", "connection", "connect", "ratelimit", "rate_limit",
     "internalserver", "servererror", "serviceunavailable", "apiconnection",
-    "temporarily", "502", "503", "504",
+    "temporarily",
 )
+_RETRYABLE_STATUS = re.compile(
+    r"(?<!\d)(408|409|429|500|502|503|504)(?!\d)")
 
 
 def _retryable(exc: BaseException) -> bool:
     """网络抖动 / 限流 / 5xx 才重试；参数错误、鉴权失败等立刻返回。"""
     name = type(exc).__name__.lower()
     text = f"{name} {exc}".lower()
-    return any(m in text for m in _RETRYABLE_MARKERS)
+    if any(m in text for m in _RETRYABLE_MARKERS):
+        return True
+    return bool(_RETRYABLE_STATUS.search(text))
 
 
 def _backoff(attempt: int) -> float:

@@ -50,6 +50,19 @@ def test_progress_reports_error():
     assert "✗" in buf.getvalue() and "Timeout" in buf.getvalue()
 
 
+def test_progress_shows_attempts_only_when_retried():
+    """重试过才提示「共 N 次尝试」；没重试则不打这条噪声。"""
+    buf = io.StringIO()
+    p = Progress(stream=buf, heartbeat=0)
+    p.llm_done(1200.0, {"prompt_tokens": 10}, attempts=3)
+    assert "共 3 次尝试" in buf.getvalue()
+
+    buf2 = io.StringIO()
+    Progress(stream=buf2, heartbeat=0).llm_done(1200.0, {"prompt_tokens": 10})
+    assert "次尝试" not in buf2.getvalue()
+
+
+
 def test_short_args_hides_big_blobs():
     """多行 / 超长参数只报体量，不把代码糊满终端一行。"""
     line = _short_args({"name": "fib", "code": "def fib(n):\n    return n\n" * 20})

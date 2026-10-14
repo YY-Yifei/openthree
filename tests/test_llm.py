@@ -140,3 +140,44 @@ def test_config_reads_context_window(tmp_path):
         encoding="utf-8")
     cfg = load_config(tmp_path)
     assert cfg.context_window_tokens == 128_000
+
+
+# ---------------------------------------------------------------- 重试层：可观测与分层
+def test_attempts_reported_on_success_and_failure():
+    """`attempts` 是「真正打到线上的次数」：成功=重试后成功，失败=用尽的次数。"""
+    # 失败 2 次后成功 → attempts 应为 3
+    client, state = _client(fail_times=2)
+    r = _llm(client).chat([{"role": "user", "content": "hi"}])
+    assert r["attempts"] == 3 and state["calls"] == 3
+
+    # 一直失败、retries=1 → 用尽 2 次
+    client2, state2 = _client(fail_times=99)
+    r2 = _llm(client2, retries=1).chat([{"role": "user", "content": "hi"}])
+    assert r2["attempts"] == 2 and r2["error"]
+
+    # 不可重试 → 只 1 次
+    client3, _ = _client(fail_times=99, exc_factory=lambda: ValueError("bad request"))
+    r3 = _llm(client3, retries=5).chat([{"role": "user", "content": "hi"}])
+    assert r3["attempts"] == 1
+
+
+def test_retryable_covers_500_and_guards_against_number_substrings():
+    """修复点：5xx 的 "500" 要认；但不能把 "5000 tokens" 这类数字误判成 5xx。"""
+    for status in ("408", "409", "429", "500", "502", "503", "504"):
+        assert _retryable(RuntimeError(f"Error code: {status} - boom")), status
+    # 词边界：数字里嵌着的 500 不算
+    assert not _retryable(RuntimeError("max_tokens exceeds 5000 tokens"))
+    assert not _retryable(ValueError("invalid api key"))
+
+
+def test_client_timeout_is_split_and_sdk_retry_disabled():
+    """修复点：connect 超时必须单独短，且 SDK 传输层重试显式关闭（默认 0）。"""
+    llm = LLM(LLMConfig(api_key="k", base_url="http://test/v1",
+                        timeout=600.0, connect_timeout=5.0, max_retries=0))
+    client = llm._ensure_client()
+    assert client.max_retries == 0
+    t = client.timeout
+    # httpx.Timeout：connect 被单独钉在 5s，read 仍是 600s
+    assert t.connect == 5.0
+    assert t.read == 600.0
+

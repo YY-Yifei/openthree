@@ -194,7 +194,7 @@ class Recorder:
 
     def record_llm(self, request: Dict[str, Any], response: Dict[str, Any],
                    elapsed_ms: float, usage: Optional[Dict[str, Any]] = None,
-                   error: Optional[str] = None) -> Event:
+                   error: Optional[str] = None, attempts: int = 1) -> Event:
         self._llm_count += 1
         idx = self._llm_count
         # 请求/响应原文过一道日志脱敏：图片 base64 折叠成占位符，
@@ -202,6 +202,10 @@ class Recorder:
         request = _jsonable(request)
         response = _jsonable(response)
         usage = _jsonable(usage or {})
+        try:
+            attempts = max(1, int(attempts))
+        except (TypeError, ValueError):
+            attempts = 1
         payload = {
             "index": idx,
             "ts": _now(),
@@ -211,19 +215,26 @@ class Recorder:
             "response": response,
             "usage": usage or {},
             "error": error,
+            # 真正打到线上的次数（含重试）。>1 说明这次是重试后才拿到结果的
+            # —— 事后从日志里就能看出「重试发生过」，而不只是「成功了」。
+            "attempts": attempts,
         }
         path = self.llm_dir / f"llm-{idx:04d}.json"
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self._append_line(self.trace_file, {
             "index": idx, "ts": payload["ts"], "elapsed_ms": payload["elapsed_ms"],
             "model": payload["model"], "usage": payload["usage"], "error": error,
+            "attempts": attempts,
         })
+        retry_note = f" · {attempts} 次尝试" if attempts > 1 else ""
         return self.record(
             "llm",
-            summary=f"LLM #{idx} {request.get('model','')} ({elapsed_ms/1000:.1f}s)",
+            summary=f"LLM #{idx} {request.get('model','')} "
+                    f"({elapsed_ms/1000:.1f}s{retry_note})",
             data={"index": idx, "usage": usage or {}, "file": str(path.name),
                   "messages": len(request.get("messages", [])),
-                  "tools": len(request.get("tools", []) or [])},
+                  "tools": len(request.get("tools", []) or []),
+                  "attempts": attempts},
             elapsed_ms=elapsed_ms,
         )
 

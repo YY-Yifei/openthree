@@ -315,7 +315,13 @@ openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已
   想让内核**彻底不插手**：`--no-auto-fold` 或环境变量 `OPENTHREE_CONTEXT_AUTOFOLD=0`
   （模型改不了环境，这是真·硬闸）。详见「上下文：模型自己管」一节。
 - **LLM 调用会重试。** 网络抖动 / 限流 / 5xx 自动指数退避重试（默认 3 次）；
-  参数错误、鉴权失败立即返回，不空转。
+  参数错误、鉴权失败、4xx 立即返回，不空转。**重试只在 openthree 这一层发生**
+  ——构造 SDK 时显式钉死 `max_retries=0`，所以 `retries=3` 就是「最多 4 次调用」，
+  不会和 SDK 自带的传输层重试叠加相乘。真正发出的次数会显示在进度行
+  （「共 N 次尝试」），并记进 `logs/llm-*.json` 与 `trace.jsonl` 的 `attempts` 字段。
+- **超时是分层的。** `llm.timeout`（默认 600s）管 read/write/pool——等模型慢慢
+  生成是合理的；`llm.connect_timeout`（默认 5s）单独管「连不上主机」，快速失败
+  后交给重试。两层不分开的话，「主机不可达」这一种失败也会干等满 600s。
 - **输出被截断可恢复。** `finish_reason=length` 时如实报错，**并要求模型重发**那条消息
   （更精简），最多 2 次——而不是把半截 `tool_calls` 当成正常回复、或白白杀死整场任务。
   连续重发仍截断才失败，并提示模型用 `set_limits(max_tokens=…)` 自己调大生成上限
@@ -325,9 +331,10 @@ openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已
   再给 5s 管道收尾宽限，仍收不回就直接放弃读取返回——所以绝不会因为某个后台
   子进程攥着输出管道而永久卡住。`stdin` 接 `DEVNULL`，交互式命令立刻 EOF 退出。
   `timeout` 被截到 `1~3600` 秒。
-- **LLM 调用有上界。** 单次请求默认 600s 超时、最多重试 3 次、退避上限 30s，
-  最坏约 3×(600+30)≈32 分钟——**这也会表现为「很久没结果」**，
-  可用 `config.yaml: llm.timeout / llm.retries` 调小。
+- **LLM 调用有上界。** 一次调用最多 `1+retries` 次（默认 4 次）；每次请求
+  `timeout` 上限 600s、每次失败后退避 ≤30s，故最坏约 `4×(600+30)≈42 分钟`
+  ——**这也会表现为「很久没结果」**，可用
+  `config.yaml: llm.timeout / llm.retries / llm.connect_timeout` 调小。
 - **`finish` 之后不再执行多余的调用。** 同批剩余 tool_calls 一律跳过。
 - **多轮记忆只活在会话里。** 每轮的 (用户原文, 结论) 追加进 append-only 的
   `prompts/history/transcript.jsonl` 作档案；但**记忆本身在进程内的会话里**
