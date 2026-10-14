@@ -43,7 +43,7 @@ PyPI 强制要求双因素认证。用任意 TOTP App（Google Authenticator / 1
 首次发布时，token 作用域选 **“Entire account”**（项目还不存在，无法选具体项目）；
 发布成功后，**建议重建一个只针对 `openthree` 项目的 token**，把账户级 token 删掉。
 
-token 形如 `pypi-AgEIcHlwaS5vcmc...`，**只显示一次**，立刻存好。
+token 形如 `pypi-XXXXXXXX...` 的一长串随机字符，**只显示一次**，立刻存好。
 
 ### 1.4 配置凭据（二选一）
 
