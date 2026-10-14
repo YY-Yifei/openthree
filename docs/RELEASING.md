@@ -11,7 +11,7 @@
 | 项目 | 状态 |
 | --- | --- |
 | 包名 `openthree` 在 PyPI | 未被占用（`https://pypi.org/pypi/openthree/json` → 404），可注册 |
-| 版本 | `0.1.1`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
+| 版本 | `0.1.2`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ PASSED |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄） |
@@ -160,6 +160,10 @@ python -m twine upload dist/*
 - **续**：`0.1.0` 的产物是「净化本机痕迹 / 停止追踪工作区」之前打的，事后解包复核确认
   它带着当时 docs/README 里的**本机路径示例**（Windows 上的项目绝对路径、WSL 的挂载盘路径）
   ——**无凭据**，但不该带。`0.1.0` 不可覆盖，处置见下一节。
+- **2026-10-14**（`openthree 0.1.2`）：把 `0.1.1` 之后合入的三项修复正式发到 PyPI ——
+  ① 横幅改显示智能体自己长出来的名字（`6c7b78e`）、② 模型调用重试收敛到一层 + connect
+  超时分离 + 补 500 分类（`9e67e66`）、③ 「读取用户输入」不再读到文件存储格式 / 上一次的
+  输入（`beab5e1`）。`0.1.1` 无凭据/本机痕迹问题，**无需 yank**。
 
 ### 发布上线后的「撤回 / 重发」记录
 
