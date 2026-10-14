@@ -38,20 +38,22 @@ def _force_utf8() -> None:
             pass
 
 
-def _print_banner() -> None:
-    print("""
-  openthree —— 三生万物
-  道生一，一生二，二生三，三生万物
-""", flush=True)
+def _print_banner(rt: "Runtime") -> None:
+    """身份卡：它叫什么（它是谁） + 自造工具 / 演化次数（它长成什么样了）。"""
+    print("\n" + rt.identity_card() + "\n", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="openthree",
-        description="三生万物 —— 极简 LLM Agent Harness，agent 天然自我演化",
+        description="极简 LLM Agent Harness：agent 天然自我演化（命名、长工具、改提示词）",
     )
     p.add_argument("task", nargs="*", help="任务描述；留空则沿用 .openthree/prompts/user-prompts.md")
     p.add_argument("-C", "--dir", default=".", help="项目目录（.openthree 会建在这里），默认当前目录")
+    p.add_argument("--name", default=None, metavar="NAME",
+                   help="给这个智能体起个名字：只在它**还没有名字**时作为种子落盘"
+                        "（已经有名字就不覆盖）；之后它可用 set_identity 自己改名。"
+                        "不传则名字由智能体自己生长")
     p.add_argument("-m", "--model", default=None, help="覆盖模型名")
     p.add_argument("--image", action="append", default=None, metavar="PATH_OR_URL",
                    help="随任务附一张图片（多模态）：本地路径或 http(s) 链接；可重复。")
@@ -135,6 +137,7 @@ def main(argv=None) -> int:
         heartbeat=args.heartbeat,
         turns=args.turns,
         max_rounds=args.max_rounds,
+        name=args.name,
     )
 
     if args.init:
@@ -163,11 +166,11 @@ def main(argv=None) -> int:
                             resume=args.resume)
 
     if not task and not rt.ws.has_task() and not images:
-        _print_banner()
+        _print_banner(rt)
         print("没有任务。用法：openthree \"你的任务\"   或   openthree -i")
         return 1
 
-    _print_banner()
+    _print_banner(rt)
     # --resume：显式把档案里最近 N 轮读回本会话（默认不读盘，从零开跑）。
     if args.resume > 0:
         loaded = rt.begin_session(resume=args.resume)
@@ -217,7 +220,7 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
                  first_images: Optional[list] = None, auto: int = 0,
                  resume: int = 0) -> int:
     _force_utf8()
-    _print_banner()
+    _print_banner(rt)
     # 交互模式 = 一个进程内会话：逐轮累积、跨轮可见，退出即忘。
     loaded = rt.begin_session(resume=resume)
     memory = ("关闭" if rt.turns == 0

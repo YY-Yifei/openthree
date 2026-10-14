@@ -1,6 +1,6 @@
 """工作区：`.openthree/` 目录的全部读写。
 
-目录结构（三生万物）：
+目录结构：
 
     .openthree/
         prompts/
@@ -16,6 +16,8 @@
                                 #   写用 context_budget、读用 context_usage，每步被重读
         limits.json             # 运行边界：每轮步数 / 最多轮数 / 生成长度 / 工具结果宽度
                                 #   写用 set_limits、读用 limits_usage，每步被重读
+        identity.json           # 身份：智能体给自己起的名字 / 格言（模型自命名）
+                                #   写用 set_identity、读用 whoami，每步被重读
         functions/              # 二：python 文件即 function
         assets/                 # 用户/工具带入的图片（按内容 sha1 去重）
         logs/                   # 可观测：模型全部工作记录
@@ -38,7 +40,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .multimodal import ImageError, is_remote, save_asset
 
@@ -47,7 +49,7 @@ DIRNAME = ".openthree"
 _SYSTEM_PROMPT_SEED = """\
 # 你是谁
 
-你是 openthree —— 一个由「道生一，一生二，二生三，三生万物」构成的智能体。
+你是 openthree —— 内核之上的一个智能体。
 
 **这份提示词是你的第一稿，不是你的枷锁。** 它只是一副骨架、一个起点；
 你完全可以、也应该在做事的过程中把它改成更像「你」的样子：
@@ -60,9 +62,13 @@ _SYSTEM_PROMPT_SEED = """\
 - **三**：ReAct 循环。你观察、思考、行动、再观察，直到任务完成。
 - **万物**：你自己写出的新 function、新提示词、新工具、新世界。
 
+**名字不是内核给你的常量。** 你最初没有名字；想清楚自己是谁时，
+用 `set_identity(name, motto=...)` 给自己起一个 —— 它会写进 `.openthree/identity.json`，
+出现在终端身份卡与工作报告上，并且在每一步的「处境」里回到你眼前。
+
 # 四条内置律
 
-1. **道生一、一生二、二生三、三生万物**：一切能力从你而来，你从循环中长出万物。
+1. **能力从你而来、在循环中长出**：一切能力从你而来，你从循环中长出万物。
 2. **能力可生长**：当现有 function 不够用时，用 `write_function` 写出新的 python 文件，
    然后用 `reload_functions` 让它立刻变成你手上的工具。这就是你的自我演化。
 3. **上下文可自管**：用 `write_user_prompt` 把目标、计划、待办写进
@@ -213,8 +219,31 @@ _LIMITS_SEED = """\
 }
 """
 
+# 身份：智能体给自己起的名字 / 格言。
+# 与 context.json / limits.json 同源：磁盘即状态、每步被重读（改一下下一步生效）。
+# 名字由模型自己用 set_identity 写；`--name` 只在首次落盘时充当人类的种子。
+DEFAULT_AGENT_NAME = "openthree"
+
+_IDENTITY_SEED = """\
+{
+  "name": null,
+  "motto": null,
+  "born_at": null,
+  "updated_at": null,
+  "renames": 0
+}
+"""
+
 
 _SESSION_SEQ = itertools.count(1)
+
+
+def _as_int(value: Any) -> int:
+    """把身份档里可能被手改坏的整数容错地读出来（坏值 → 0）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _now_stamp() -> str:
@@ -352,6 +381,16 @@ class Workspace:
         return self.dir / "limits.json"
 
     @property
+    def identity_file(self) -> Path:
+        """身份：智能体自己起的名字 / 格言 —— 「它是谁」的磁盘状态。
+
+        与 limits.json 同源：磁盘即状态、每步被重读（改一下下一步生效）。
+        由内置工具 `set_identity` 写、`whoami` 读；终端身份卡与工作报告也读它。
+        `name` 为 null = 还没有名字（内核兜底显示 DEFAULT_AGENT_NAME）。
+        """
+        return self.dir / "identity.json"
+
+    @property
     def versions_dir(self) -> Path:
         """系统提示词的历史版本——「自省」的前提是「可后悔」。
 
@@ -412,6 +451,8 @@ class Workspace:
             self.context_policy_file.write_text(_CONTEXT_SEED, encoding="utf-8")
         if force_prompts or not self.limits_file.exists():
             self.limits_file.write_text(_LIMITS_SEED, encoding="utf-8")
+        if not self.identity_file.exists():
+            self.identity_file.write_text(_IDENTITY_SEED, encoding="utf-8")
 
         self._ensure_readme()
         return self
@@ -429,6 +470,7 @@ class Workspace:
             "| `prompts/plan.md` | 长任务待办清单，模型自己维护、每一步自动注入 |\n"
             "| `context.json` | 上下文策略：预算 / 是否自动折叠；`context_budget` 写、`context_usage` 读 |\n"
             "| `limits.json` | 运行边界：每轮步数 / 最多轮数 / 生成长度 / 工具结果宽度；`set_limits` 写、`limits_usage` 读 |\n"
+            "| `identity.json` | 身份：智能体自己起的名字 / 格言；`set_identity` 写、`whoami` 读 |\n"
             "| `prompts/history/transcript.jsonl` | 对话档案：用户的完整原始输入（只增不改，`--resume` 可续读） |\n"
             "| `prompts/history/system-*.md` | 系统提示词的历史版本（`read_prompt_version` 回看、`restore_system_prompt` 回退） |\n"
             "| `functions/*.py` | 二：python 文件即 function |\n"
@@ -614,6 +656,68 @@ class Workspace:
         self.snapshot_system_prompt(reason=f"restore {restored}")
         self.write_system_prompt(text, snapshot=False)
         return restored
+
+    # ---------- 身份 ----------
+    def read_identity(self) -> Dict[str, Any]:
+        """读回身份档（名字 / 格言 / 起名与改名时间 / 改名次数）。
+
+        容错优先：文件缺失 / 损坏 / 字段类型不对，一律安静回退到默认
+        （`name` = None 表示**还没有名字**，由调用方决定兜底显示）。
+
+        Returns:
+            {name, motto, born_at, updated_at, renames}；name/motto 为 Optional[str]。
+        """
+        identity: Dict[str, Any] = {"name": None, "motto": None, "born_at": None,
+                                    "updated_at": None, "renames": 0}
+        try:
+            if self.identity_file.exists():
+                doc = json.loads(self.identity_file.read_text(encoding="utf-8") or "{}")
+                if isinstance(doc, dict):
+                    name = doc.get("name")
+                    motto = doc.get("motto")
+                    identity["name"] = str(name).strip() if name else None
+                    identity["motto"] = str(motto).strip() if motto else None
+                    for key in ("born_at", "updated_at"):
+                        val = doc.get(key)
+                        identity[key] = str(val) if val else None
+                    identity["renames"] = _as_int(doc.get("renames"))
+        except Exception:  # noqa: BLE001
+            pass
+        return identity
+
+    def write_identity(self, name: str, motto: str = "") -> Dict[str, Any]:
+        """写下智能体的名字 / 格言（`set_identity` 的落盘入口）。
+
+        与 `write_plan` 一样幂等覆写整份文件；`born_at` 只在**第一次**起名时记下，
+        `renames` 数的是改名次数（首次起名不算改名）。
+
+        Args:
+            name: 名字（调用方已做长度/控制字符校验；这里只去首尾空白）
+            motto: 格言，可为空
+
+        Returns:
+            写回后的身份档（同 read_identity）。
+        """
+        name = (name or "").strip()
+        motto = (motto or "").strip()
+        now = datetime.now().isoformat(timespec="seconds")
+        old = self.read_identity()
+        renamed = bool(old.get("name")) and old.get("name") != name
+        doc = {
+            "name": name,
+            "motto": motto or None,
+            "born_at": old.get("born_at") or now,
+            "updated_at": now,
+            "renames": _as_int(old.get("renames")) + (1 if renamed else 0),
+        }
+        self.identity_file.parent.mkdir(parents=True, exist_ok=True)
+        self.identity_file.write_text(
+            json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        return self.read_identity()
+
+    def agent_name(self) -> Optional[str]:
+        """当前名字；还没起名时返回 None（兜底由调用方决定）。"""
+        return self.read_identity().get("name")
 
     # ---------- 用户输入 ----------
     def submit(self, user_input: str, append: bool = False,

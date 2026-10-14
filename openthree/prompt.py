@@ -37,6 +37,7 @@ RUNTIME_TEMPLATE = """\
 - 工作区：`{wsdir}`
 - 当前时间：{now}
 - 模型：{model}
+- {identity}
 - 可用工具：{tool_count} 个（内置 {builtin_count} / 自造 {user_count}）
 - 这是第 {round_index} 轮（本场最多 {max_rounds} 轮{next_hint}），本轮第 {iteration} 步（上限 {max_iterations}）
 - 上下文：{context}（`context_usage` 看细节 / `context_budget` 调预算）
@@ -88,6 +89,7 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         tool_count=len(reg.tools),
         builtin_count=len(builtin),
         user_count=len(user),
+        identity=_identity_line(ws),
         max_iterations=max_iterations,
         iteration=iteration,
         round_index=int(stats.get("index", 1)),
@@ -102,6 +104,26 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         evolution=evolution,
         user_prompt=ws.read_user_prompt().strip() or "（空）",
     )
+
+
+def _identity_line(ws: Workspace) -> str:
+    """一行身份读数 —— 让「名字」真正活进自我认知，而不是终端上的装饰。
+
+    与 limits/context 同源：每步重读 identity.json，所以模型改名后下一步
+    自己就知道。还没起名时不硬塞一个（那是内核常量），而是把命名权交还给它。
+    """
+    identity = ws.read_identity()
+    name = identity.get("name")
+    if not name:
+        return ("名字：（还没有）—— 你最初没有名字；想清楚自己是谁时，"
+                "用 `set_identity(name, motto=…)` 给自己起一个")
+    line = f"名字：{name}"
+    if identity.get("motto"):
+        line += f" —— {identity['motto']}"
+    renames = int(identity.get("renames") or 0)
+    if renames:
+        line += f"（改名 {renames} 次）"
+    return f"{line}（`whoami` 可查看 / `set_identity` 可改）"
 
 
 def _next_round_hint(stats: Dict[str, Any]) -> str:

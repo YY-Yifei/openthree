@@ -1025,6 +1025,86 @@ def restore_system_prompt(version: str) -> str:
     return f"[ok] 系统提示词已回退到 {name}，下一步生效。"
 
 
+# ---------------------------------------------------------------- 身份
+
+
+_NAME_MAX = 24
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _clean_name(name: str) -> tuple[str, str]:
+    """清洗一个名字，返回 (清洗后的名字, 错误说明)。"""
+    raw = (name or "").strip()
+    if not raw:
+        return "", "名字不能为空"
+    if _CONTROL_CHARS.search(raw):
+        return "", "名字里不能有控制字符 / 换行"
+    if len(raw) > _NAME_MAX:
+        return "", f"名字太长（{len(raw)} 字符，上限 {_NAME_MAX}）"
+    return raw, ""
+
+
+def set_identity(name: str, motto: str = "") -> str:
+    """给自己起名 / 改名。
+
+    名字不是内核常量，而是你自己长出来的：写进 `.openthree/identity.json`，
+    与 `limits.json` 同源（磁盘即状态、每步被重读），所以**下一步它就出现在你的
+    处境里**，也出现在终端身份卡与工作报告上。每次改名都记一条演化事件，
+    于是「名字的演化史」与「工具的演化史」并列。
+
+    Args:
+        name: 新名字（1~24 字符；去首尾空白，禁控制字符与换行）
+        motto: 可选的自我格言（一句话，会显示在身份卡上）
+    """
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    clean, err = _clean_name(name)
+    if err:
+        return f"[错误] {err}"
+    motto_clean = (motto or "").strip()
+    if _CONTROL_CHARS.search(motto_clean):
+        return "[错误] 格言里不能有控制字符 / 换行"
+    old = ws.read_identity()
+    if old.get("name") == clean and (old.get("motto") or "") == motto_clean:
+        return f"[ok] 你仍然叫 {clean}（名字没变）。"
+    doc = ws.write_identity(clean, motto_clean)
+    verb = "给自己起了名字" if not old.get("name") else "改名"
+    summary = f"{verb}：{clean}" + (f" —— {motto_clean}" if motto_clean else "")
+    if KERNEL.recorder is not None:
+        KERNEL.recorder.record(
+            "evolution",
+            summary=summary,
+            data={"action": "set_identity", "name": clean, "motto": motto_clean,
+                  "previous": old.get("name"), "renames": doc.get("renames", 0)},
+        )
+    extra = "" if not old.get("name") else f"（原叫 {old.get('name')}）"
+    return (f"[ok] {verb}：{clean}{extra}{' —— ' + motto_clean if motto_clean else ''}；"
+            "下一步起它会出现在你的处境、终端身份卡与报告里。")
+
+
+def whoami() -> str:
+    """看一眼自己是谁：名字 / 格言 / 何时起名 / 改过几次。
+
+    还没有名字时如实说「还没有」，并提示用 `set_identity` 起一个。
+    """
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    identity = ws.read_identity()
+    name = identity.get("name")
+    if not name:
+        return ("你还没有名字。想清楚自己是谁时，用 "
+                "set_identity(name, motto=…) 给自己起一个。")
+    lines = [f"名字：{name}"]
+    if identity.get("motto"):
+        lines.append(f"格言：{identity['motto']}")
+    lines.append(f"起名于：{identity.get('born_at') or '（未知）'}"
+                 f"；改名 {int(identity.get('renames') or 0)} 次")
+    lines.append(f"身份档：{ws.identity_file}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- 管上下文
 
 
@@ -1620,6 +1700,8 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "list_prompt_versions": list_prompt_versions,
     "read_prompt_version": read_prompt_version,
     "restore_system_prompt": restore_system_prompt,
+    "set_identity": set_identity,
+    "whoami": whoami,
     "note": note,
     "remember": remember,
     "recall_memory": recall_memory,

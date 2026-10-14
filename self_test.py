@@ -190,7 +190,7 @@ def main() -> int:
     check("three-report.html 生成", report.exists(), f"{report.stat().st_size if report.exists() else 0}B")
     html = report.read_text(encoding="utf-8")
     check("报告含演化代码", "def fib" in html or "fib(n) = " in html or "write_function" in html)
-    check("报告含时间线", "timeline" in html and "三生万物" in html)
+    check("报告含时间线", "timeline" in html and "openthree" in html)
 
     # 6 配置分层：不再复用 local-llm 的 ~/.local-llm/config.yaml 兜底
     #    （空项目 + 无用户级配置时，任何一层都不该给出 api_key）

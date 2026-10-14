@@ -36,7 +36,7 @@ from .progress import Progress
 from .recorder import Recorder
 from .registry import Registry
 from .report import write_report
-from .workspace import Workspace
+from .workspace import DEFAULT_AGENT_NAME, Workspace
 
 
 class Runtime:
@@ -52,9 +52,11 @@ class Runtime:
                  context_window_tokens: Optional[int] = None,
                  heartbeat: float = 15.0,
                  turns: Optional[int] = None,
-                 max_rounds: Optional[int] = None) -> None:
+                 max_rounds: Optional[int] = None,
+                 name: Optional[str] = None) -> None:
         self.project_dir = Path(project_dir or Path.cwd()).resolve()
         self.quiet = quiet
+        self.name_arg = (name or "").strip() or None    # --name：人类给的「命名种子」
         self.max_iterations = max_iterations          # 每轮步数；None = 交给模型（limits.json）
         self.tool_result_limit = tool_result_limit    # 同上：显式才锁，否则模型可自管
         self.max_tokens = max_tokens
@@ -73,6 +75,7 @@ class Runtime:
         self._session_turns: List[Dict[str, Any]] = []
 
         self.ws = Workspace(self.project_dir).init(force_prompts=force_prompts)
+        self._seed_identity()
         self.config: LLMConfig = load_config(self.project_dir, model_override=model)
         # CLI 显式给的上下文窗口覆盖 config 里的值（config 已在 load_config 里兜过底）。
         if self._context_window_arg is not None:
@@ -113,6 +116,41 @@ class Runtime:
     def say(self, msg: str) -> None:
         if not self.quiet:
             print(msg, flush=True)
+
+    # ---------------------------------------------------------------- 身份
+    def _seed_identity(self) -> None:
+        """`--name`：把人类给的名字作为**种子**落一次盘（只作种子，不锁定）。
+
+        已经有名字时绝不覆盖 —— 名字是智能体自己长出来的，人类只是初始投喂。
+        """
+        if self.name_arg and not self.ws.read_identity().get("name"):
+            self.ws.write_identity(self.name_arg)
+
+    def agent_name(self) -> Optional[str]:
+        """当前名字；还没起名时返回 None。"""
+        return self.ws.read_identity().get("name")
+
+    def agent_label(self) -> str:
+        """展示用标签：有名字用它，没有则 `openthree（未命名）`。"""
+        return self.agent_name() or f"{DEFAULT_AGENT_NAME}（未命名）"
+
+    def _evolution_count(self) -> int:
+        """演化史条数（身份卡右栏「它长成什么样了」的硬证据）。"""
+        path = self.ws.logs_dir / "evolution.jsonl"
+        if not path.exists():
+            return 0
+        try:
+            return sum(1 for line in path.read_text(encoding="utf-8").splitlines()
+                       if line.strip())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def identity_card(self) -> str:
+        """终端身份卡：名字（它是谁） + 自造工具与演化次数（它长成什么样了）。"""
+        user_tools = len(self.registry.user_tools())
+        return (f"  {self.agent_label()}  ·  自造 {user_tools} 个工具"
+                f" · {self._evolution_count()} 次演化\n"
+                f"  工作区 {self.ws.dir}")
 
     def check(self) -> Optional[str]:
         if not self.config.usable:
@@ -338,12 +376,11 @@ class Runtime:
         self.agent.task_text = self.user_text
         KERNEL.agent = self.agent
 
-        # 「道生一」只在整场任务的开头喊一次；续轮的头部只交代「现在是第几轮」。
+        # 首轮开头报一次「手上有多少工具」；续轮只交代「现在是第几轮」。
         if first_round:
-            self.say(f"道生一  工作区 {self.ws.dir}")
-            self.say(f"一生二  {len(self.registry)} 个工具"
+            self.say(f"{len(self.registry)} 个工具"
                      f"（内置 {len(self.registry.builtins)} / 自造 {len(self.registry.user_tools())}）")
-        self.say(f"二生三  {'ReAct 循环开始' if first_round else f'第 {round_index} 轮开始'}"
+        self.say(f"{'ReAct 循环开始' if first_round else f'第 {round_index} 轮开始'}"
                  f"（每轮 ≤ {self.agent.max_iterations} 步 × 最多 {self.agent.max_rounds} 轮，"
                  f"模型 {self.config.model}）")
         if first_round and image_refs:
@@ -408,7 +445,7 @@ class Runtime:
                                      data={"error": f"{type(exc).__name__}: {exc}"})
 
         stats = doc["stats"]
-        self.say(f"三生万物 第 {self.agent.round_index} 轮完成：{stats['steps']} 步 / "
+        self.say(f"第 {self.agent.round_index} 轮完成：{stats['steps']} 步 / "
                  f"{stats['tool_calls']} 工具调用 / {stats['evolutions']} 次演化"
                  + ("（本轮撞步数上限，未收尾）" if self.agent.step_limit_hit else ""))
         self.say(f"报告 {self.ws.report_file}")
@@ -514,6 +551,9 @@ class Runtime:
         """不需要模型的一句话自省摘要。"""
         reg = self.registry
         lines = [
+            f"智能体   {self.agent_label()}"
+            + (f"（set_identity 维护；改名 {self.ws.read_identity().get('renames') or 0} 次）"
+               if self.agent_name() else "（用 set_identity 给自己起名）"),
             f"工作区   {self.ws.dir}",
             f"系统提示词 {self.ws.system_prompt_file} ({len(self.ws.read_system_prompt())} 字符)",
             f"任务     {self.ws.user_prompt_file}",

@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .workspace import Workspace
+from .workspace import DEFAULT_AGENT_NAME, Workspace
 
 KIND_STYLE = {
     "llm": ("#6366f1", "LLM"),
@@ -53,6 +53,9 @@ def build_html(ws: Workspace) -> str:
     evolution = _load_evolution(ws)
     memory = _load_memory(ws)
     funcs = _list_functions(ws)
+    identity = ws.read_identity()
+    label = identity.get("name") or f"{DEFAULT_AGENT_NAME}（未命名）"
+    motto = identity.get("motto") or ""
 
     total_events = sum(s.get("stats", {}).get("events", 0) for s in sessions)
     total_tools = sum(s.get("stats", {}).get("tool_calls", 0) for s in sessions)
@@ -60,13 +63,13 @@ def build_html(ws: Workspace) -> str:
     total_evo = sum(s.get("stats", {}).get("evolutions", 0) for s in sessions)
 
     parts: List[str] = []
-    parts.append(_head())
+    parts.append(_head(label))
 
     # 概览
     parts.append(f"""
 <section class="hero">
-  <h1>三生万物</h1>
-  <p class="sub">道生一，一生二，二生三，三生万物 —— openthree 智能体工作记录</p>
+  <h1>{_esc(label)}</h1>
+  <p class="sub">{_esc(motto) if motto else 'openthree 智能体工作记录'}</p>
   <div class="cards">
     {_card('会话', len(sessions))}
     {_card('事件', total_events)}
@@ -237,11 +240,12 @@ def _render_memory(memory: List[Dict[str, Any]]) -> str:
     return f'<section><h2>长期记忆 <span class="dim">({len(memory)})</span></h2><ol class="plain">{"".join(rows)}</ol></section>'
 
 
-def _head() -> str:
-    return """<!DOCTYPE html>
+def _head(label: str = DEFAULT_AGENT_NAME) -> str:
+    return ("""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>openthree · 三生万物</title>
+<title>__OPENTHREE_TITLE__</title>""".replace("__OPENTHREE_TITLE__", f"{_esc(label)} · openthree")
+            + """
 <style>
 :root{--bg:#0b1020;--fg:#e6e9f5;--dim:#8b93b0;--line:#232a44;--card:#141a30;}
 *{box-sizing:border-box}
@@ -281,11 +285,11 @@ pre{margin:6px 0 0;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-
 .tag{background:#6366f133;color:#a5b4fc;border-radius:5px;padding:0 6px;font-size:11px;margin-left:4px}
 .empty{color:var(--dim)}
 footer{text-align:center;color:var(--dim);padding:28px;font-size:12px}
-</style></head><body>"""
+</style></head><body>""")
 
 
 def _tail() -> str:
-    return '<footer>openthree · 道生一，一生二，二生三，三生万物</footer></body></html>'
+    return '<footer>openthree 智能体工作记录 · 由 openthree 生成</footer></body></html>'
 
 
 def write_report(ws: Workspace) -> Path:

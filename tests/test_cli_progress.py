@@ -49,7 +49,7 @@ def test_runtime_keeps_talking_during_slow_model(tmp_path, capsys):
     assert "思考中" in out                   # 调模型前有回声
     assert "已等待" in out                   # 长等待期间有心跳 —— 关键
     assert "LLM 返回" in out                 # 回来了也告诉你
-    assert "三生万物 第 1 轮完成" in out        # 收尾也交代是第几轮
+    assert "第 1 轮完成" in out               # 收尾也交代是第几轮
 
 
 def test_quiet_runtime_is_silent(tmp_path, capsys):
