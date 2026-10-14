@@ -17,29 +17,20 @@ _pubtest/
 _sdisttest/
 
 # ---------------------------------------------------------------------------
-# .openthree 工作区：演化成果入库，运行时状态不入库
+# .openthree 工作区：一律不入库
 #
-#   入库    functions/            模型自造的能力（这是项目的成果，务必入库）
-#           memory/               模型学到的经验
-#           prompts/system-prompts.md   它的自我认知
-#   不入库  config.yaml           含 api_key
-#           context.json          上下文策略（预算/自动折叠），运行时可被模型改写
-#           limits.json           运行边界（步数/生成/结果宽度），运行时可被模型改写
-#           logs/                 工作记录，每次运行都变
-#           assets/               随任务带进来的图片等资产（体积大，不入库）
-#           three-report.html     由 openthree --report 生成
-#           prompts/user-prompts.md     每次任务的任务书
-#           prompts/plan.md             长任务待办，随任务推进反复改写
-#           prompts/versions/           系统提示词的历史版本（回滚用的安全网）
-#           prompts/history/            多轮对话档案，每次任务都在长
+#   它是「用 openthree 开发 openthree」时的工作现场 —— 自举开发的产物，
+#   天然属于个人 / 运行时，而不是内核：
+#     memory/      模型自己的长期记忆（会写下内网痕迹 / 本机路径，已因此泄露过）
+#     prompts/     当前任务书 + 模型自我认知（随任务变）
+#     functions/   模型随手自造的工具
+#     logs/       工作记录（每次运行都变）
+#     assets/ three-report.html  随任务带进来的资产 / 报告
+#     config.yaml / context.json / limits.json  可能含 api_key 与运行时策略
+#
+#   仓库里应该只有**内核**（openthree/ 包 + tests + docs）；
+#   工作区的种子内容由 openthree/workspace.py 在首次运行时自动铺开（Workspace.init），
+#   新克隆的仓库跑一次就有了，无需入库。
+#   若想给仓库留一份「成果展示」，另放 examples/，不要放 .openthree/。
 # ---------------------------------------------------------------------------
-.openthree/config.yaml
-.openthree/context.json
-.openthree/limits.json
-.openthree/logs/
-.openthree/assets/
-.openthree/three-report.html
-.openthree/prompts/user-prompts.md
-.openthree/prompts/plan.md
-.openthree/prompts/versions/
-.openthree/prompts/history/
+.openthree/
