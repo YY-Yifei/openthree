@@ -18,7 +18,7 @@ pip install openthree           # 从 PyPI 安装
 
 `json_repair` 已随主依赖自动装上，用于模型返回非法 JSON 参数时自动修复。
 
-在 WSL 里部署（git 跟随更新 + 内网网关模型）：仓库内有 `docs/wsl-setup.md` 说明，
+在 WSL 里部署（git 跟随更新）：仓库内有 `docs/wsl-setup.md` 说明，
 或一键 `bash scripts/wsl-setup.sh`（需先在仓库根目录）。
 
 ## 配置

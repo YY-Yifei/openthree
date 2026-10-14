@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把一个本地 LLM 配置（内网网关模型）搬成 openthree 的用户级配置。
+"""把一份本地 LLM 配置搬成 openthree 的用户级配置。
 
 幂等：可重复执行；已存在时先备份再覆盖（内容一致则跳过）。
 用法： python3 setup_openthree_config.py
@@ -41,7 +41,7 @@ def main() -> int:
         llm["extra"] = extra
     doc = {
         "llm": llm,
-        # 内网模型的上下文窗口按默认对待；如需改，写 context_window_tokens: 128k
+        # 上下文窗口按默认对待；如需改，写 context_window_tokens: 128k
     }
     text = ("# openthree 用户级配置（由 ~/.local-llm/config.yaml 的 llm 节生成）\n"
             + yaml.safe_dump(doc, allow_unicode=True, sort_keys=False))

@@ -11,8 +11,8 @@
 | 项目 | 状态 |
 | --- | --- |
 | 包名 `openthree` 在 PyPI | 未被占用（`https://pypi.org/pypi/openthree/json` → 404），可注册 |
-| 版本 | `0.1.0`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
-| 构建 | `python -m build` ✓ 产出 `dist/openthree-0.1.0-py3-none-any.whl` + `.tar.gz` |
+| 版本 | `0.1.1`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
+| 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ PASSED |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄） |
 | 测试 | 256 passed（仓库根 + 解包后的 sdist 内各跑一遍都全绿） |
@@ -157,9 +157,18 @@ python -m twine upload dist/*
   `View at: https://pypi.org/project/openthree/0.1.0/`）。
   发布前把 README 里会原样渲染到 PyPI 页面的 `<repo>` 占位符去掉了，并**重建产物**后重传。
 - 之后从 PyPI 全新 venv 实装 `openthree` 成功，`openthree --inspect` → 31 工具就绪。
-- 遗留小事（留待 `0.1.1`）：本项目**尚未配置 git remote**，故 `pyproject.toml`
-  未加 `[project.urls]` —— PyPI 侧栏的 Project Links（Homepage/Repository）暂缺。
-  等仓库有了公开地址，补上 `[project.urls]` 再发一版即可。
+- **续**：`0.1.0` 的产物是「净化本机痕迹 / 停止追踪工作区」之前打的，事后解包复核确认
+  它带着当时 docs/README 里的**本机路径示例**（Windows 上的项目绝对路径、WSL 的挂载盘路径）
+  ——**无凭据**，但不该带。`0.1.0` 不可覆盖，处置见下一节。
+
+### 发布上线后的「撤回 / 重发」记录
+
+- **0.1.0 → 0.1.1**：0.1.0 的两个发行包（whl 的 `METADATA`、sdist 的 `README.md` /
+  `docs/wsl-setup.md` / `scripts/wsl-setup.sh`）含本机路径示例，已在 `0.1.1` 全部改为
+  通用占位（`<你的项目>`、`/mnt/...`）。0.1.0 **建议 yank**（见第 6 节），
+  `pip` 未锁版本时会自动跳过它、装到 0.1.1。
+- 注：yank 只是「不推荐」，**已发布文件无法删除**；真正让 `pip install openthree`
+  装到干净代码的办法就是发一版新的。
 
 ---
 

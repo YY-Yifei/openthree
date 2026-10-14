@@ -32,12 +32,12 @@ mkdir -p "$HOME/.local/bin"
 ln -sfn "$VENV/bin/openthree" "$HOME/.local/bin/openthree"
 echo "== 软链：$HOME/.local/bin/openthree -> $VENV/bin/openthree"
 
-# 3) 用户级模型配置（由 local-llm 生成内网网关配置）
+# 3) 用户级模型配置（从 ~/.local-llm/config.yaml 生成，可选）
 "$VENV/bin/python" "$REPO/scripts/setup_openthree_config.py"
 
 echo
 echo "== 完成。验证："
 bash -lc 'which openthree && openthree -V'
 echo
-echo "提示：请在 WSL 自己的目录（~/...）里运行 openthree，不要在 /mnt/<挂载盘> 下运行"
+echo "提示：请在 WSL 自己的目录（~/...）里运行 openthree，不要在 /mnt/... 挂载盘下运行"
 echo "     （cwd 会遮蔽 editable 安装的包导入）。"
