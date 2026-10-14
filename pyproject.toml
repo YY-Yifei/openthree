@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=68"]
+# SPDX license 表达式（PEP 639）需要 setuptools>=77，故下限随之抬高。
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +9,28 @@ version = "0.1.0"
 description = "三生万物 —— 极简 LLM Agent Harness，agent 天然自我演化"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Yang Yifei" },
+]
+keywords = [
+    "llm", "agent", "agent-harness", "openai", "react", "tool-calling",
+    "self-evolving", "ai", "chatgpt",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "openai>=1.0",
     "PyYAML>=6.0",

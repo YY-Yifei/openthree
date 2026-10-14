@@ -1,0 +1,26 @@
+# sdist 内容清单。
+#
+# setuptools 会自动收包内所有 .py、README、pyproject、LICENSE；
+# 这里补上它默认会漏掉的边角文件（最典型：tests/conftest.py），
+# 并显式排除绝不能发布的本地工作区与构建产物。
+
+include LICENSE
+include README.md
+include pyproject.toml
+include self_test.py
+
+recursive-include tests *.py
+recursive-include scripts *.py *.sh
+recursive-include docs *.md
+
+# 安全网：.openthree/ 里可能含 api_key（config.yaml），绝不入发行包
+prune .openthree
+prune .git
+prune .github
+# 构建 / 临时产物
+prune build
+prune dist
+prune _sandbox
+prune _pubvenv
+prune _pubtest
+# （__pycache__ / *.pyc / *.egg-info 由 setuptools 默认排除，无需在此重复声明）
