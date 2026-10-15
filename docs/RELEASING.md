@@ -11,11 +11,11 @@
 | 项目 | 状态 |
 | --- | --- |
 | 包名 `openthree` 在 PyPI | 未被占用（`https://pypi.org/pypi/openthree/json` → 404），可注册 |
-| 版本 | `0.1.2`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
+| 版本 | `0.1.3`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ PASSED |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄） |
-| 测试 | 256 passed（仓库根 + 解包后的 sdist 内各跑一遍都全绿） |
+| 测试 | 309 passed（仓库根 + 解包后的 sdist 内各跑一遍都全绿） |
 | 依赖 | `openai>=1.0`、`PyYAML>=6.0`、`json_repair>=0.30` |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
@@ -164,6 +164,13 @@ python -m twine upload dist/*
   ① 横幅改显示智能体自己长出来的名字（`6c7b78e`）、② 模型调用重试收敛到一层 + connect
   超时分离 + 补 500 分类（`9e67e66`）、③ 「读取用户输入」不再读到文件存储格式 / 上一次的
   输入（`beab5e1`）。`0.1.1` 无凭据/本机痕迹问题，**无需 yank**。
+- **2026-10-15**（`openthree 0.1.3`）：把「`-i` 是默认模式」与四处机制修复正式发到 PyPI（`52035f4`）——
+  ① 不带参数、且 stdin 连着终端时直接进交互模式（等价 `-i`），stdin 非终端（管道 / CI）自动退回单次，新增 `--no-interactive` 强制退回；
+  ② **P1** 纯图片输入（`:img X` + 空回车 / `--image` 不给任务）不再回落到磁盘上的旧任务；
+  ③ **P2** 交互模式退出（`:q` / EOF / Ctrl-C）在 `finally` 里 `end_session()`，不再泄漏会话记忆；
+  ④ **P3** `--auto` 只把「本次接力动过的」`plan.md` 未完成项算作还没做完，陈旧计划不再拖满轮数；
+  ⑤ **P4** `--auto` 触到轮数上限而仍有活时退出码非 0（`auto_unfinished`），CI 判得出「没做完」。
+  测试数 256 → 309。`0.1.2` 无凭据/本机痕迹问题，**无需 yank**。
 
 ### 发布上线后的「撤回 / 重发」记录
 
@@ -231,8 +238,18 @@ PyPI 上的版本不能删除，只能 *yank*（标记为“不建议使用”�
 
 - `python -m build` → 成功，**无 setuptools 弃用警告**（license 已用 SPDX 表达式 + `setuptools>=77`）
 - `python -m twine check dist/*` → **两个 PASSED**
-- 全新 venv 装 **wheel** → `import openthree` OK，`openthree --inspect` → 31 工具就绪
+- 全新 venv 装 **wheel** → `import openthree` OK，`openthree --inspect` → **33 工具**就绪
 - 全新 venv 装 **sdist**（走 PEP 517 重新构建）→ 成功
-- 解包 sdist 后在其内跑 `pytest` → **256 passed**
-- sdist 清单 56 项：含 `tests/conftest.py`、`self_test.py`、`docs/`、`scripts/`；**不含任何 `.openthree/`**
+- 解包 sdist 后在其内跑 `pytest` → **309 passed**
+- sdist 清单 **62 项**：含 `tests/conftest.py`、`self_test.py`、`docs/`、`scripts/`；**不含任何 `.openthree/`，也扫不到 `api_key` / `sk-` 形迹**
 - 依赖安装需联网（`openai`/`PyYAML`/`json_repair`）；断网时会失败，与包本身无关
+
+### 0.1.3 实跑补充（2026-10-15）
+
+- `pyproject.toml` / `openthree/__init__.py` 版本号一致（`0.1.3`）✓
+- `python -m build` → 产出 `openthree-0.1.3-py3-none-any.whl` + `.tar.gz` ✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist 62 项，**无 `.openthree/`、无 `config.yaml`、无 `api_key`/`sk-` 形迹** ✓
+- **全新 venv**（`_pubvenv013`）装 **wheel**：`import openthree` → `0.1.3`（`__file__` 指向 site-packages）、`python -m openthree --inspect` → 33 工具就绪 ✓
+- 解包 sdist 后在其内跑 `pytest` → **309 passed** ✓
+- ⚠️ **已知环境怪癖**：在 Windows 上以 `Scripts\openthree.exe`（console script 启动器）重定向 stdout 时可能零输出（`--version` / `--inspect` 均如此，**rc 仍为 0**）——**0.1.2 的 venv 同样复现**，故非本次引入；用 `python -m openthree` 一切正常。
