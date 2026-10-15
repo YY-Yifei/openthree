@@ -10,7 +10,7 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | 未被占用（`https://pypi.org/pypi/openthree/json` → 404），可注册 |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；最新 `0.1.3`，见 <https://pypi.org/project/openthree/>） |
 | 版本 | `0.1.3`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ PASSED |
@@ -171,6 +171,9 @@ python -m twine upload dist/*
   ④ **P3** `--auto` 只把「本次接力动过的」`plan.md` 未完成项算作还没做完，陈旧计划不再拖满轮数；
   ⑤ **P4** `--auto` 触到轮数上限而仍有活时退出码非 0（`auto_unfinished`），CI 判得出「没做完」。
   测试数 256 → 309。`0.1.2` 无凭据/本机痕迹问题，**无需 yank**。
+  **状态：已正式上传 PyPI**（`twine upload` 输出 `View at: https://pypi.org/project/openthree/0.1.3/`）。
+  发布后验证：PyPI JSON API 可见 `0.1.3` 与两个文件（whl 129173 B / sdist 208004 B，与本地一致）；
+  另建全新 venv 从 `https://pypi.org/simple/` 实装 `openthree==0.1.3` → `import` 报 `0.1.3`、`python -m openthree --inspect` → 33 工具就绪 ✓
 
 ### 发布上线后的「撤回 / 重发」记录
 
