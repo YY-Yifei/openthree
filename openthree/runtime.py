@@ -489,8 +489,15 @@ class Runtime:
         停下条件（任一）：计划已无 `- [ ]` 未完成项且本轮已正常收尾 / 某轮出错或被中断 /
         达到轮数上限。于是「一个长任务」会自己跑到做完，而不是跑一轮就停。
 
+        **计划未完成项只在「本次接力动过计划」时才算数**：计划是单槽位的
+        `plan.md`，上一次任务留下的陈旧 `- [ ]` 与本次任务无关，不该逼着
+        接力跑满轮数（P3）。判据是本次接力期间 `plan.md` 的文本变过没有。
+
         Returns:
-            最后一轮的会话文档，额外带 `auto_rounds` 与 `auto_answers` 两个字段。
+            最后一轮的会话文档，额外带：
+              * `auto_rounds` / `auto_answers` —— 实际轮数与逐轮结论；
+              * `auto_open_items` —— 收尾时仍属于本次接力的未完成项数；
+              * `auto_unfinished` —— 是否因**撞到轮数上限而仍有活**（CI 可据此判非 0）。
         """
         rounds = max(1, int(rounds or 1))
         # 只有人类**显式**给了 --max-rounds 才把它当硬顶；否则 --auto N 就是 N 轮
@@ -503,6 +510,13 @@ class Runtime:
             self.begin_session()
         docs: List[Dict[str, Any]] = []
         prev_summary = ""
+        # P3：陈旧计划的 `- [ ]` 不该拖满轮数。只有本次接力**动过** plan.md
+        # 时，未完成项才算「本次接力还没做完」；开局就摆在那里的旧勾选项与本次任务无关。
+        plan_at_start = self.ws.read_plan()
+        plan_touched = False
+        plan_left = 0
+        # P4：是否因撞到轮数上限而停下（此时若仍有活，就是「没做完」）。
+        hit_limit = False
         try:
             for i in range(rounds):
                 first = (i == 0)
@@ -524,27 +538,32 @@ class Runtime:
                     break
                 docs.append(doc)
                 prev_summary = doc.get("next_round_summary") or ""
+                if self.ws.read_plan() != plan_at_start:
+                    plan_touched = True          # 本次接力写过计划 → 未完成项与本任务相关
 
                 status = str(doc.get("status") or "")
                 open_items = self.ws.plan_open_items()
                 if status in ("error", "interrupted"):
                     self.say(f"[auto] 第 {i + 1} 轮 {status}，停止自动接力。")
                     break
-                # 计划还有未完成项、本轮撞了步数上限、或模型主动 next_round —— 都算「没做完」。
-                unfinished = (open_items > 0 or bool(doc.get("step_limit_hit"))
+                # 未完成项只在本次接力动过计划时才算数（否则是上一次任务的陈迹）；
+                # 本轮撞了步数上限、或模型主动 next_round —— 这两样本就说明「没做完」。
+                plan_left = open_items if plan_touched else 0
+                unfinished = (plan_left > 0 or bool(doc.get("step_limit_hit"))
                               or bool(doc.get("wants_next_round")))
                 if not unfinished:
                     self.say(f"[auto] 计划已无未完成项，收工（共 {i + 1} 轮）。")
                     break
                 if i + 1 >= rounds:
-                    why = (f"计划还剩 {open_items} 项未完成" if open_items
+                    hit_limit = True
+                    why = (f"计划还剩 {plan_left} 项未完成" if plan_left
                            else ("上一轮撞到步数上限" if doc.get("step_limit_hit")
                                  else "上一轮主动 next_round"))
                     self.say(f"[auto] 已达轮数上限 {rounds}，{why}；"
                              "再跑请加大 --auto 或用 openthree 继续。")
                     break
                 nxt = i + 2
-                why = (f"计划还有 {open_items} 项未完成" if open_items
+                why = (f"计划还有 {plan_left} 项未完成" if plan_left
                        else ("上一轮撞到步数上限" if doc.get("step_limit_hit")
                              else "上一轮主动 next_round"))
                 self.say(f"[auto] {why} → 自动开始第 {nxt} 轮")
@@ -554,10 +573,14 @@ class Runtime:
 
         if not docs:
             return {"status": "error", "answer": "[auto] 一轮都没跑起来",
-                    "auto_rounds": 0, "auto_answers": []}
+                    "auto_rounds": 0, "auto_answers": [],
+                    "auto_open_items": 0, "auto_unfinished": True}
         last = dict(docs[-1])
         last["auto_rounds"] = len(docs)
         last["auto_answers"] = [d.get("answer", "") for d in docs]
+        # P4：撞到轮数上限时仍有活 = 「没做完」；CLI 据此返回非 0 退出码。
+        last["auto_open_items"] = plan_left
+        last["auto_unfinished"] = bool(hit_limit)
         return last
 
     def report(self) -> Path:

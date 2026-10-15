@@ -1,8 +1,9 @@
 """命令行入口。
 
     openthree "你的任务"              就地初始化 .openthree/ 并开始 ReAct（单次，不读旧对话）
-    openthree                         沿用 .openthree/prompts/user-prompts.md 继续（单次）
-    openthree -i                      交互模式（进程内会话，多轮记忆）
+    openthree                         不带参数 = 进入交互模式（-i 是默认模式）
+    openthree -i                      交互模式（显式写法，与不带参数等价）
+    openthree --no-interactive        不带参数时退回「单次」：沿用磁盘上的当前任务跑一次
     openthree -i --auto 5             长任务自动推进：计划未完成就接力，最多 5 轮
     openthree --resume 4              显式把对话档案里最近 4 轮读回本会话（默认不读）
     openthree --turns 8               会话内保留最近 8 轮（默认 4，0 关闭）
@@ -10,6 +11,11 @@
     openthree --report                只重建 three-report.html
     openthree --inspect               看一眼自己当前的样子（不调模型）
     openthree --functions             列出所有工具
+
+交互模式是**默认模式**：不带任务参数、不带图片、不开 --auto，且 stdin 连着终端时，
+`openthree` 直接进 -i，不必再记那个 -i。**stdin 不是终端时**（管道 / 重定向 / CI /
+脚本，或显式 `--no-interactive`）退回旧的单次语义 —— 交互模式需要人来敲字，无人应答
+的 REPL 只会立刻 EOF、什么也不做就退出，比旧行为更糟。
 
 跨轮记忆只在**会话**里存在（`-i` / `--auto`）；单次任务从零开跑，绝不读磁盘上
 上一次的对话。对话原文仍 append 到 transcript.jsonl 作档案，想续读就用 --resume。
@@ -43,12 +49,27 @@ def _print_banner(rt: "Runtime") -> None:
     print("\n" + rt.identity_card() + "\n", flush=True)
 
 
+def _stdin_is_tty() -> bool:
+    """stdin 是否连着终端 —— 「不带参数默认进交互模式」的前提。
+
+    管道 / 重定向 / CI / pytest 下为 False：那时 REPL 会立刻 EOF、什么也不做就
+    退出，比旧的单次语义更糟，所以退回单次。任何异常一律当「不是终端」。
+    """
+    try:
+        return bool(sys.stdin is not None and sys.stdin.isatty())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="openthree",
         description="极简 LLM Agent Harness：agent 天然自我演化（命名、长工具、改提示词）",
     )
-    p.add_argument("task", nargs="*", help="任务描述；留空则沿用 .openthree/prompts/user-prompts.md")
+    p.add_argument("task", nargs="*",
+                   help="任务描述；留空则**进入交互模式**（-i 是默认模式）。"
+                        "要让「留空」退回旧的单次语义（沿用磁盘上的当前任务跑一次），"
+                        "用 --no-interactive；stdin 不是终端时自动走这条路")
     p.add_argument("-C", "--dir", default=".", help="项目目录（.openthree 会建在这里），默认当前目录")
     p.add_argument("--name", default=None, metavar="NAME",
                    help="给这个智能体起个名字：只在它**还没有名字**时作为种子落盘"
@@ -96,11 +117,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inspect", action="store_true", help="看一眼自己当前的样子")
     p.add_argument("--functions", action="store_true", help="列出当前所有工具")
     p.add_argument("-i", "--interactive", action="store_true",
-                   help="交互模式：开一个进程内会话，多轮记忆（退出即忘）")
+                   help="交互模式：开一个进程内会话，多轮记忆（退出即忘）。"
+                        "这是**默认模式** —— 不带任务参数、不带图片、不开 --auto，"
+                        "且 stdin 连着终端时直接进交互模式，无需显式写 -i")
+    p.add_argument("--no-interactive", action="store_true",
+                   help="不带任务参数时不要进交互模式：退回「单次」语义 ——"
+                        "磁盘上有当前任务就沿用并跑一次，否则只打印用法。"
+                        "脚本 / CI（stdin 不是终端）本来就会自动走这条路")
     p.add_argument("--auto", type=int, default=0, metavar="N",
-                   help="长任务自动推进：一轮收尾后若计划仍有未完成项（或撞了本轮步数上限），"
-                        "就自动接力下一轮，最多 N 轮（0 = 关闭，默认）—— 它直接决定本场 "
-                        "max_rounds。常与 -i 联用。"
+                   help="长任务自动推进：一轮收尾后若**本次接力写过的**计划仍有未完成项"
+                        "（或撞了本轮步数上限 / 模型主动 next_round），就自动接力下一轮，"
+                        "最多 N 轮（0 = 关闭，默认）—— 它直接决定本场 max_rounds。常与 -i 联用。"
+                        "只认本次接力动过的计划：上一次任务留下的陈旧勾选项不会拖着它空跑。"
+                        "触到轮数上限而仍有活时，进程退出码非 0（CI 可判「没做完」）。"
                         "注意这与单次任务自带的「撞步数上限自动续轮」不同：后者只在没跑完时续，"
                         "不看计划。")
     p.add_argument("--turns", type=int, default=4,
@@ -161,13 +190,21 @@ def main(argv=None) -> int:
     task = " ".join(args.task).strip()
     images = _collect_images(args)
 
-    if args.interactive:
+    # 不带参数 = 进交互模式（-i 是默认模式）。前提是有人在键盘边：stdin 不是终端
+    # （管道 / CI / 脚本）时 REPL 会立刻 EOF、什么也不做就退出，比旧行为更糟，
+    # 所以那种情况退回旧的单次语义。显式 -i 不受此限；--no-interactive 强制退回。
+    if (args.interactive
+            or (not args.no_interactive
+                and not task and not images
+                and args.auto <= 0 and args.resume <= 0
+                and _stdin_is_tty())):
         return _interactive(rt, task, args.append, images, auto=args.auto,
                             resume=args.resume)
 
     if not task and not rt.ws.has_task() and not images:
         _print_banner(rt)
-        print("没有任务。用法：openthree \"你的任务\"   或   openthree -i")
+        print("没有任务，也没进入交互模式（stdin 不是终端，或指定了 --no-interactive）。")
+        print("用法：openthree \"你的任务\"；在终端里直接 openthree 则进入交互模式。")
         return 1
 
     _print_banner(rt)
@@ -176,14 +213,18 @@ def main(argv=None) -> int:
         loaded = rt.begin_session(resume=args.resume)
         print(f"[会话] 已从对话档案续读最近 {args.resume} 轮"
               f"（实际载入 {loaded} 轮）\n", flush=True)
+    # 纯图片输入（只有图、没有文字任务）绝不能传 None —— None 是「沿用磁盘上的
+    # 当前任务」的信号，会把图片附加到上一次的**旧任务**上（P1）。空串才是
+    # 「本轮任务 = 看这张图」，runtime 不会去读盘。
+    user_arg = task if task else ("" if images else None)
     try:
         if args.auto > 0:
-            doc = rt.run_auto(task or None, rounds=args.auto, append=args.append,
+            doc = rt.run_auto(user_arg, rounds=args.auto, append=args.append,
                               images=images or None)
         else:
             # --resume 时调用方自带会话（读到档案即已是会话），故 session=True 归调用方；
             # 否则不给 session → run() 自带一个短命会话，供「撞步数上限自动续轮」轮间连续。
-            doc = rt.run(task or None, append=args.append, images=images or None,
+            doc = rt.run(user_arg, append=args.append, images=images or None,
                          session=args.resume > 0)
     except RuntimeError as exc:
         print(f"[错误] {exc}", file=sys.stderr)
@@ -192,7 +233,10 @@ def main(argv=None) -> int:
     print("\n" + "─" * 60)
     print(doc.get("answer", ""))
     print("─" * 60)
-    return 0 if doc.get("status") == "done" else 1
+    # --auto 跑到轮数上限却仍有活（计划未完成 / 撞步数上限）时不算成功：
+    # 退出码非 0，CI / 脚本才判得出「长任务其实没做完」（P4）。
+    unfinished = bool(doc.get("auto_unfinished")) if args.auto > 0 else False
+    return 0 if doc.get("status") == "done" and not unfinished else 1
 
 
 def _collect_images(args) -> list[str]:
@@ -235,56 +279,64 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
     print(f"对话档案：{rt.ws.transcript_file}（只增不改；记忆只在本会话内）\n")
     pending = first_task
     pending_images = list(first_images or [])
-    while True:
-        prompt = "你 ▸ " if not pending_images else f"你(+{len(pending_images)}图) ▸ "
-        try:
-            text = pending or input(prompt).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 0
-        pending = ""
-        if not text and not pending_images:
-            continue
-        if text in (":q", ":quit", ":exit"):
-            return 0
-        if text == ":r":
-            print(f"[ok] {rt.report()}")
-            continue
-        if text == ":i":
-            print(rt.self_inspect())
-            continue
-        if text == ":img" or text.startswith(":img "):
-            extra = text[len(":img"):].strip()
-            if not extra:
-                print("用法：:img <路径或URL>[,...]")
+    try:
+        while True:
+            prompt = "你 ▸ " if not pending_images else f"你(+{len(pending_images)}图) ▸ "
+            try:
+                text = pending or input(prompt).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+            pending = ""
+            if not text and not pending_images:
                 continue
-            pending_images.extend(_split_image_arg(extra))
-            print(f"[ok] 已附加 {len(pending_images)} 张图片，随下一条消息发出")
-            continue
-        images = pending_images or None
-        pending_images = []
-        try:
-            if auto > 0:
-                doc = rt.run_auto(text or None, rounds=auto, append=append,
-                                  images=images)
-                answers = doc.get("auto_answers") or []
-            else:
-                doc = rt.run(text or None, append=append, images=images, session=True)
-                answers = doc.get("round_answers") or []
-            if len(answers) > 1:
-                print("\n" + "═" * 60)
-                print(f"（本次任务跑了 {len(answers)} 轮 —— 一轮没做完就自动续了下一轮，"
-                      f"逐轮结论如下）")
-                print("═" * 60)
-                for i, a in enumerate(answers, 1):
-                    print(f"\n──── 第 {i} 轮 ────\n{a}")
-                print("═" * 60 + "\n")
+            if text in (":q", ":quit", ":exit"):
+                return 0
+            if text == ":r":
+                print(f"[ok] {rt.report()}")
                 continue
-            print("\n" + "─" * 60)
-            print(doc.get("answer", ""))
-            print("─" * 60 + "\n")
-        except RuntimeError as exc:
-            print(f"[错误] {exc}", file=sys.stderr)
+            if text == ":i":
+                print(rt.self_inspect())
+                continue
+            if text == ":img" or text.startswith(":img "):
+                extra = text[len(":img"):].strip()
+                if not extra:
+                    print("用法：:img <路径或URL>[,...]")
+                    continue
+                pending_images.extend(_split_image_arg(extra))
+                print(f"[ok] 已附加 {len(pending_images)} 张图片，随下一条消息发出")
+                continue
+            images = pending_images or None
+            pending_images = []
+            # 纯图片输入（只附图、无文字）传 ""，绝不传 None —— None 会被 runtime
+            # 当成「沿用磁盘当前任务」，把图片附到上一次的旧任务上（P1）。
+            user_arg = text if text else ""
+            try:
+                if auto > 0:
+                    doc = rt.run_auto(user_arg, rounds=auto, append=append,
+                                      images=images)
+                    answers = doc.get("auto_answers") or []
+                else:
+                    doc = rt.run(user_arg, append=append, images=images, session=True)
+                    answers = doc.get("round_answers") or []
+                if len(answers) > 1:
+                    print("\n" + "═" * 60)
+                    print(f"（本次任务跑了 {len(answers)} 轮 —— 一轮没做完就自动续了下一轮，"
+                          f"逐轮结论如下）")
+                    print("═" * 60)
+                    for i, a in enumerate(answers, 1):
+                        print(f"\n──── 第 {i} 轮 ────\n{a}")
+                    print("═" * 60 + "\n")
+                    continue
+                print("\n" + "─" * 60)
+                print(doc.get("answer", ""))
+                print("─" * 60 + "\n")
+            except RuntimeError as exc:
+                print(f"[错误] {exc}", file=sys.stderr)
+    finally:
+        # 退出（:q / EOF / Ctrl-C）也要收会话：否则同一个 Runtime 被复用（嵌入 /
+        # 测试 / 同一进程再跑单次任务）时会莫名继承本会话记忆（P2）。
+        rt.end_session()
 
 
 def _split_image_arg(raw: str) -> list:

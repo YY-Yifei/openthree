@@ -27,7 +27,8 @@ ln -sfn ~/venvs/openthree/bin/openthree ~/.local/bin/openthree
 ```bash
 cd 任意目录
 openthree "你的任务"            # 单次任务
-openthree -i                    # 交互会话（多轮）
+openthree                       # 不带参数 = 交互会话（-i 是默认模式）
+openthree -i                    # 交互会话（多轮，等价写法）
 openthree --auto 5 "长期任务"    # 最多 5 轮自动接力
 openthree --inspect             # 只看工作区/工具/预算，不调模型
 ```
