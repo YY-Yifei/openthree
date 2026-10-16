@@ -51,11 +51,11 @@ def test_run_shell_reports_exit_code():
 
 
 # ------------------------------------------------------- run_shell 超时（防挂死）
-# 回归背景：旧实现用 subprocess.run(shell=True, capture_output=True, timeout=N)。
-# Windows 下 shell=True 会起 cmd.exe，真实命令是它的「孙进程」；超时时
-# subprocess.run 只杀 cmd.exe，随后内部 communicate() 等 stdout/stderr 读到 EOF，
-# 而孙进程仍攥着管道写端 -> EOF 永不到来 -> 连同 timeout 设置一起永久挂住。
-# 实测：timeout=4 的命令会卡到 60.1s；孙进程若常驻则永久卡死。
+# 被保护的不变量：超时必须连**子孙进程**一起杀，且在管道 EOF 到不来时也不得挂住。
+# 这正是 subprocess.run(shell=True, timeout=N) 的死穴：Windows 下 shell=True 起
+# cmd.exe，真实命令是它的「孙进程」；超时时只杀 cmd.exe，随后内部 communicate()
+# 等 stdout/stderr 读到 EOF，而孙进程仍攥着管道写端 -> EOF 永不到来 -> 连同
+# timeout 设置一起永久挂住。实测：timeout=4 的命令会卡到 60.1s；孙进程常驻则永久卡死。
 
 
 def _wall(fn, *a, **kw):
@@ -73,7 +73,7 @@ def test_run_shell_timeout_returns_promptly():
 
 
 def test_run_shell_kills_grandchild():
-    """孙进程（常驻）持有输出管道：旧实现会永久挂住，必须被杀掉整棵树。"""
+    """孙进程（常驻）持有输出管道：也必须被杀掉整棵树，绝不能挂住。"""
     elapsed, out = _wall(
         run_shell, 'python -c "import time;time.sleep(3600)"', timeout=3)
     assert elapsed < 12, f"被孙进程挂住，耗时 {elapsed:.1f}s"

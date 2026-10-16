@@ -14,14 +14,14 @@
       后者是纯展示，CLI 不会因为模型思考而长时间沉默。
 
 多轮对话（会话）：
-    记忆的寿命 = **进程内会话**，由 Runtime 持有，不再每次从磁盘读回。
+    记忆的寿命 = **进程内会话**，由 Runtime 持有；磁盘上的 transcript 只是档案。
       * 单次 `openthree "任务"`：不带会话 → 从零开跑，不读任何旧对话。
       * `-i` 交互模式：开一个会话，逐轮累积、跨轮可见（`--turns N` 限制播种轮数）。
-      * `--auto` 自主接力：本次接力过程也开一个会话（或搭 `-i` 的会话），
+      * `--auto` 自主接力：接力过程也开一个会话（或搭 `-i` 的会话），
         于是长任务逐轮连贯，收尾后不残留、不影响后续单次任务。
       * `--resume`：**显式**把 transcript 档案里最近若干轮载入为本会话起点。
     每轮收尾仍把 (user, answer) 追加进 append-only 的 transcript.jsonl 作档案/可观测，
-    但它**不再被自动回读**。用户的完整原始输入因此永不丢失。
+    但它不会被自动回读 —— 读盘只发生在 `--resume`。用户的完整原始输入因此永不丢失。
 """
 from __future__ import annotations
 
@@ -233,8 +233,9 @@ class Runtime:
         """跑一次任务 —— **一次任务 = 若干轮（round），每轮是一次完整 ReAct 循环**。
 
         轮与步是两层：`max_iterations` 是**一轮**的步预算，`max_rounds` 是**整场**的
-        轮预算。于是「200 步」不再是整场任务的硬墙 —— 一轮没跑完（撞步数上限还没
-        finish，或模型主动 `next_round`）运行期会**新开一轮接着干**，由轮预算兜住成本。
+        轮预算。于是「200 步」只是**一轮**的节奏，不是整场任务的硬墙 —— 一轮没跑完
+        （撞步数上限还没 finish，或模型主动 `next_round`）运行期会**新开一轮接着干**，
+        由轮预算兜住成本。
 
         单次任务的收尾条件（任一）：模型 finish（整件事做完）/ 某轮出错或被中断 /
         达到轮预算。计划里还有未完成项但本轮已正常 finish 时，**不**自动续轮 ——
@@ -260,7 +261,7 @@ class Runtime:
 
         docs: List[Dict[str, Any]] = []
         # 本场**生效轮预算**在开头就定死，之后各轮都把这个数交给 Agent —— 于是
-        # 「模型看见的本场最多 M 轮」= 「循环真正执行的轮数」，不再有两份打架的真相。
+        # 「模型看见的本场最多 M 轮」与「循环真正执行的轮数」是同一个数。
         # 显式 rounds 优先；否则读一次生效的旋钮（--max-rounds > limits.json > 内核默认）。
         budget: int = (max(1, int(rounds)) if rounds is not None
                        else self._effective_max_rounds())
@@ -314,8 +315,7 @@ class Runtime:
                    reuse_task: bool = False) -> Dict[str, Any]:
         """跑**一轮**：建 Agent → 起 ReAct → finalize，返回本轮的会话文档。
 
-        `user_input=None` 有**两种**语义，必须显式区分（历史 bug 的根源就是它俩
-        曾被混为一谈）：
+        `user_input=None` 有**两种**语义，必须显式区分：
           * `reuse_task=True` —— 显式沿用磁盘上的「当前任务」（`openthree` 无参数续跑）；
           * `reuse_task=False` —— 本轮**没有新输入**（多轮续跑）：不读盘、不重复播种。
 
@@ -429,8 +429,7 @@ class Runtime:
         doc["next_round_summary"] = self.agent.next_round_summary
 
         # 本轮对话入档：用户的完整原始输入 append 进 transcript，永不丢失。
-        # **一次任务只入档一次**：多轮任务里同一用户输入绝不被重复写 N 次
-        # （历史 bug：续轮把上一条输入又当新的一条 append 进去）。
+        # **一次任务只入档一次**：多轮任务里同一用户输入绝不被重复写 N 次。
         # 续轮（没有新输入）只记本轮结论。
         try:
             if first_round:
@@ -478,7 +477,7 @@ class Runtime:
         实际执行 `min(rounds, 显式 max_rounds)` 轮。每轮都是一次完整的 ReAct 循环；
         轮与轮之间靠三样东西自然接续：
 
-          * 会话内的跨轮记忆（模型记得住本次接力里说过什么）；
+          * 会话内的跨轮记忆（模型记得住接力里说过什么）；
           * 每轮重新组装的 system（含模型自己维护的 plan.md 待办）；
           * 模型自己写进文件的进度（不随上下文折叠而丢失）。
 
@@ -489,14 +488,14 @@ class Runtime:
         停下条件（任一）：计划已无 `- [ ]` 未完成项且本轮已正常收尾 / 某轮出错或被中断 /
         达到轮数上限。于是「一个长任务」会自己跑到做完，而不是跑一轮就停。
 
-        **计划未完成项只在「本次接力动过计划」时才算数**：计划是单槽位的
-        `plan.md`，上一次任务留下的陈旧 `- [ ]` 与本次任务无关，不该逼着
-        接力跑满轮数（P3）。判据是本次接力期间 `plan.md` 的文本变过没有。
+        **计划未完成项只以「接力期间写过的计划」为准**：计划是单槽位的
+        `plan.md`，磁盘上残留的 `- [ ]` 未必属于这次接力，不该逼着
+        接力跑满轮数。判据是接力期间 `plan.md` 的文本变过没有。
 
         Returns:
             最后一轮的会话文档，额外带：
               * `auto_rounds` / `auto_answers` —— 实际轮数与逐轮结论；
-              * `auto_open_items` —— 收尾时仍属于本次接力的未完成项数；
+              * `auto_open_items` —— 收尾时接力写过的计划里剩余的未完成项数；
               * `auto_unfinished` —— 是否因**撞到轮数上限而仍有活**（CI 可据此判非 0）。
         """
         rounds = max(1, int(rounds or 1))
@@ -510,12 +509,12 @@ class Runtime:
             self.begin_session()
         docs: List[Dict[str, Any]] = []
         prev_summary = ""
-        # P3：陈旧计划的 `- [ ]` 不该拖满轮数。只有本次接力**动过** plan.md
-        # 时，未完成项才算「本次接力还没做完」；开局就摆在那里的旧勾选项与本次任务无关。
+        # 磁盘残留的 `- [ ]` 不该拖满轮数。只有接力**动过** plan.md
+        # 时，未完成项才算「接力还没做完」；开局就摆在那里的勾选项不属于这次接力。
         plan_at_start = self.ws.read_plan()
         plan_touched = False
         plan_left = 0
-        # P4：是否因撞到轮数上限而停下（此时若仍有活，就是「没做完」）。
+        # 是否因撞到轮数上限而停下（此时若仍有活，就是「没做完」）。
         hit_limit = False
         try:
             for i in range(rounds):
@@ -539,14 +538,14 @@ class Runtime:
                 docs.append(doc)
                 prev_summary = doc.get("next_round_summary") or ""
                 if self.ws.read_plan() != plan_at_start:
-                    plan_touched = True          # 本次接力写过计划 → 未完成项与本任务相关
+                    plan_touched = True          # 接力写过计划 → 未完成项与该任务相关
 
                 status = str(doc.get("status") or "")
                 open_items = self.ws.plan_open_items()
                 if status in ("error", "interrupted"):
                     self.say(f"[auto] 第 {i + 1} 轮 {status}，停止自动接力。")
                     break
-                # 未完成项只在本次接力动过计划时才算数（否则是上一次任务的陈迹）；
+                # 未完成项只以「接力期间写过的计划」为准（否则是磁盘上的残留）；
                 # 本轮撞了步数上限、或模型主动 next_round —— 这两样本就说明「没做完」。
                 plan_left = open_items if plan_touched else 0
                 unfinished = (plan_left > 0 or bool(doc.get("step_limit_hit"))
@@ -578,7 +577,7 @@ class Runtime:
         last = dict(docs[-1])
         last["auto_rounds"] = len(docs)
         last["auto_answers"] = [d.get("answer", "") for d in docs]
-        # P4：撞到轮数上限时仍有活 = 「没做完」；CLI 据此返回非 0 退出码。
+        # 撞到轮数上限时仍有活 = 「没做完」；CLI 据此返回非 0 退出码。
         last["auto_open_items"] = plan_left
         last["auto_unfinished"] = bool(hit_limit)
         return last

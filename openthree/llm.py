@@ -185,7 +185,7 @@ class LLM:
             kwargs["timeout"] = httpx.Timeout(
                 self.config.timeout, connect=self.config.connect_timeout)
         except Exception:  # noqa: BLE001  # pragma: no cover
-            # httpx 缺席（罕见）时退回 float，行为不比从前差
+            # httpx 缺席（罕见）时退回 float
             kwargs["timeout"] = self.config.timeout
         # 显式钉死 SDK 自带重试：默认 0，让重试只发生在 openthree 这一层。
         kwargs["max_retries"] = max(0, int(self.config.max_retries or 0))

@@ -1,6 +1,6 @@
-"""多轮记忆：记忆只活在**进程内会话**里，不再每次从磁盘读回。
+"""多轮记忆：记忆只活在**进程内会话**里，磁盘上只留档案。
 
-用户诉求的两个面：
+两条必须同时成立：
   * 用户的完整原始输入必须跨轮保留（档案层，append-only）；
   * 但**单次任务绝不自动读盘** —— 只有 `-i` / `--auto` 的会话才跨轮可见，
     想续读旧档案得用 `--resume` 显式要求。
@@ -104,7 +104,7 @@ def test_agent_seeds_explicit_turns(ws, registry):
 
 
 def test_agent_without_seed_starts_empty(ws, registry):
-    """回归：Agent 不再自动读盘 —— 没显式给轮次，历史就是空的。"""
+    """Agent 从不自动读盘 —— 没显式给轮次，历史就是空的。"""
     ws.append_turn("上一轮的旧对话", "旧回答")
     ag = _agent(ws, registry)                  # 不给 seed_turns
     assert ag.history == []                     # 磁盘有档案，但不读它
@@ -157,7 +157,7 @@ def _runtime(tmp_path, **kw):
 
 
 def test_runtime_single_run_does_not_read_transcript(tmp_path):
-    """本次诉求的直接回归：单次任务绝不去读上一次的对话。"""
+    """单次任务绝不去读磁盘上的对话档案：不读盘，从零开跑。"""
     rt = _runtime(tmp_path)
     rt.run("我叫小明，请记住")
     rt.run("我叫什么？")

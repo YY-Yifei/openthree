@@ -1,13 +1,11 @@
 """「轮」是一等概念：步/轮/会话分层、每轮独立步预算、撞上限自动续轮、next_round。
 
-用户诉求：「step 现在有上限是否合理？是否没考虑模型改完计划/prompts 后其实已是新的一轮？
-应该加上『轮』，每轮有 step 上限。」
-
-设计：
+三层定义（见 prompt.py）：
   * 步（step）= ReAct 的一次「思 → 行」；
   * 轮（round）= 一次完整 ReAct 循环 = 一个 Agent 的生命周期，**每轮独立一份步预算**；
   * 会话（session）= 进程内的多轮容器。
-回归点：单次任务撞步数上限不再「直接死」，而是在轮预算内自动续下一轮。
+
+被保护的不变量：单次任务撞步数上限**不会直接死**，而是在轮预算内自动续下一轮。
 """
 from __future__ import annotations
 
@@ -156,7 +154,7 @@ def test_rounds_arg_takes_precedence_over_knob(tmp_path):
 
 
 def test_prompt_reports_effective_round_budget(tmp_path):
-    """处境里的「本场最多 M 轮」= 运行期真正执行的轮数（不再是旋钮默认）。"""
+    """处境里的「本场最多 M 轮」= 运行期真正执行的轮数。"""
     import re
     rt = _rt(tmp_path, llm_cls=_CountRoundsLLM, max_iterations=1, max_rounds=2)
     rt.run("长任务", rounds=3)
@@ -182,7 +180,7 @@ def test_run_auto_without_explicit_max_rounds_uses_auto_n(tmp_path):
 
 
 def test_single_run_continues_round_on_step_limit(tmp_path):
-    """核心回归：单次任务撞步数上限不再直接死，而是在轮预算内自动开下一轮。"""
+    """核心不变量：单次任务撞步数上限不会直接死，而是在轮预算内自动开下一轮。"""
     rt = _rt(tmp_path, max_iterations=3, max_rounds=2)
     doc = rt.run("长任务")
     assert doc["rounds_run"] == 2                          # 续了一轮

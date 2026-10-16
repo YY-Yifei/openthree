@@ -3,7 +3,7 @@
     openthree "你的任务"              就地初始化 .openthree/ 并开始 ReAct（单次，不读旧对话）
     openthree                         不带参数 = 进入交互模式（-i 是默认模式）
     openthree -i                      交互模式（显式写法，与不带参数等价）
-    openthree --no-interactive        不带参数时退回「单次」：沿用磁盘上的当前任务跑一次
+    openthree --no-interactive        不带参数时走「单次」：沿用磁盘上的当前任务跑一次
     openthree -i --auto 5             长任务自动推进：计划未完成就接力，最多 5 轮
     openthree --resume 4              显式把对话档案里最近 4 轮读回本会话（默认不读）
     openthree --turns 8               会话内保留最近 8 轮（默认 4，0 关闭）
@@ -14,10 +14,10 @@
 
 交互模式是**默认模式**：不带任务参数、不带图片、不开 --auto，且 stdin 连着终端时，
 `openthree` 直接进 -i，不必再记那个 -i。**stdin 不是终端时**（管道 / 重定向 / CI /
-脚本，或显式 `--no-interactive`）退回旧的单次语义 —— 交互模式需要人来敲字，无人应答
-的 REPL 只会立刻 EOF、什么也不做就退出，比旧行为更糟。
+脚本，或显式 `--no-interactive`）走单次路径 —— 交互模式需要人来敲字，无人应答
+的 REPL 只会立刻 EOF、什么也不做就退出。
 
-跨轮记忆只在**会话**里存在（`-i` / `--auto`）；单次任务从零开跑，绝不读磁盘上
+跨轮记忆只在**会话**里存在（`-i` / `--auto`）；单次任务从零开跑，不读磁盘上
 上一次的对话。对话原文仍 append 到 transcript.jsonl 作档案，想续读就用 --resume。
 
 跑长任务时终端不会沉默：每一步、每次模型调用、每次工具执行都有回声，
@@ -53,7 +53,7 @@ def _stdin_is_tty() -> bool:
     """stdin 是否连着终端 —— 「不带参数默认进交互模式」的前提。
 
     管道 / 重定向 / CI / pytest 下为 False：那时 REPL 会立刻 EOF、什么也不做就
-    退出，比旧的单次语义更糟，所以退回单次。任何异常一律当「不是终端」。
+    退出，所以走单次。任何异常一律当「不是终端」。
     """
     try:
         return bool(sys.stdin is not None and sys.stdin.isatty())
@@ -68,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("task", nargs="*",
                    help="任务描述；留空则**进入交互模式**（-i 是默认模式）。"
-                        "要让「留空」退回旧的单次语义（沿用磁盘上的当前任务跑一次），"
+                        "要让「留空」走单次语义（沿用磁盘上的当前任务跑一次），"
                         "用 --no-interactive；stdin 不是终端时自动走这条路")
     p.add_argument("-C", "--dir", default=".", help="项目目录（.openthree 会建在这里），默认当前目录")
     p.add_argument("--name", default=None, metavar="NAME",
@@ -121,14 +121,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "这是**默认模式** —— 不带任务参数、不带图片、不开 --auto，"
                         "且 stdin 连着终端时直接进交互模式，无需显式写 -i")
     p.add_argument("--no-interactive", action="store_true",
-                   help="不带任务参数时不要进交互模式：退回「单次」语义 ——"
+                   help="不带任务参数时不要进交互模式：走「单次」语义 ——"
                         "磁盘上有当前任务就沿用并跑一次，否则只打印用法。"
                         "脚本 / CI（stdin 不是终端）本来就会自动走这条路")
     p.add_argument("--auto", type=int, default=0, metavar="N",
-                   help="长任务自动推进：一轮收尾后若**本次接力写过的**计划仍有未完成项"
+                   help="长任务自动推进：一轮收尾后若**接力自己写过的**计划仍有未完成项"
                         "（或撞了本轮步数上限 / 模型主动 next_round），就自动接力下一轮，"
                         "最多 N 轮（0 = 关闭，默认）—— 它直接决定本场 max_rounds。常与 -i 联用。"
-                        "只认本次接力动过的计划：上一次任务留下的陈旧勾选项不会拖着它空跑。"
+                        "未完成项只以**接力期间写过的计划**为准：磁盘上残留的勾选项不驱动接力。"
                         "触到轮数上限而仍有活时，进程退出码非 0（CI 可判「没做完」）。"
                         "注意这与单次任务自带的「撞步数上限自动续轮」不同：后者只在没跑完时续，"
                         "不看计划。")
@@ -191,8 +191,8 @@ def main(argv=None) -> int:
     images = _collect_images(args)
 
     # 不带参数 = 进交互模式（-i 是默认模式）。前提是有人在键盘边：stdin 不是终端
-    # （管道 / CI / 脚本）时 REPL 会立刻 EOF、什么也不做就退出，比旧行为更糟，
-    # 所以那种情况退回旧的单次语义。显式 -i 不受此限；--no-interactive 强制退回。
+    # （管道 / CI / 脚本）时 REPL 会立刻 EOF、什么也不做就退出，所以那种情况走单次。
+    # 显式 -i 不受此限；--no-interactive 强制走单次。
     if (args.interactive
             or (not args.no_interactive
                 and not task and not images
@@ -214,7 +214,7 @@ def main(argv=None) -> int:
         print(f"[会话] 已从对话档案续读最近 {args.resume} 轮"
               f"（实际载入 {loaded} 轮）\n", flush=True)
     # 纯图片输入（只有图、没有文字任务）绝不能传 None —— None 是「沿用磁盘上的
-    # 当前任务」的信号，会把图片附加到上一次的**旧任务**上（P1）。空串才是
+    # 当前任务」的信号，会把图片附加到磁盘上的任务上。空串才是
     # 「本轮任务 = 看这张图」，runtime 不会去读盘。
     user_arg = task if task else ("" if images else None)
     try:
@@ -234,7 +234,7 @@ def main(argv=None) -> int:
     print(doc.get("answer", ""))
     print("─" * 60)
     # --auto 跑到轮数上限却仍有活（计划未完成 / 撞步数上限）时不算成功：
-    # 退出码非 0，CI / 脚本才判得出「长任务其实没做完」（P4）。
+    # 退出码非 0，CI / 脚本才判得出「长任务其实没做完」。
     unfinished = bool(doc.get("auto_unfinished")) if args.auto > 0 else False
     return 0 if doc.get("status") == "done" and not unfinished else 1
 
@@ -309,7 +309,7 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
             images = pending_images or None
             pending_images = []
             # 纯图片输入（只附图、无文字）传 ""，绝不传 None —— None 会被 runtime
-            # 当成「沿用磁盘当前任务」，把图片附到上一次的旧任务上（P1）。
+            # 当成「沿用磁盘当前任务」，把图片附到磁盘上那条任务上。
             user_arg = text if text else ""
             try:
                 if auto > 0:
@@ -335,7 +335,7 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
                 print(f"[错误] {exc}", file=sys.stderr)
     finally:
         # 退出（:q / EOF / Ctrl-C）也要收会话：否则同一个 Runtime 被复用（嵌入 /
-        # 测试 / 同一进程再跑单次任务）时会莫名继承本会话记忆（P2）。
+        # 测试 / 同一进程再跑单次任务）时会莫名继承本会话记忆。
         rt.end_session()
 
 

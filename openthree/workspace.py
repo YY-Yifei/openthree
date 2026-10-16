@@ -555,7 +555,7 @@ class Workspace:
         """读回 user-prompts.md 的**原始 markdown**（渲染层，供自省 / read_prompts）。
 
         ⚠ 这是「给人看的那份」，包含 `# 当前任务` 头 / `_提交于 …_` 尾 / `---` 累积块。
-        **不要拿它当「用户输入」**——那正是历史 bug 的根源。要任务正文请用
+        **不要拿它当「用户输入」**——它会连存储格式一起读进来。要任务正文请用
         `current_task_text()`（读结构化真源）。
         """
         if not self.user_prompt_file.exists():

@@ -1,18 +1,17 @@
-"""回归：P1–P4 —— `-i` / `--auto` / CLI 的三处机制缺陷。
+"""`-i` / `--auto` / CLI 里四条容易被改坏的不变量。
 
-本轮修复（2026-10-15，均先经 %TEMP% 探针实证、后修）：
+本文件用 stub LLM + 临时工作区覆盖它们，不联网、不依赖真实模型。
 
-* **P1** `-i` 里 `:img X` + 空回车（只有图、没有文字）曾把 `text or None`
-  变成 `None`，而 `None` 是「沿用磁盘上的当前任务」的信号 —— 于是图片被
-  附到**上一次的旧任务**上、transcript 里同一条任务被写两次。同理
-  `openthree --image a.png`（不给任务）也踩同一坑。
-* **P2** `_interactive` 退出（`:q` / EOF / Ctrl-C）时不调 `end_session()`，
-  Runtime 被复用时会莫名继承上一会话的记忆。
-* **P3** `--auto` 只看 `plan.md` 里有没有 `- [ ]`，不区分这条计划属不属于
-  本次任务 —— 陈旧计划会把接力拖满轮数。
-* **P4** `--auto` 跑到轮数上限却仍有活时，退出码仍是 0，CI 判不出「没做完」。
-
-本文件用 stub LLM + 临时工作区覆盖这四条，不联网、不依赖真实模型。
+* **纯图片输入不落到磁盘任务上**：`-i` 里 `:img X` + 空回车（只有图、没有文字），
+  以及 `openthree --image a.png`（不给任务）—— 二者都必须把「本轮任务」当成
+  「看这张图」，而不是 `None`。`None` 是「沿用磁盘上的当前任务」的信号，
+  传错会把图片附到磁盘上那条任务上、transcript 里同一条任务被写两次。
+* **退出必收会话**：`_interactive` 退出（`:q` / EOF / Ctrl-C）时必须调 `end_session()`，
+  否则 Runtime 被复用（嵌入 / 测试 / 同一进程再跑单次任务）时会莫名继承本会话记忆。
+* **未完成项只以接力期间写过的计划为准**：`--auto` 不能只看 `plan.md` 里有没有 `- [ ]` ——
+  磁盘上残留的勾选项未必属于这次接力，不该把接力拖满轮数。
+* **没做完就非 0**：`--auto` 跑到轮数上限却仍有活时，退出码必须非 0，
+  否则 CI 判不出「没做完」。
 """
 from __future__ import annotations
 
@@ -86,34 +85,34 @@ def _fake_stdin(seq):
     return _input
 
 
-# ================================================================ P1
-def test_p1_interactive_image_only_does_not_reuse_stale_task(tmp_path, monkeypatch):
-    """`:img X` + 空回车 = 纯图片任务，绝不沿用磁盘上的旧任务。"""
+# ================================================================ 不变量 1：纯图片输入
+def test_image_only_interactive_does_not_reuse_task_on_disk(tmp_path, monkeypatch):
+    """`:img X` + 空回车 = 纯图片任务，绝不沿用磁盘上的那条任务。"""
     rt = _rt(tmp_path)
     png = tmp_path / "a.png"
     png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)
 
     monkeypatch.setattr(builtins, "input",
-                        _fake_stdin(["TASK-A: 旧任务", f":img {png}", "", ":q"]))
+                        _fake_stdin(["TASK-A: 第一条任务", f":img {png}", "", ":q"]))
     with redirect_stdout(io.StringIO()):
         cli._interactive(rt, "", False, [], auto=0, resume=0)
 
     tasks = [_task_in_system(c) for c in rt.llm.calls]
-    assert tasks[0] == "TASK-A: 旧任务"
-    # 关键：第二条（纯图）不是旧任务，而是「空任务 + 图片输入」
-    assert tasks[1] != "TASK-A: 旧任务"
+    assert tasks[0] == "TASK-A: 第一条任务"
+    # 关键：第二条（纯图）不是磁盘上那条任务，而是「空任务 + 图片输入」
+    assert tasks[1] != "TASK-A: 第一条任务"
     assert any("图片输入" in u for u in _user_texts(rt.llm.calls[1]))
 
     users = [t["user"] for t in rt.ws.read_turns(-1)]
-    assert users[0] == "TASK-A: 旧任务"
-    assert users.count("TASK-A: 旧任务") == 1          # 旧任务不再被重复入档
+    assert users[0] == "TASK-A: 第一条任务"
+    assert users.count("TASK-A: 第一条任务") == 1      # 磁盘上那条任务只入档一次
     assert users[1] == ""                              # 纯图轮记空 user + 结论
 
 
-def test_p1_cli_image_only_does_not_reuse_stale_task(tmp_path, monkeypatch):
-    """`openthree --image a.png`（不给任务）同样不得沿用旧任务。"""
+def test_image_only_cli_does_not_reuse_task_on_disk(tmp_path, monkeypatch):
+    """`openthree --image a.png`（不给任务）同样不得沿用磁盘上的任务。"""
     rt = _rt(tmp_path)
-    rt.run("STALE-TASK: 磁盘上的旧任务")               # 先落下一条旧任务
+    rt.run("STALE-TASK: 磁盘上的任务")                 # 先落一条磁盘任务
     png = tmp_path / "a.png"
     png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)
 
@@ -131,19 +130,19 @@ def test_p1_cli_image_only_does_not_reuse_stale_task(tmp_path, monkeypatch):
 
     assert code == 0
     assert calls, "模型应被调用一次"
-    assert _task_in_system(calls[-1]) != "STALE-TASK: 磁盘上的旧任务"
+    assert _task_in_system(calls[-1]) != "STALE-TASK: 磁盘上的任务"
     assert any("图片输入" in u for u in _user_texts(calls[-1]))
 
 
-def test_p1_no_arg_run_still_reuses_disk_task(tmp_path, monkeypatch):
-    """反证：`openthree --no-interactive` 无参数「沿用磁盘任务」的旧行为没被改坏。
+def test_no_arg_run_still_reuses_task_on_disk(tmp_path, monkeypatch):
+    """反证：`--no-interactive` 无参数时「沿用磁盘任务」这条路径照旧有效。
 
-    注：不带参数的 `openthree` 现在是「进交互模式」，单次沿用要走 --no-interactive
+    注：不带参数的 `openthree` 是「进交互模式」，单次沿用要走 --no-interactive
     （或 stdin 不是终端）。这里两条都显式给出，免得测试依赖 pytest 的 stdin 形态。
     """
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
     rt = _rt(tmp_path)
-    rt.run("STALE-TASK: 磁盘上的旧任务")
+    rt.run("STALE-TASK: 磁盘上的任务")
 
     calls = []
     stub = _FinishLLM(rt.config)
@@ -158,11 +157,11 @@ def test_p1_no_arg_run_still_reuses_disk_task(tmp_path, monkeypatch):
         code = cli.main(["--dir", str(tmp_path), "-q", "--no-interactive"])
 
     assert code == 0
-    assert _task_in_system(calls[-1]) == "STALE-TASK: 磁盘上的旧任务"
+    assert _task_in_system(calls[-1]) == "STALE-TASK: 磁盘上的任务"
 
 
-# ================================================================ P2
-def test_p2_interactive_quit_closes_session(tmp_path, monkeypatch):
+# ================================================================ 不变量 2：退出必收会话
+def test_interactive_quit_closes_session(tmp_path, monkeypatch):
     """`:q` 退出时必须 end_session —— 否则 Runtime 复用会继承旧会话记忆。"""
     rt = _rt(tmp_path)
     monkeypatch.setattr(builtins, "input", _fake_stdin(["第一句", ":q"]))
@@ -172,7 +171,7 @@ def test_p2_interactive_quit_closes_session(tmp_path, monkeypatch):
     assert rt._session_turns == []
 
 
-def test_p2_interactive_eof_closes_session(tmp_path, monkeypatch):
+def test_interactive_eof_closes_session(tmp_path, monkeypatch):
     """EOF 退出同理。"""
     rt = _rt(tmp_path)
     monkeypatch.setattr(builtins, "input", _fake_stdin(["第一句"]))   # 随后 EOF
@@ -182,7 +181,7 @@ def test_p2_interactive_eof_closes_session(tmp_path, monkeypatch):
     assert rt._session_turns == []
 
 
-def test_p2_no_session_leak_into_later_single_run(tmp_path, monkeypatch):
+def test_no_session_leak_into_later_single_run(tmp_path, monkeypatch):
     """会话退出后，紧接着的单次任务不该看到上一次会话的用户消息。"""
     rt = _rt(tmp_path)
     monkeypatch.setattr(builtins, "input", _fake_stdin(["上个会话的问题", ":q"]))
@@ -197,7 +196,7 @@ def test_p2_no_session_leak_into_later_single_run(tmp_path, monkeypatch):
                    for m in rt.llm.calls[-1])
 
 
-# ================================================================ P3
+# ================================================================ 不变量 3：计划归属
 class _PlanStubLLM:
     """每轮 finish；按 plans 序列写计划，用 plan 的未完成项驱动接力。"""
 
@@ -223,19 +222,19 @@ class _PlanStubLLM:
                 "raw_response": {"choices": [{"message": msg}]}, "error": None}
 
 
-def test_p3_stale_plan_does_not_force_extra_rounds(tmp_path):
-    """陈旧计划（本次接力没动过）的 `- [ ]` 不该把 --auto 拖满轮数。"""
+def test_stale_plan_does_not_force_extra_rounds(tmp_path):
+    """磁盘上残留的计划（接力期间没动过）不该把 --auto 拖满轮数。"""
     rt = _rt(tmp_path)
-    rt.ws.write_plan("# 上一次任务留下的计划\n\n- [ ] 陈旧未完成项\n")
-    rt.llm = _PlanStubLLM(rt.config, [None])          # 本次接力不碰计划
+    rt.ws.write_plan("# 与这次接力无关的计划\n\n- [ ] 残留未完成项\n")
+    rt.llm = _PlanStubLLM(rt.config, [None])          # 接力期间不碰计划
 
     doc = rt.run_auto("完全无关的新任务", rounds=3)
     assert doc["auto_rounds"] == 1                    # 只跑一轮就收工
     assert doc["auto_unfinished"] is False
 
 
-def test_p3_touched_plan_still_drives_relay(tmp_path):
-    """反证：本次接力自己写的计划，未完成项照常驱动接力。"""
+def test_touched_plan_still_drives_relay(tmp_path):
+    """反证：接力期间自己写的计划，未完成项照常驱动接力。"""
     rt = _rt(tmp_path)
     rt.llm = _PlanStubLLM(rt.config, ["- [ ] 甲\n- [ ] 乙", "- [x] 甲\n- [x] 乙"])
     doc = rt.run_auto("长任务", rounds=5)
@@ -244,7 +243,7 @@ def test_p3_touched_plan_still_drives_relay(tmp_path):
     assert doc["auto_unfinished"] is False
 
 
-# ================================================================ P4
+# ================================================================ 不变量 4：没做完就非 0
 class _NeverDoneLLM:
     """每轮都写一条永远做不完的计划 + finish。"""
 
@@ -266,7 +265,7 @@ class _NeverDoneLLM:
                 "raw_response": {"choices": [{"message": msg}]}, "error": None}
 
 
-def test_p4_run_auto_marks_unfinished_when_hitting_round_cap(tmp_path):
+def test_run_auto_marks_unfinished_when_hitting_round_cap(tmp_path):
     rt = _rt(tmp_path)
     rt.llm = _NeverDoneLLM(rt.config)
     doc = rt.run_auto("做不完的长任务", rounds=2)
@@ -275,7 +274,7 @@ def test_p4_run_auto_marks_unfinished_when_hitting_round_cap(tmp_path):
     assert doc["auto_unfinished"] is True
 
 
-def test_p4_cli_exit_code_nonzero_when_auto_unfinished(tmp_path, monkeypatch):
+def test_cli_exit_code_nonzero_when_auto_unfinished(tmp_path, monkeypatch):
     """CI 判据：--auto 没做完 → 退出码非 0。"""
     rt = _rt(tmp_path)
     rt.ws  # noqa: B018 —— 只是确保工作区就绪
@@ -289,7 +288,7 @@ def test_p4_cli_exit_code_nonzero_when_auto_unfinished(tmp_path, monkeypatch):
     assert code != 0
 
 
-def test_p4_cli_exit_code_zero_when_auto_done(tmp_path, monkeypatch):
+def test_cli_exit_code_zero_when_auto_done(tmp_path, monkeypatch):
     """反证：--auto 计划勾完正常收工 → 退出码 0。"""
     rt = _rt(tmp_path)
 

@@ -80,7 +80,7 @@ def test_step_files_written(ws):
 
 
 def test_step_files_survive_across_sessions(ws):
-    """回归：两场会话的 step/llm 原文必须各留各的，不能跨会话覆盖。"""
+    """两场会话的 step/llm 原文必须各留各的，不能跨会话覆盖。"""
     first = Recorder(ws, user_input="t1", model="m")
     first.begin_step()
     first.record("note", summary="会话一")
@@ -110,7 +110,7 @@ def test_record_llm_persists_attempts(ws):
 
 
 def test_finalize_keeps_real_status(ws):
-    """回归：真实终态必须落盘，不能被压成 running（否则事后分不清真终态与被 kill）。"""
+    """真实终态必须落盘，不能被压成 running（否则事后分不清真终态与被 kill）。"""
     for status in ("done", "unfinished", "interrupted", "error"):
         ws2 = Workspace(ws.root / status)
         rec = Recorder(ws2, user_input="t", model="m")

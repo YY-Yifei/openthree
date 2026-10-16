@@ -533,8 +533,7 @@ def run_shell(command: str, cwd: str = "", timeout: int = 60) -> str:
     """执行 shell 命令并返回输出。
 
     超时后会**连同子孙进程一起强杀**，所以绝不会因为某个后台子进程仍攥着
-    输出管道而永久挂住（旧实现 subprocess.run 的缺陷）。stdin 不继承终端，
-    交互式命令会立刻得到 EOF 而退出。
+    输出管道而永久挂住。stdin 不继承终端，交互式命令会立刻得到 EOF 而退出。
 
     Args:
         command: 要执行的命令

@@ -1,7 +1,8 @@
-"""回归：『读取用户输入』读到的是干净原文，绝不是文件的存储格式 / 上一次的输入。
+"""『读取用户输入』读到的是干净原文，绝不是文件的存储格式 / 别的输入。
 
-历史 bug（12 个 case A–L 实测）的根因：写走 `ws.submit`（干净原文 + 固定头尾），
-读走 `ws.read_user_prompt`（**整份 markdown 文件**）—— 口径不一致。修复后：
+被保护的不变量（12 个 case A–L 实测得出）：
+  * 写走 `ws.submit`（干净原文 + 固定头尾），读**不许**走 `ws.read_user_prompt`
+    （那是**整份 markdown 文件**）—— 口径必须一致。
   * `current-task.json` 是**结构化真源**（机器读），`user-prompts.md` 只是**渲染层**；
   * `_run_round` 把 `user_input=None` 的两种语义拆开（显式沿用 vs 本轮无新输入）；
   * `has_task` / `submit(append)` 用结构化判据，不靠「等待用户输入」这四个字；
@@ -66,7 +67,7 @@ def test_seed_workspace_has_no_task(ws: Workspace):
 
 # ---------------------------------------------------------------- C：结构化判据
 def test_has_task_not_fooled_by_literal_phrase(ws: Workspace):
-    """任务正文**含**『等待用户输入』四个字时，仍应被判为有任务（旧版会误判为无）。"""
+    """任务正文**含**『等待用户输入』四个字时仍应判为有任务 —— 判据是结构，不是字面。"""
     ws.submit("请处理『等待用户输入』这个字样，它是正文的一部分")
     assert ws.has_task() is True
 
@@ -126,7 +127,7 @@ def _task_in_system(rt: Runtime, idx: int = -1) -> str:
 
 
 def test_run_none_reuses_clean_text_not_markdown(tmp_path):
-    """回归 A1/B：`run(None)` 沿用任务时，读的是**干净原文**，不是整份 markdown。"""
+    """`run(None)` 沿用任务时，读的是**干净原文**，不是整份 markdown。"""
     rt = _runtime(tmp_path)
     rt.run("上一次的任务：把 README 改一下")
     rt.run(None)
@@ -137,7 +138,7 @@ def test_run_none_reuses_clean_text_not_markdown(tmp_path):
 
 
 def test_run_none_on_unfinished_round_does_not_reseed(tmp_path):
-    """回归 A2/D：多轮任务续轮时不再把上一条任务当新输入重复播种。"""
+    """多轮任务续轮时，同一用户输入只播种一次、只入档一次。"""
     import json as _json
 
     class _DripLLM:
@@ -170,7 +171,7 @@ def test_run_none_on_unfinished_round_does_not_reseed(tmp_path):
 
 
 def test_run_none_images_does_not_leak_seed_placeholder(tmp_path, png):
-    """回归 E：全新工作区只给图，模型不该把「（等待用户输入……）」当任务。"""
+    """全新工作区只给图：模型不该把「（等待用户输入……）」当任务。"""
     rt = _runtime(tmp_path)
     rt.run(None, images=[str(png)])
     task = _task_in_system(rt)
@@ -181,7 +182,7 @@ def test_run_none_images_does_not_leak_seed_placeholder(tmp_path, png):
 
 
 def test_resume_reads_clean_transcript(tmp_path):
-    """回归 A3：多轮任务写出的档案是干净的，--resume 不会再回灌脏记录。"""
+    """多轮任务写出的档案是干净的：只有用户原文，没有 markdown 存储格式。"""
     rt = _runtime(tmp_path)
     rt.run("第一件事")
     rt.run("第二件事")

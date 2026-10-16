@@ -17,20 +17,20 @@
 
 工程加固（不改变设计）：
   * 工具结果进 history 前统一截断，超长输出落盘，history 只留预览 + 路径，
-    避免同一份大输出被每步重发（见 REVIEW.md P0-3.2）。
+    避免同一份大输出被每步重发。
   * 上下文预算：超过阈值时自动把最老的若干 step 折叠成摘要，
-    不再指望模型自觉调用 compact_context（见 REVIEW.md P0-3.1）。
+    不指望模型自觉调用 compact_context。
   * 运行边界：每轮步数上限 / max_tokens / tool_result_limit / temperature / 最多轮数
     默认由内核给，但模型可用 set_limits 写进 .openthree/limits.json 自管（tick 每步
     重读）；显式启动参数与 OPENTHREE_LIMITS_LOCK 是它绕不过的两层。与「自管上下文」同源同构。
-  * finish 提交后，同批剩余 tool_calls 一律跳过（见 REVIEW.md P2-3.11）。
-  * compact_context 的区间先在现有 history 上校验，如实返回成功/失败（P1-3.8）。
-  * 进度回声：把「正在做什么」通过注入的 progress 打出去，CLI 不再长时间沉默。
-    这是纯展示层，不参与决策；不注入时走 NullProgress，行为与从前一致。
+  * finish 提交后，同批剩余 tool_calls 一律跳过。
+  * compact_context 的区间先在现有 history 上校验，如实返回成功/失败。
+  * 进度回声：把「正在做什么」通过注入的 progress 打出去，CLI 不会长时间沉默。
+    这是纯展示层，不参与决策；不注入时走 NullProgress，静默。
   * 跨轮记忆：会话里「之前几轮」由 Runtime 显式传入（seed_turns），以
     user/assistant 消息播种进 history，于是多轮会话里模型记得住用户说过什么。
     **Agent 自己不读磁盘** —— 没有会话（如单次任务）时 seed_turns 为空，
-    历史就是空的，不会莫名背上上一轮的旧对话；会话记忆只活在进程内
+    历史就是空的，不会莫名背上别的对话；会话记忆只活在进程内
     （见 runtime.begin_session / workspace.append_turn）。
     system 依然每一步重组装，播种只发生在消息层，演化机制不受影响。
 """
@@ -74,13 +74,13 @@ LIMITS_LOCK_ENV = "OPENTHREE_LIMITS_LOCK"
 
 # 「轮」的内核默认上限：一次任务最多自动接力几轮。
 #
-# 这里把「步」与「轮」两个层级分清楚（旧实现把它们混着叫「轮」，见 prompt.py）：
+# 先把「步」与「轮」两个层级分清楚（见 prompt.py）：
 #   * **步（step）** = ReAct 的一次「思 → 行」。
 #   * **轮（round）** = 一次完整的 ReAct 循环 = 一个 Agent 的生命周期。
 #     **每轮拥有独立的一份 step 预算**（新 Agent → 新 max_iterations）。
 #   * **会话（session）** = 进程内的多轮容器（-i / --auto）。
 #
-# 于是「200 步」不再是整场任务的硬墙，而是**一轮**的预算：还没做完（撞步数上限
+# 于是「200 步」只是**一轮**的预算，不是整场任务的硬墙：还没做完（撞步数上限
 # 未 finish / 模型自己调了 next_round / 计划还有未完成项）就自动开下一轮，
 # 由 max_rounds 兜住总成本（默认 3 轮 ≈ 600 步）。模型可 set_limits 改它，
 # 人类可用 --max-rounds 锁定。
@@ -169,9 +169,9 @@ class Agent:
         self._explicit_max_rounds = max_rounds
         self._limits_env = os.environ.get(LIMITS_LOCK_ENV)
         # 生成参数的「内核默认」基线：**构造时快照一次，之后只读**。
-        # 旧实现让 apply_limits 原地改 llm.config，而「默认值」又取自 llm.config，
-        # 于是模型调大一次后，跨轮（-i / --auto 复用同一个 LLM）「内核默认」就被
-        # 它自己的值污染了 —— 基线必须与「模型能改的运行时值」分开。
+        # 一旦让 apply_limits 原地改 llm.config，而「默认值」又取自 llm.config，
+        # 模型调大一次后，跨轮（-i / --auto 复用同一个 LLM）「内核默认」就会被
+        # 它自己的值污染 —— 基线必须与「模型能改的运行时值」分开。
         self._baseline_max_tokens = _as_int(
             getattr(getattr(self.llm, "config", None), "max_tokens", None), 8192, lo=1)
         self._baseline_temperature = _as_float(
@@ -183,8 +183,8 @@ class Agent:
         # 步预算（max_iterations）属于**一轮**，轮预算（max_rounds）属于**整场任务**。
         self.round_index = max(1, int(round_index))
         # 本场的**生效轮预算**：Runtime 逐轮驱动时显式传入（run 的 budget / run_auto 的
-        # rounds），此时它就是 `max_rounds`，且**整场固定**（tick 不再被 limits.json 改写）。
-        # 单独构造（测试 / 单轮）时传 None → 走旋钮默认，行为与以前一致。
+        # rounds），此时它就是 `max_rounds`，且**整场固定**（tick 不被 limits.json 改写）。
+        # 单独构造（测试 / 单轮）时传 None → 走旋钮默认。
         # 只有一个真相：`self.max_rounds` 同时进「处境轮读数」与「运行边界读数」。
         self._round_budget_fixed = round_budget is not None
         (self.max_iterations, self.tool_result_limit, self.max_tokens,
@@ -374,8 +374,8 @@ class Agent:
 
             两条铁律：
               * **基线不可写**。`base` 是构造时从 `llm.config` 快照一次的只读内核
-                默认，绝不回写 `llm.config` —— 旧实现原地改 config，又拿 config 当
-                默认值，跨轮（`-i` / `--auto` 复用同一个 LLM）就把它自己的值当成了
+                默认，绝不回写 `llm.config` —— 否则原地改 config、又拿 config 当
+                默认值，跨轮（`-i` / `--auto` 复用同一个 LLM）就会把它自己的值当成
                 「内核默认」。基准与运行时值必须分开。
               * **文件值才夹取**。`limits.json` 是模型/人能随手改的磁盘状态，坏值要
                 回退、越界要夹到合法区间，不能让循环崩、也不能把非法值直通模型。
@@ -407,7 +407,7 @@ class Agent:
         """重读「运行边界」并应用 —— 供 tick() 每步调用（改一下下一步生效）。"""
         self._reload_limits_file()
         mi, tr, mt, tp, mr = self._compute_limits()
-        # 本场轮预算一旦由 Runtime 定死（逐轮驱动），tick 不再被 limits.json 改写 ——
+        # 本场轮预算一旦由 Runtime 定死（逐轮驱动），tick 就不再用 limits.json 改写它 ——
         # 否则模型在某一轮里 set_limits(max_rounds=N) 会让「处境说的本场最多几轮」
         # 与「循环真正执行的轮数」错位（同一句话里出现两个数）。其余四个旋钮照常。
         if self._round_budget_fixed:
@@ -540,8 +540,7 @@ class Agent:
         人接着跑（`next`），也不知道这颗棋子还能走几格（`remaining`）。
 
         `max` 是本场**生效轮预算** `max_rounds`（Runtime 真正会执行的轮数），
-        与运行边界读数里的 max_rounds 是同一个数 —— 不再有两份互相打架的真相
-        （旧实现里 `--auto 5` 实际跑 5 轮、处境却常说 3 轮）。
+        与运行边界读数里的 max_rounds 是同一个数 —— 只有一份真相。
         """
         total = int(self.max_rounds)
         remaining = max(0, total - int(self.round_index))
@@ -803,7 +802,7 @@ class Agent:
     def _inject_next_round_summary(self) -> None:
         """把上一轮 `next_round(summary=…)` 的交接说明注入 history 开头（只一次）。
 
-        与跨轮播种的旧对话不同：这是**上一轮的你**留给**这一轮的你**的便条，
+        与跨轮播种的对话不同：这是**上一轮的你**留给**这一轮的你**的便条，
         不是用户说的话，所以标成 system，放在最前面 —— 让本轮一开场就知道
         「上一轮到哪了、还剩什么」。
         """
@@ -822,7 +821,7 @@ class Agent:
     def _inject_images(self) -> None:
         """把本轮的「任务文本 + 图片」作为一条 user 消息注入 history（只注入一次）。
 
-        刻意**不复用**跨轮播种的旧 user 消息：那些是历史轮次，本轮任务
+        刻意**不复用**跨轮播种的 user 消息：那些是历史轮次，本轮任务
         与它们不是同一条。注入放在 history 末尾 —— 它才是「当前这一问」。
         """
         if self._images_injected or not self.current_images:
@@ -884,7 +883,7 @@ class Agent:
         """折叠 step [start, end]：`summary` 非空则留摘要，为空则**直接丢弃**。
 
         登记后**立刻**在现有 history 上落地 —— 于是返回值说的是「真的省了多少」，
-        而不是「已登记、下一轮再看」（旧实现报成功但可能什么也没发生，见 REVIEW.md P1-3.8）。
+        而不是「已登记、留待下一步再看」。
         返回 (是否成功, 面向模型的说明)。
         """
         try:
@@ -1094,7 +1093,7 @@ def _is_truncation(result: Dict[str, Any]) -> bool:
     """判断这次 LLM 结果是不是「被 max_tokens 截断」——这是可恢复的错误。
 
     优先用 llm 层给的 error_kind（明确信号）；退回看 finish_reason / 错误文本，
-    好让 agent 在旧版 LLM 返回上也能识别。
+    好让 agent 在只带 finish_reason 的结果上也能识别。
     """
     if result.get("error_kind") == "truncated":
         return True

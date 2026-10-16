@@ -9,7 +9,7 @@
 
 整个 run() 每一步都重新组装，所以模型的自我修改下一步立即生效。
 
-「轮 / 步 / 会话」三层务必分清（旧版把它们混着叫「轮」，是歧义的源头）：
+「轮 / 步 / 会话」三层务必分清：
     * **步（step）** = ReAct 的一次「思 → 行」；一次 run() 内逐步推进。
     * **轮（round）** = 一次完整的 ReAct 循环（= 一个 Agent 的生命周期）；
       **每轮有独立的一份步数预算**，撞上限就由运行期决定是否开下一轮。
@@ -140,8 +140,7 @@ def _next_round_hint(stats: Dict[str, Any]) -> str:
 def _context_line(stats: Optional[Dict[str, Any]], fold_range: str = "") -> str:
     """一行上下文用量读数 —— 让模型每轮都知道「我在用多少、还能折哪段」。
 
-    有 stats（Agent 正常提供）就按真实用量拼；没有（老调用/测试）就退回到
-    只用 fold_range，保持向后兼容。
+    有 stats（Agent 正常提供）就按真实用量拼；没有 stats 时只报 fold_range。
     """
     if not stats:
         return (f"可折叠 step 范围 {fold_range or '（暂无）'}"
@@ -162,7 +161,7 @@ def _context_line(stats: Optional[Dict[str, Any]], fold_range: str = "") -> str:
 def _limits_line(stats: Optional[Dict[str, Any]], max_iterations: int) -> str:
     """一行运行边界读数 —— 让模型每轮都知道「能走多远、生成多长、结果留多宽」。
 
-    有 stats（Agent 正常提供）就按真实值拼；没有（老调用/测试）就退回到只报步数上限。
+    有 stats（Agent 正常提供）就按真实值拼；没有 stats 时只报步数上限。
     """
     if not stats:
         return f"步数上限 {max_iterations}"

@@ -4,7 +4,7 @@
 
     * 这是**纯展示层**，不含任何决策逻辑，不参与 ReAct，不影响回答质量。
     * Agent 只调用注入进来的 progress 对象，它并不认识「终端 / print」。
-    * 不传 progress 时，Agent 行为与以前逐字节一致（走 NullProgress）。
+    * 不传 progress 时，Agent 走 NullProgress，行为完全一致。
 
 为什么需要它：一次 LLM 调用可能几十秒到几分钟，一次 run_shell 可能几十秒，
 而 openthree 在开跑前说过三句话之后就彻底沉默了 —— 用户无法区分

@@ -162,7 +162,7 @@ def test_attempts_reported_on_success_and_failure():
 
 
 def test_retryable_covers_500_and_guards_against_number_substrings():
-    """修复点：5xx 的 "500" 要认；但不能把 "5000 tokens" 这类数字误判成 5xx。"""
+    """5xx 的 "500" 要认；但不能把 "5000 tokens" 这类数字误判成 5xx。"""
     for status in ("408", "409", "429", "500", "502", "503", "504"):
         assert _retryable(RuntimeError(f"Error code: {status} - boom")), status
     # 词边界：数字里嵌着的 500 不算
@@ -171,7 +171,7 @@ def test_retryable_covers_500_and_guards_against_number_substrings():
 
 
 def test_client_timeout_is_split_and_sdk_retry_disabled():
-    """修复点：connect 超时必须单独短，且 SDK 传输层重试显式关闭（默认 0）。"""
+    """connect 超时必须单独短，且 SDK 传输层重试显式关闭（默认 0）。"""
     llm = LLM(LLMConfig(api_key="k", base_url="http://test/v1",
                         timeout=600.0, connect_timeout=5.0, max_retries=0))
     client = llm._ensure_client()

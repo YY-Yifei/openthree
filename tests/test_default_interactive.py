@@ -1,13 +1,11 @@
 """`-i` 是默认模式 —— 不带参数在终端里直接进交互模式。
 
-设计（2026-10-15）：
-
 * **默认进交互**：不带任务参数、不带图片、不开 `--auto`、不 `--resume`，
   且 `stdin` 连着终端（`_stdin_is_tty()`）→ `openthree` 等价于 `openthree -i`。
-* **非终端退回单次**：管道 / 重定向 / CI / pytest（`isatty()` 为假）下，REPL 会
-  立刻 EOF、什么也不做就退出，比旧的单次语义更糟 —— 所以退回旧路径。
-* **显式 `-i` 不受此限**：任何时候写 `-i` 都进交互（旧的行为一点没变）。
-* **`--no-interactive`**：不带参数时强制退回单次（沿用磁盘上的当前任务跑一次）。
+* **非终端走单次**：管道 / 重定向 / CI / pytest（`isatty()` 为假）下，REPL 会
+  立刻 EOF、什么也不做就退出 —— 所以走单次路径。
+* **显式 `-i` 不受此限**：任何时候写 `-i` 都进交互。
+* **`--no-interactive`**：不带参数时强制走单次（沿用磁盘上的当前任务跑一次）。
 * **`--resume N`（无任务）不劫持**：它是「单次跑 + 读回档案」的文档化路径，
   要交互式续读请写 `-i --resume N`。
 * **有任务 / 有图片 / 有 `--auto` 一律是单次路径**，不进交互。
@@ -115,10 +113,10 @@ def test_default_no_args_runs_task_inside_interactive(tmp_path, monkeypatch, stu
     assert _task_in_system(stub_llm[0].calls[-1]) == "交互里的第一句"
 
 
-# ------------------------------------------------ 2) 非终端 / 显式退回 = 单次
+# ------------------------------------------------ 2) 非终端 / 显式 --no-interactive = 单次
 def test_non_tty_falls_back_to_single_run(tmp_path, monkeypatch, stub_llm):
-    """stdin 不是终端（管道 / CI）：退回单次，沿用磁盘上的当前任务。"""
-    _rt(tmp_path).run("磁盘上的旧任务")
+    """stdin 不是终端（管道 / CI）：走单次，沿用磁盘上的当前任务。"""
+    _rt(tmp_path).run("磁盘上的任务")
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
     monkeypatch.setattr(builtins, "input", _no_input_allowed)
 
@@ -127,12 +125,12 @@ def test_non_tty_falls_back_to_single_run(tmp_path, monkeypatch, stub_llm):
         code = cli.main(["--dir", str(tmp_path), "-q"])
     assert code == 0
     assert "交互模式。" not in out.getvalue()
-    assert _task_in_system(stub_llm[-1].calls[-1]) == "磁盘上的旧任务"
+    assert _task_in_system(stub_llm[-1].calls[-1]) == "磁盘上的任务"
 
 
 def test_no_interactive_flag_forces_single_run_even_on_tty(tmp_path, monkeypatch, stub_llm):
-    """`--no-interactive`：即使在终端里也不进交互，退回单次沿用磁盘任务。"""
-    _rt(tmp_path).run("磁盘上的旧任务")
+    """`--no-interactive`：即使在终端里也不进交互，走单次沿用磁盘任务。"""
+    _rt(tmp_path).run("磁盘上的任务")
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
     monkeypatch.setattr(builtins, "input", _no_input_allowed)
 
@@ -141,11 +139,11 @@ def test_no_interactive_flag_forces_single_run_even_on_tty(tmp_path, monkeypatch
         code = cli.main(["--dir", str(tmp_path), "-q", "--no-interactive"])
     assert code == 0
     assert "交互模式。" not in out.getvalue()
-    assert _task_in_system(stub_llm[-1].calls[-1]) == "磁盘上的旧任务"
+    assert _task_in_system(stub_llm[-1].calls[-1]) == "磁盘上的任务"
 
 
 def test_explicit_i_still_works_without_tty(tmp_path, monkeypatch, stub_llm):
-    """反证：显式 `-i` 不受「非终端」限制 —— 旧行为一点没变。"""
+    """反证：显式 `-i` 不受「非终端」限制，任何时候都进交互。"""
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
     monkeypatch.setattr(builtins, "input", _fake_stdin([":q"]))
     out = io.StringIO()
@@ -182,7 +180,7 @@ def test_auto_without_task_never_enters_interactive(tmp_path, monkeypatch, stub_
 
 def test_resume_without_task_stays_single_run(tmp_path, monkeypatch, stub_llm):
     """`--resume N`（无任务）保持文档化语义：单次跑 + 读回档案，不被劫持成交互。"""
-    _rt(tmp_path).run("磁盘上的旧任务")
+    _rt(tmp_path).run("磁盘上的任务")
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
     monkeypatch.setattr(builtins, "input", _no_input_allowed)
     out = io.StringIO()

@@ -47,7 +47,7 @@ def test_tick_reacts_to_limits_file(make_agent):
     assert ag.tool_result_limit == 99
     assert ag.max_tokens == 1234
     assert ag.temperature == 0.7
-    # 生成参数不再去改 llm.config（原地改会跨轮污染「内核默认」，见 #1），
+    # 生成参数不去改 llm.config（原地改会跨轮污染「内核默认」），
     # 而是按调用传进 llm.chat(...)；配置基线保持原样。
     assert ag.llm.config.max_tokens == 8192
     assert ag.llm.config.temperature == 0.3
@@ -87,7 +87,7 @@ def test_set_limits_writes_and_applies(make_agent):
     assert ag.tool_result_limit == 123 and ag.temperature == 0.1
     data = json.loads(ag.ws.limits_file.read_text(encoding="utf-8"))
     assert data["tool_result_limit"] == 123 and data["temperature"] == 0.1
-    # 配置基线不被改写（生成参数按调用传入，见 #1 的跨轮污染修复）
+    # 配置基线不被改写（生成参数按调用传入）
     assert ag.llm.config.temperature == 0.3
 
 
@@ -121,7 +121,7 @@ def test_broken_limits_file_does_not_crash(make_agent):
     ag = make_agent()
     _write(ag.ws, max_iterations="many", max_tokens="abc",
            tool_result_limit=[1, 2], temperature="hot")
-    ag.tick()                                           # 旧实现这里会抛 ValueError
+    ag.tick()                                           # 不许因坏值抛异常
     assert ag.max_iterations == 200                     # 坏值回退内核默认
     assert ag.max_tokens == 8192
     assert ag.tool_result_limit == 4000
