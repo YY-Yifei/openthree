@@ -44,7 +44,7 @@ class LLMConfig:
     api_key: str = ""
     base_url: str = ""
     model: str = DEFAULT_MODEL
-    max_tokens: int = 8192
+    max_tokens: int = 32768
     # 模型上下文窗口（token）。上下文预算的默认值的来源。
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     temperature: float = 0.3
@@ -148,7 +148,7 @@ def load_config(project_dir: Optional[Path] = None, model_override: Optional[str
         api_key=str(merged.get("api_key", "") or ""),
         base_url=str(merged.get("base_url", "") or ""),
         model=str(model_override or merged.get("model") or DEFAULT_MODEL),
-        max_tokens=int(parse_token_count(merged.get("max_tokens")) or 8192),
+        max_tokens=int(parse_token_count(merged.get("max_tokens")) or 32768),
         context_window_tokens=int(window),
         temperature=float(merged.get("temperature", 0.3) or 0.3),
         timeout=float(merged.get("timeout", 600) or 600),

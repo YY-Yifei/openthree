@@ -133,6 +133,22 @@ def test_config_default_context_window_is_1m():
     assert LLMConfig().context_window_tokens == 1_000_000
 
 
+def test_config_default_max_tokens():
+    """内核默认生成上限：配置缺省时 `LLMConfig` 与 `load_config` 都给这个值。"""
+    assert LLMConfig().max_tokens == 32768
+
+
+def test_load_config_falls_back_to_default_max_tokens(tmp_path, monkeypatch):
+    """没有任何一层给出 max_tokens 时，`load_config` 回落内核默认（而非 0/None）。"""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    (tmp_path / ".openthree").mkdir()
+    (tmp_path / ".openthree" / "config.yaml").write_text(
+        "llm:\n  api_key: k\n  base_url: u\n", encoding="utf-8")
+    cfg = load_config(tmp_path)
+    assert cfg.max_tokens == LLMConfig().max_tokens
+
+
 def test_config_reads_context_window(tmp_path):
     (tmp_path / ".openthree").mkdir()
     (tmp_path / ".openthree" / "config.yaml").write_text(

@@ -32,7 +32,7 @@ def test_agent_defaults_when_file_null(make_agent):
     ag = make_agent()
     assert ag.max_iterations == 200
     assert ag.tool_result_limit == 4000
-    assert ag.max_tokens == 8192                        # 来自 LLMConfig 默认
+    assert ag.max_tokens == 32768                       # 来自 LLMConfig 默认
     assert ag.temperature == 0.3
     assert ag.limits_stats()["source"]["max_iterations"] == "内核默认"
 
@@ -49,7 +49,7 @@ def test_tick_reacts_to_limits_file(make_agent):
     assert ag.temperature == 0.7
     # 生成参数不去改 llm.config（原地改会跨轮污染「内核默认」），
     # 而是按调用传进 llm.chat(...)；配置基线保持原样。
-    assert ag.llm.config.max_tokens == 8192
+    assert ag.llm.config.max_tokens == 32768
     assert ag.llm.config.temperature == 0.3
     assert ag.limits_stats()["source"]["max_tokens"] == "模型自管"
 
@@ -123,7 +123,7 @@ def test_broken_limits_file_does_not_crash(make_agent):
            tool_result_limit=[1, 2], temperature="hot")
     ag.tick()                                           # 不许因坏值抛异常
     assert ag.max_iterations == 200                     # 坏值回退内核默认
-    assert ag.max_tokens == 8192
+    assert ag.max_tokens == 32768
     assert ag.tool_result_limit == 4000
     assert ag.temperature == 0.3
     # 来源标签也如实：实际走的是内核默认，不谎称「模型自管」
@@ -146,15 +146,15 @@ def test_limits_file_values_are_clamped(make_agent):
 
 def test_generation_limits_do_not_pollute_kernel_default(make_agent):
     """#1：模型调大生成上限后，跨轮/复原都不该污染「内核默认」（config 基线）。"""
-    ag = make_agent()                                   # 配置基线 = 8192 / 0.3
+    ag = make_agent()                                   # 配置基线 = 32768 / 0.3
     ag.set_limits(max_tokens=100000, temperature=1.7)
     # 生成参数只落在运行时值与文件上，不改 llm.config
-    assert ag.llm.config.max_tokens == 8192
+    assert ag.llm.config.max_tokens == 32768
     assert ag.llm.config.temperature == 0.3
     # 把文件复原为 null（等于「回到内核默认」）——必须真的回到基线，而非残留
     _write(ag.ws)
     ag.tick()
-    assert ag.max_tokens == 8192 and ag.temperature == 0.3
+    assert ag.max_tokens == 32768 and ag.temperature == 0.3
     assert ag.limits_stats()["source"]["max_tokens"] == "内核默认"
 
 

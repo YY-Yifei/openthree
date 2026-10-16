@@ -173,7 +173,7 @@ class Agent:
         # 模型调大一次后，跨轮（-i / --auto 复用同一个 LLM）「内核默认」就会被
         # 它自己的值污染 —— 基线必须与「模型能改的运行时值」分开。
         self._baseline_max_tokens = _as_int(
-            getattr(getattr(self.llm, "config", None), "max_tokens", None), 8192, lo=1)
+            getattr(getattr(self.llm, "config", None), "max_tokens", None), 32768, lo=1)
         self._baseline_temperature = _as_float(
             getattr(getattr(self.llm, "config", None), "temperature", None),
             0.3, lo=0.0, hi=2.0)

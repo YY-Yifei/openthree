@@ -36,7 +36,7 @@ llm:
   api_key: sk-xxx
   base_url: https://api.deepseek.com
   model: deepseek-v4.1-flash
-  max_tokens: 8192
+  max_tokens: 32768
   context_window_tokens: 128k   # 上下文窗口，决定自动折叠预算；可写 1M/128k/1000000，缺省 1M
 ```
 
@@ -274,7 +274,7 @@ openthree --no-auto-fold "这个任务我自己管上下文"   # 彻底冻结内
   写下边界。**改一下，下一步就生效** —— 一轮的步数不够就调 `max_iterations`、整场轮数不够就调
   `max_rounds`（它们对应「一轮」与「整场」两个层级）；输出被 `max_tokens` 截断就自己调大，
   不必等谁来改配置文件。
-- **内核默认只是起点**：`max_iterations=200`、`max_rounds=3`、`max_tokens=8192`、
+- **内核默认只是起点**：`max_iterations=200`、`max_rounds=3`、`max_tokens=32768`、
   `tool_result_limit=4000` 都是**默认值**，不是天花板。模型改了 `limits.json`，
   下一步 `run()` 开头就应用。
 
