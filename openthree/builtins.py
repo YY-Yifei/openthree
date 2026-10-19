@@ -535,6 +535,11 @@ def run_shell(command: str, cwd: str = "", timeout: int = 60) -> str:
     超时后会**连同子孙进程一起强杀**，所以绝不会因为某个后台子进程仍攥着
     输出管道而永久挂住。stdin 不继承终端，交互式命令会立刻得到 EOF 而退出。
 
+    最坏阻塞时长是 `timeout + 15s`（强杀进程树 ≤10s，管道收尾宽限 5s）。
+    越过这条线的唯一形态是「管道写端被一个已脱离的孙进程攥住」：此时直接
+    子进程已无可杀的 PID，EOF 永不到来 —— 函数放弃读取并立刻返回，报
+    「输出管道未能收尾」，而不是停在原地等。
+
     Args:
         command: 要执行的命令
         cwd: 工作目录（默认当前目录）
@@ -563,15 +568,16 @@ def run_shell(command: str, cwd: str = "", timeout: int = 60) -> str:
         try:
             out_b, err_b = proc.communicate(timeout=_KILL_GRACE)
         except subprocess.TimeoutExpired:
-            # 极端兜底：仍有进程攥着管道。放弃读取、立刻返回，绝不无限等待。
+            # 极端兜底：管道 EOF 等不到 —— 写端攥在一个**脱离的孙进程**手里
+            # （它继承了 stdout/stderr，而直接子进程已退出、没有 PID 可杀）。
+            # 此刻唯一正确的动作是**放弃读取、立刻返回**。
+            #
+            # 绝不在这里 close() 那两个管道对象：communicate() 起的读线程正阻塞
+            # 在同一个缓冲区上，close() 要先拿到同一把锁 —— 会和读线程互锁，把
+            # 「超时兜底」变成永久挂死（实测）。读线程是 daemon，随本进程退出即
+            # 消失，那两根管道一并交还操作系统，不必在这里收。
             stream_cut = True
             out_b, err_b = b"", b""
-            for stream in (proc.stdout, proc.stderr):
-                try:
-                    if stream is not None:
-                        stream.close()
-                except Exception:  # noqa: BLE001
-                    pass
     except Exception as exc:  # noqa: BLE001
         _kill_tree(proc)
         return f"[错误] 执行失败: {type(exc).__name__}: {exc}"

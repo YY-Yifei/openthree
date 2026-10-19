@@ -99,6 +99,30 @@ def test_run_shell_clamps_huge_timeout():
     assert _SHELL_TIMEOUT_MAX == 3600
 
 
+def test_run_shell_survives_orphan_holding_pipe(tmp_path):
+    """孙进程攥着管道而直接子进程已退出时，也必须按时返回、不得挂死。
+
+    被保护的不变量：**超时兜底路径本身不得二次阻塞**。危险形态是：命令自己
+    先退出，把一个继承了 stdout/stderr 的孤儿孙进程留下 —— 于是直接子进程
+    已死（没有 PID 可杀，`_kill_tree` 只能报 already-exited），而管道写端仍被
+    攥着，EOF 永不到来。此刻若去 `close()` 那两个管道对象，就会和
+    `communicate()` 里正阻塞在读上的 daemon 读线程抢同一把缓冲区锁而互锁，
+    把「超时」变成永久挂死。正确做法是放弃读取、立刻返回。
+    """
+    spawner = tmp_path / "orphan_spawner.py"
+    spawner.write_text(
+        "import subprocess, sys\n"
+        "# 孙进程继承本进程的 stdout/stderr（即 run_shell 给的那根管道）。\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3600)'],\n"
+        "                     close_fds=False)\n"
+        "print(p.pid, flush=True)\n",
+        encoding="utf-8",
+    )
+    elapsed, out = _wall(run_shell, 'python "%s"' % spawner, timeout=3)
+    assert elapsed < 20, f"孤儿孙进程把超时兜底拖成了挂死，耗时 {elapsed:.1f}s"
+    assert "超时" in out
+
+
 # ---------------------------------------------------------------- write_function
 def test_write_function_rejects_bad_syntax(make_agent, ws):
     from openthree.builtins import write_function
