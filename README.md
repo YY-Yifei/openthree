@@ -125,7 +125,7 @@ def screenshot(url: str) -> ImageResult:
   工作区 <你的项目>\.openthree
 
 36 个工具（内置 33 / 自造 3）
-ReAct 循环开始（每轮 ≤ 200 步 × 最多 3 轮，模型 deepseek-v4.1-flash）
+ReAct 循环开始（每轮 ≤ 200 步 × 最多 10 轮，模型 deepseek-v4.1-flash）
        每 15s 打一次心跳，长任务不会看起来卡死
 
 [step 3/200]
@@ -197,7 +197,7 @@ def pdf_to_text(path: str, pages: str = "") -> str:
 
 于是「200 步」是**一轮**的预算，不是整场任务的硬墙：一轮撞到步数上限还没做完，
 运行期会**自动开下一轮接着干**（每轮拿一份独立的步预算），整场由 `max_rounds` 兜住成本
-（默认 3 轮 ≈ 600 步）。模型也可以主动 `next_round(summary=…)` 说「这一轮先到这，
+（默认 10 轮 ≈ 2000 步）。模型也可以主动 `next_round(summary=…)` 说「这一轮先到这，
 剩下的下一轮做」。这条路径**单次任务就生效**，不必先学 `--auto`。**处境里写的
 「本场最多 M 轮」就是运行期真正会执行的轮数**（`--auto N` 时 M=N，显式 `--max-rounds`
 更低时取小者）—— 只有一份数字：
@@ -205,7 +205,7 @@ def pdf_to_text(path: str, pages: str = "") -> str:
 ```bash
 openthree "把项目里的重复代码抽干净"
 # [step 200/200] …… （本轮没跑完）
-# [轮] 第 1 轮未跑完（3 轮预算内）→ 自动开始第 2 轮
+# [轮] 第 1 轮未跑完（10 轮预算内）→ 自动开始第 2 轮
 # ...
 ```
 
@@ -274,7 +274,7 @@ openthree --no-auto-fold "这个任务我自己管上下文"   # 彻底冻结内
   写下边界。**改一下，下一步就生效** —— 一轮的步数不够就调 `max_iterations`、整场轮数不够就调
   `max_rounds`（它们对应「一轮」与「整场」两个层级）；输出被 `max_tokens` 截断就自己调大，
   不必等谁来改配置文件。
-- **内核默认只是起点**：`max_iterations=200`、`max_rounds=3`、`max_tokens=32768`、
+- **内核默认只是起点**：`max_iterations=200`、`max_rounds=10`、`max_tokens=32768`、
   `tool_result_limit=4000` 都是**默认值**，不是天花板。模型改了 `limits.json`，
   下一步 `run()` 开头就应用。
 

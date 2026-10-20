@@ -87,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "整场轮数由 --max-rounds 兜住")
     p.add_argument("--max-rounds", type=int, default=None,
                    help="一次任务最多跑几轮（每轮一次完整 ReAct 循环，各自有 --max-iterations 步预算）；"
-                        "显式给出即锁定，不传则由 .openthree/limits.json / 内核默认 3 决定，"
+                        "显式给出即锁定，不传则由 .openthree/limits.json / 内核默认 10 决定，"
                         "模型运行期可用 set_limits(max_rounds=…) 改它。"
                         "这是「整场最多几轮」，与 --auto N 说的是同一件事（同时给就取较小者）")
     p.add_argument("--context-window", default=None,

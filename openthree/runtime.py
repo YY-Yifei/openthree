@@ -61,7 +61,7 @@ class Runtime:
         self.tool_result_limit = tool_result_limit    # 同上：显式才锁，否则模型可自管
         self.max_tokens = max_tokens
         self.temperature = temperature
-        # 整场最多几轮（每轮一次完整 ReAct）；None = 交给模型（limits.json），内核默认 3。
+        # 整场最多几轮（每轮一次完整 ReAct）；None = 交给模型（limits.json），内核默认 10。
         self.max_rounds = max_rounds
         # 先记住是否显式给了预算/窗口，等 config 读出来后再统一解析。
         self._context_budget_arg = context_budget_chars

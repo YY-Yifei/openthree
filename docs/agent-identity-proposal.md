@@ -77,7 +77,7 @@ def set_identity(name: str, motto: str = "") -> str:
 
 道生一  工作区 &lt;你的项目&gt;\.openthree
 一生二  34 个工具（内置 31 / 自造 3）
-二生三  ReAct 循环开始（每轮 ≤ 200 步 × 最多 3 轮，模型 deepseek-v4.1-flash）
+二生三  ReAct 循环开始（每轮 ≤ 200 步 × 最多 10 轮，模型 deepseek-v4.1-flash）
        每 15s 打一次心跳，长任务不会看起来卡死
 [step 3/200] …
 三生万物 第 1 轮完成：4 步 / 4 工具调用 / 2 次演化
@@ -91,7 +91,7 @@ def set_identity(name: str, motto: str = "") -> str:
   工作区 &lt;你的项目&gt;\.openthree
 
 34 个工具（内置 31 / 自造 3）
-ReAct 循环开始（每轮 ≤ 200 步 × 最多 3 轮，模型 deepseek-v4.1-flash）
+ReAct 循环开始（每轮 ≤ 200 步 × 最多 10 轮，模型 deepseek-v4.1-flash）
        每 15s 打一次心跳，长任务不会看起来卡死
 [step 3/200] …
 第 1 轮完成：4 步 / 4 工具调用 / 2 次演化

@@ -65,8 +65,8 @@ def _rt(tmp_path, llm_cls=_NeverFinishLLM, **kw) -> Runtime:
 # ---------------------------------------------------------------- 边界读数
 def test_max_rounds_default_and_source(make_agent):
     ag = make_agent()
-    assert ag.max_rounds == DEFAULT_MAX_ROUNDS == 3
-    assert ag.limits_stats()["max_rounds"] == 3
+    assert ag.max_rounds == DEFAULT_MAX_ROUNDS == 10
+    assert ag.limits_stats()["max_rounds"] == 10
     assert ag.limits_stats()["source"]["max_rounds"] == "内核默认"
 
 
@@ -172,7 +172,7 @@ def test_run_auto_min_with_explicit_max_rounds(tmp_path):
 
 
 def test_run_auto_without_explicit_max_rounds_uses_auto_n(tmp_path):
-    """默认旋钮（非显式）不该悄悄把 `--auto 5` 截成 3。"""
+    """默认旋钮（非显式）不该悄悄把 `--auto 5` 截短。"""
     rt = _rt(tmp_path, llm_cls=_NeverFinishLLM, max_iterations=1)   # 未传 max_rounds
     rt.ws.write_plan("# P\n - [ ] 永远没完\n")
     doc = rt.run_auto("长任务", rounds=5)

@@ -82,9 +82,9 @@ LIMITS_LOCK_ENV = "OPENTHREE_LIMITS_LOCK"
 #
 # 于是「200 步」只是**一轮**的预算，不是整场任务的硬墙：还没做完（撞步数上限
 # 未 finish / 模型自己调了 next_round / 计划还有未完成项）就自动开下一轮，
-# 由 max_rounds 兜住总成本（默认 3 轮 ≈ 600 步）。模型可 set_limits 改它，
+# 由 max_rounds 兜住总成本（默认 10 轮 ≈ 2000 步）。模型可 set_limits 改它，
 # 人类可用 --max-rounds 锁定。
-DEFAULT_MAX_ROUNDS = 3
+DEFAULT_MAX_ROUNDS = 10
 
 
 def resolve_context_budget(context_budget_chars: Optional[int],
