@@ -10,7 +10,7 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；最新 `0.1.3`，见 <https://pypi.org/project/openthree/>） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；最新 `0.1.4`，见 <https://pypi.org/project/openthree/>） |
 | 版本 | `0.1.4`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ PASSED |
@@ -184,7 +184,11 @@ python -m twine upload dist/*
   测试数 309 → **312**。三项都只是默认值与健壮性变化，**不改变已显式配置的行为**
   （`config.yaml` / `.openthree/limits.json` / 启动参数优先级不变）。
   升级建议：`0.1.4` 无凭据/本机痕迹问题，`0.1.3` **无需 yank**。
-  **状态：本地已构建并通过全量验收，尚未上传**。
+  **状态：已正式上传 PyPI**（`twine upload` 输出 `View at: https://pypi.org/project/openthree/0.1.4/`）。
+  发布后验证：PyPI JSON API 的 `releases` 含 `0.1.4`、`latest=0.1.4`；远端两个文件的 sha256 与本地
+  逐字节一致（whl `2152f10b…` / sdist `193f54df…`）；另建全新 venv 从
+  `https://pypi.org/simple/` 实装 `openthree==0.1.4` → `import` 报 `0.1.4`、
+  `python -m openthree --inspect` → 33 工具就绪、`run_shell(timeout=2)` 2.4s 返回并报「命令超时」。
 
 ### 发布上线后的「撤回 / 重发」记录
 
