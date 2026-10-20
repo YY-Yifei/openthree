@@ -32,7 +32,7 @@ from .multimodal import (ImageError, ImageResult, content_text, image_result,
                          to_data_url)
 from .tool import Tool, tool
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 __all__ = [
     "tool", "Tool", "KERNEL", "Kernel",

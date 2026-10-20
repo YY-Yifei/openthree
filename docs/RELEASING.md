@@ -11,11 +11,11 @@
 | 项目 | 状态 |
 | --- | --- |
 | 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；最新 `0.1.3`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.1.3`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
+| 版本 | `0.1.4`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ PASSED |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄） |
-| 测试 | 309 passed（仓库根 + 解包后的 sdist 内各跑一遍都全绿） |
+| 测试 | 312 passed（仓库根 + 解包后的 sdist 内各跑一遍都全绿） |
 | 依赖 | `openai>=1.0`、`PyYAML>=6.0`、`json_repair>=0.30` |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
@@ -174,6 +174,17 @@ python -m twine upload dist/*
   **状态：已正式上传 PyPI**（`twine upload` 输出 `View at: https://pypi.org/project/openthree/0.1.3/`）。
   发布后验证：PyPI JSON API 可见 `0.1.3` 与两个文件（whl 129173 B / sdist 208004 B，与本地一致）；
   另建全新 venv 从 `https://pypi.org/simple/` 实装 `openthree==0.1.3` → `import` 报 `0.1.3`、`python -m openthree --inspect` → 33 工具就绪 ✓
+- **2026-10-20**（`openthree 0.1.4`）：把 `0.1.3` 之后合入的三项运行边界变更正式发到 PyPI ——
+  ① `max_tokens` 内核默认 8192 → **32768**（无任何配置层级提供时生效；`LLMConfig` 字段默认与
+  `load_config` 回落值同源，`b449f16`）；
+  ② `max_rounds` 内核默认 3 → **10**（整场自动接力轮数，每轮 200 步 ≈ 最长 2000 步，`459ad12`）；
+  ③ `run_shell` 超时兜底不再对已交给读线程的管道 `close()`（旧写法与读线程争同一把锁，
+  在「子进程退出但孙进程仍攥着写端」的形态下会让 `timeout` 失效、函数挂死；现在放弃读取并
+  如实报「输出管道未能收尾」，`4080ce9`）。
+  测试数 309 → **312**。三项都只是默认值与健壮性变化，**不改变已显式配置的行为**
+  （`config.yaml` / `.openthree/limits.json` / 启动参数优先级不变）。
+  升级建议：`0.1.4` 无凭据/本机痕迹问题，`0.1.3` **无需 yank**。
+  **状态：本地已构建并通过全量验收，尚未上传**。
 
 ### 发布上线后的「撤回 / 重发」记录
 
