@@ -10,8 +10,8 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；最新 `0.1.4`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.1.4`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；最新 `0.1.5`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.1.5`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ PASSED |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄） |
@@ -189,6 +189,22 @@ python -m twine upload dist/*
   逐字节一致（whl `2152f10b…` / sdist `193f54df…`）；另建全新 venv 从
   `https://pypi.org/simple/` 实装 `openthree==0.1.4` → `import` 报 `0.1.4`、
   `python -m openthree --inspect` → 33 工具就绪、`run_shell(timeout=2)` 2.4s 返回并报「命令超时」。
+- **2026-10-20**（`openthree 0.1.5`）：把「测试自身不留垃圾」这一条修好再发 ——
+  `tests/test_builtins.py` 的 `test_run_shell_survives_orphan_holding_pipe` 刻意造一个
+  脱离的孙进程持有输出管道（被保护的不变量要求这个形态），但它是刻意脱离的，
+  杀树够不着它，于是每跑一次测试就在机器上留下一个 `sleep(3600)` 的进程。
+  现在孙进程把 pid 写进 tmp 目录、用例在 `finally` 里按 pid 结束它，并断言收尾确实
+  发生（pid 没记下来或杀不掉即判失败）；睡眠时长同时降到 120s，作为收尾失败时的兜底。
+  运行期代码与 `0.1.4` **完全一致**（`whl` 内四个关键模块逐字节相同），
+  只有 sdist 里的这份测试变了 —— 所以 `0.1.4` **无需 yank**：装 whl 的人拿到的代码一样，
+  从 `0.1.4` sdist 从源码装的人才会拿到那个会留下孤儿进程的测试。
+  测试数仍为 312。
+  **状态：已正式上传 PyPI**（`twine upload` 输出 `View at: https://pypi.org/project/openthree/0.1.5/`）。
+  发布后验证：PyPI JSON API 的 `releases` 含 `0.1.5`、`latest=0.1.5`；远端两个文件的 sha256
+  与本地逐字节一致（whl `dbc26c42…` / sdist `64425332…`）；另建全新 venv 从
+  `https://pypi.org/simple/` 实装 `openthree==0.1.5` → `import` 报 `0.1.5`、
+  `python -m openthree --inspect` → 33 工具就绪、`run_shell(timeout=2)` 2.4s 返回并报「命令超时」、
+  包内 `DEFAULT_MAX_ROUNDS=10` / `LLMConfig.max_tokens=32768`。
 
 ### 发布上线后的「撤回 / 重发」记录
 
@@ -271,3 +287,21 @@ PyPI 上的版本不能删除，只能 *yank*（标记为“不建议使用”�
 - **全新 venv**（`_pubvenv013`）装 **wheel**：`import openthree` → `0.1.3`（`__file__` 指向 site-packages）、`python -m openthree --inspect` → 33 工具就绪 ✓
 - 解包 sdist 后在其内跑 `pytest` → **309 passed** ✓
 - ⚠️ **已知环境怪癖**：在 Windows 上以 `Scripts\openthree.exe`（console script 启动器）重定向 stdout 时可能零输出（`--version` / `--inspect` 均如此，**rc 仍为 0**）——**0.1.2 的 venv 同样复现**，故非本次引入；用 `python -m openthree` 一切正常。
+
+### 0.1.5 实跑补充（2026-10-20）
+
+- `pyproject.toml` / `openthree/__init__.py` 版本号一致（`0.1.5`）✓
+- `python -m build` → `openthree-0.1.5-py3-none-any.whl`（129,003 B）+ `.tar.gz`（209,660 B）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- **whl 与 sdist 的 `agent.py` / `llm.py` / `builtins.py` / `__init__.py` 逐字节相同** ✓
+- 包内关键值：`DEFAULT_MAX_ROUNDS=10`、`LLMConfig.max_tokens=32768`（`load_config` 回落同值）、
+  超时兜底无 `stream.close()`、含「输出管道未能收尾」表述 ✓
+- sdist 无越界目录段 / 无 `config.yaml`、`limits.json`、`identity.json`、`.env` /
+  本机绝对路径 0 命中 / 真实形态 api key 0 命中（README 里 7 处 `sk-xxx` 是占位符示例）✓
+- **仓库根全量 pytest → 312 passed**；**解包 sdist 内全量 pytest → 312 passed**（核 junit 计数）✓
+- sdist 内孤儿用例已是收尾版：有 `pidfile` / `_reap`、睡 120s，跑完机器上无残留进程 ✓
+- **全新 venv**（`_live/venv015`）从 `https://pypi.org/simple/` 装 `openthree==0.1.5`：
+  `import` → `0.1.5`（`__file__` 指向 site-packages）、`python -m openthree --inspect` → 33 工具就绪、
+  `run_shell(timeout=2)` → 2.4s 返回并报「命令超时（2s），已强杀进程树」✓
+- 发布后 PyPI JSON API：`latest=0.1.5`、两个文件 sha256 与本地逐字节一致 ✓
+
