@@ -14,10 +14,11 @@ import json
 from openthree.agent import DEFAULT_MAX_ROUNDS
 from openthree.builtins import next_round
 from openthree.kernel import KERNEL
-from openthree.prompt import build_runtime_block
 from openthree.recorder import Recorder
 from openthree.runtime import Runtime
 from openthree.workspace import Workspace
+
+from conftest import sent_block
 
 
 class _NeverFinishLLM:
@@ -95,7 +96,7 @@ def test_max_rounds_from_file_clamped(make_agent):
 
 # ---------------------------------------------------------------- 处境轮读数
 def test_prompt_shows_round_and_step_line(ws, registry):
-    block = build_runtime_block(
+    block = sent_block(
         ws, registry, model="m", iteration=7, max_iterations=200,
         round_stats={"index": 2, "max": 3, "remaining": 1,
                      "autonomous": True, "next": True})
@@ -105,7 +106,7 @@ def test_prompt_shows_round_and_step_line(ws, registry):
 
 def test_prompt_hides_next_hint_when_budget_exhausted(ws, registry):
     """轮预算用尽（next=False）时，处境不再写「还有下一轮」。"""
-    block = build_runtime_block(
+    block = sent_block(
         ws, registry, model="m", iteration=1, max_iterations=200,
         round_stats={"index": 3, "max": 3, "remaining": 0,
                      "autonomous": True, "next": False})
@@ -114,12 +115,12 @@ def test_prompt_hides_next_hint_when_budget_exhausted(ws, registry):
 
 
 def test_prompt_round_line_backcompat_without_stats(ws, registry):
-    block = build_runtime_block(ws, registry, model="m", iteration=1, max_iterations=200)
+    block = sent_block(ws, registry, model="m", iteration=1, max_iterations=200)
     assert "这是第 1 轮（本场最多 1 轮）" in block          # 无 stats 时退回 1/1
 
 
 def test_prompt_limits_line_mentions_rounds(ws, registry):
-    block = build_runtime_block(
+    block = sent_block(
         ws, registry, model="m", iteration=1, max_iterations=200,
         limits_stats={"max_iterations": 200, "max_rounds": 3, "max_tokens": 8192,
                       "tool_result_limit": 4000, "temperature": 0.3, "locked": False})

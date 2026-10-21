@@ -8,10 +8,9 @@ from __future__ import annotations
 
 from openthree.agent import resolve_context_policy
 from openthree.builtins import BUILTIN_FUNCTIONS, context_budget, context_usage
-from openthree.prompt import build_runtime_block
 from openthree.workspace import Workspace
 
-from conftest import step
+from conftest import sent_block, step
 
 
 # ---------------------------------------------------------------- 策略解析
@@ -158,7 +157,7 @@ def test_context_budget_tool_noop_without_args(make_agent):
 
 # ---------------------------------------------------------------- prompt 注入
 def test_prompt_injects_usage_line(ws, registry):
-    block = build_runtime_block(
+    block = sent_block(
         ws, registry, model="m", iteration=1, max_iterations=200,
         context_stats={"used_chars": 123, "budget_chars": 1000, "ratio": 0.123,
                        "fold_range": "1-2", "auto_fold": True, "compactions": 2})
@@ -167,6 +166,6 @@ def test_prompt_injects_usage_line(ws, registry):
 
 
 def test_prompt_backcompat_without_stats(ws, registry):
-    block = build_runtime_block(ws, registry, model="m", iteration=1,
+    block = sent_block(ws, registry, model="m", iteration=1,
                                 max_iterations=200, fold_range="1-2")
     assert "可折叠 step 范围 1-2" in block

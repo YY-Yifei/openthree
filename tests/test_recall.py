@@ -12,7 +12,6 @@ from pathlib import Path
 from openthree.builtins import (BUILTIN_FUNCTIONS, _public_function_warning,
                                 list_dir, read_file, recall_memory, remember,
                                 search_files, write_function)
-from openthree.prompt import build_runtime_block
 from openthree.workspace import Workspace
 
 from conftest import *  # noqa: F401,F403  复用夹具
@@ -165,14 +164,14 @@ def test_runtime_block_injects_memory(ws, registry):
     ws.memory_file.parent.mkdir(parents=True, exist_ok=True)
     ws.memory_file.write_text('{"ts":"t","content":"可被注入的经验","tags":[]}\n',
                               encoding="utf-8")
-    block = build_runtime_block(ws, registry, model="m", iteration=1, max_iterations=200)
+    block = sent_block(ws, registry, model="m", iteration=1, max_iterations=200)
     assert "# 你的长期记忆" in block
     assert "可被注入的经验" in block
     assert "recall_memory" in block
 
 
 def test_runtime_block_memory_is_absent_message_when_empty(ws, registry):
-    block = build_runtime_block(ws, registry, model="m", iteration=1, max_iterations=200)
+    block = sent_block(ws, registry, model="m", iteration=1, max_iterations=200)
     assert "# 你的长期记忆" in block
     assert "还没有长期记忆" in block
 
@@ -182,7 +181,7 @@ def test_runtime_block_caps_memory_chars(ws, registry):
     ws.memory_file.parent.mkdir(parents=True, exist_ok=True)
     ws.memory_file.write_text(
         '{"ts":"t","content":"' + "长" * 5000 + '","tags":[]}\n', encoding="utf-8")
-    block = build_runtime_block(ws, registry, model="m", iteration=1, max_iterations=200)
+    block = sent_block(ws, registry, model="m", iteration=1, max_iterations=200)
     i = block.find("# 你的长期记忆")
     j = block.find("# 你上次的行动")
     assert j - i < 2000

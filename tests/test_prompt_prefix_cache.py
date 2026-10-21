@@ -16,7 +16,8 @@ from __future__ import annotations
 import io
 
 from openthree.prompt import (build_context_block, build_messages,
-                              build_situation_block, build_static_block)
+                              build_runtime_block, build_situation_block,
+                              build_static_block)
 
 from conftest import *  # noqa: F401,F403  复用 ws / registry 夹具
 
@@ -27,16 +28,23 @@ HISTORY = [{"role": "user", "content": "帮我修个 typo"}]
 PER_STEP_FIELDS = ("- 当前时间：", "- 这是第", "# 你上次的行动")
 
 
-def _assemble(ws, registry, *, iteration: int, last_action: str):
-    return build_messages(
-        ws, registry, HISTORY, model="m", iteration=iteration, max_iterations=200,
-        last_action=last_action, fold_range="1-2",
+def _stats_kw(iteration: int) -> dict:
+    """这一步的读数 —— 发送路径与兼容壳必须拿同一份，否则比的不是同一件事。"""
+    return dict(
+        fold_range="1-2",
         context_stats={"used_chars": iteration * 100, "budget_chars": 100000,
                        "ratio": iteration / 1000.0, "fold_range": "1-2",
                        "auto_fold": True, "compactions": 0},
         limits_stats={"max_iterations": 200, "max_rounds": 3, "max_tokens": 8192,
                       "tool_result_limit": 4000, "temperature": 0.3, "locked": False},
         round_stats={"index": 1, "max": 3, "next": True},
+    )
+
+
+def _assemble(ws, registry, *, iteration: int, last_action: str):
+    return build_messages(
+        ws, registry, HISTORY, model="m", iteration=iteration, max_iterations=200,
+        last_action=last_action, **_stats_kw(iteration),
     )
 
 
@@ -122,3 +130,31 @@ def test_rewriting_plan_does_not_change_system(ws, registry):
         else:
             with io.open(plan_path, "w", encoding="utf-8", newline="") as fh:
                 fh.write(original)
+
+
+# ---------------------------------------------------------------- 兼容壳不许漂移
+def test_runtime_block_equals_what_is_actually_sent(ws, registry):
+    """`build_runtime_block` 不是第二条组装路径，而是发送内容的**同一次拼装**。
+
+    它是给「想一眼看全处境」的调用方用的（诊断、自省、人肉排查），生产路径
+    只走 `build_messages`。既然是兼容壳，就必须始终等于真正发出去的那三段，
+    否则看诊断的人和看请求的人会看到两份不同的处境 —— 而这份壳没有任何生产
+    调用方，漂移了也不会有别的东西来撞它。
+    """
+    kw = _stats_kw(1)
+    msgs = build_messages(ws, registry, HISTORY, model="m", iteration=1,
+                          max_iterations=200, last_action="", **kw)
+    static = build_static_block(ws, registry, model="m")
+    context = build_context_block(ws)
+    situation = build_situation_block(iteration=1, max_iterations=200,
+                                      last_action="", **kw)
+
+    # 发送路径：system 以内核常量段结尾，随后是自维护段与此刻段
+    assert msgs[0]["content"].endswith(static)
+    assert msgs[-2]["content"] == context
+    assert msgs[-1]["content"] == situation
+
+    # 兼容壳：同一组三段按同样顺序拼回
+    assert build_runtime_block(ws, registry, model="m", iteration=1,
+                               max_iterations=200, **kw) == \
+        f"{static}\n\n{context}\n\n{situation}"

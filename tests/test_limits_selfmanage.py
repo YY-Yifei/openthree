@@ -9,10 +9,9 @@ from __future__ import annotations
 import json
 
 from openthree.builtins import BUILTIN_FUNCTIONS, limits_usage, set_limits
-from openthree.prompt import build_runtime_block
 from openthree.workspace import Workspace
 
-from conftest import step
+from conftest import sent_block, step
 
 
 def _write(ws, **kw):
@@ -201,7 +200,7 @@ def test_limits_usage_and_set_limits_tools(make_agent):
 
 # ---------------------------------------------------------------- prompt 注入
 def test_prompt_injects_limits_line(ws, registry):
-    block = build_runtime_block(
+    block = sent_block(
         ws, registry, model="m", iteration=1, max_iterations=200,
         limits_stats={"max_iterations": 200, "max_rounds": 3, "max_tokens": 8192,
                       "tool_result_limit": 4000, "temperature": 0.3,
@@ -211,6 +210,6 @@ def test_prompt_injects_limits_line(ws, registry):
 
 
 def test_prompt_backcompat_without_limits(ws, registry):
-    block = build_runtime_block(ws, registry, model="m",
+    block = sent_block(ws, registry, model="m",
                                 iteration=1, max_iterations=200)
     assert "运行边界" in block and "步数上限 200" in block

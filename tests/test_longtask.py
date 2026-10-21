@@ -11,9 +11,10 @@ from openthree.builtins import (list_prompt_versions, read_plan,
                                 write_system_prompt)
 from openthree.kernel import KERNEL
 from openthree.llm import LLMConfig
-from openthree.prompt import build_runtime_block
 from openthree.runtime import Runtime
 from openthree.workspace import Workspace
+
+from conftest import sent_block
 
 
 # ---------------------------------------------------------------- 柔性种子
@@ -94,7 +95,7 @@ def test_init_is_idempotent_keeps_plan(tmp_path):
 # ---------------------------------------------------------------- 计划注入上下文
 def test_runtime_block_includes_plan(ws, registry):
     ws.write_plan("- [ ] 待办甲")
-    block = build_runtime_block(ws, registry, model="m", iteration=1, max_iterations=200)
+    block = sent_block(ws, registry, model="m", iteration=1, max_iterations=200)
     assert "# 你的计划" in block
     assert "待办甲" in block
     assert "还有 1 项未完成" in block
@@ -102,7 +103,7 @@ def test_runtime_block_includes_plan(ws, registry):
 
 def test_runtime_block_marks_done_plan(ws, registry):
     ws.write_plan("- [x] 干完了")
-    block = build_runtime_block(ws, registry, model="m", iteration=1, max_iterations=200)
+    block = sent_block(ws, registry, model="m", iteration=1, max_iterations=200)
     assert "所有条目都已勾选" in block
 
 

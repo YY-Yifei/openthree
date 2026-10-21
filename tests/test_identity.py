@@ -10,9 +10,10 @@ import json
 
 from openthree.builtins import set_identity, whoami
 from openthree.kernel import KERNEL
-from openthree.prompt import build_runtime_block
 from openthree.report import build_html
 from openthree.workspace import DEFAULT_AGENT_NAME, Workspace
+
+from conftest import sent_block
 
 
 def _bind(ws: Workspace) -> None:
@@ -89,10 +90,10 @@ def test_whoami_reports_state(ws: Workspace, make_agent):
 # ---------------------------------------------------------------- 处境注入
 def test_prompt_injects_name(ws: Workspace, registry):
     _bind(ws)
-    block = build_runtime_block(ws, registry, model="m", iteration=1, max_iterations=200)
+    block = sent_block(ws, registry, model="m", iteration=1, max_iterations=200)
     assert "名字：（还没有）" in block                   # 未命名时如实说
     ws.write_identity("小问", "落盘为证")
-    block = build_runtime_block(ws, registry, model="m", iteration=1, max_iterations=200)
+    block = sent_block(ws, registry, model="m", iteration=1, max_iterations=200)
     assert "名字：小问 —— 落盘为证" in block
 
 
