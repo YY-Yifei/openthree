@@ -10,8 +10,8 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；最新 `0.1.5`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.1.5`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；最新 `0.1.6`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.1.6`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ PASSED |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄） |

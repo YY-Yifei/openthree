@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openthree"
-version = "0.1.5"
+version = "0.1.6"
 description = "极简 LLM Agent Harness：agent 天然自我演化（命名、长工具、改提示词）"
 readme = "README.md"
 requires-python = ">=3.10"
