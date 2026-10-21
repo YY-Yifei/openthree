@@ -205,6 +205,24 @@ python -m twine upload dist/*
   `https://pypi.org/simple/` 实装 `openthree==0.1.5` → `import` 报 `0.1.5`、
   `python -m openthree --inspect` → 33 工具就绪、`run_shell(timeout=2)` 2.4s 返回并报「命令超时」、
   包内 `DEFAULT_MAX_ROUNDS=10` / `LLMConfig.max_tokens=32768`。
+- **2026-10-21**（`openthree 0.1.6`）：把「静态前缀 + 自维护段 + 处境尾消息」这层提示词重组发到 PyPI ——
+  此前每一步重新组装的 system 让工具 schema 等大块常量每步都重算，跨步的前缀缓存命中被压到
+  94% 左右（截断后重发同一条消息时更低）。现在请求按三层组装：静止的 system 常量、
+  模型自己会改的自维护段（计划 / 记忆 / 演化史）、每步刷新的处境尾消息；
+  `build_runtime_block` 保留为兼容壳。
+  「改一下，下一步就生效」的七条链路（计划 / 记忆 / 系统提示词 / 任务 / 名字 / 自造工具 / 运行边界）
+  已用 stub 模型实跑 ReAct 循环逐条验证，并由 `tests/test_layered_prompt_evolution.py` 钉住 ——
+  防止为了命中率把会变的东西藏起来或晚一步再给模型看。测试数 312 → **324**。
+  **状态：已正式上传 PyPI**（`twine upload` 输出 `View at: https://pypi.org/project/openthree/0.1.6/`）。
+  发布后验证：PyPI JSON API 的 `releases` 含 `0.1.6`、`latest=0.1.6`；远端两个文件的 sha256
+  与本地逐字节一致（whl `43df6733…` / sdist `8fd20e24…`）；另建全新 venv 从
+  `https://pypi.org/simple/` 实装 `openthree==0.1.6` → `import` 报 `0.1.6`（`__file__` 指向
+  site-packages）、`python -m openthree --inspect` → 33 工具就绪。
+  上传过程两处环境坑：① 首次 `twine upload` 在 Windows 控制台因 rich 进度条撞 GBK
+  （`UnicodeEncodeError: 'gbk' codec can't encode character '\u2022'`）中断，核对 PyPI JSON API
+  确认 `0.1.6` 不存在 —— 文件未上传，改用 `PYTHONUTF8=1` + `--disable-progress-bar` 后成功；
+  ② 本机 pip 默认源是阿里云镜像，索引同步滞后会报「找不到 0.1.6」，那是镜像而非发布失败，
+  实装验证须显式 `--index-url https://pypi.org/simple/`。
 
 ### 发布上线后的「撤回 / 重发」记录
 
