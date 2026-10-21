@@ -165,7 +165,7 @@ def test_runtime_single_run_does_not_read_transcript(tmp_path):
     second = rt.llm.calls[-1]
     texts = [str(m.get("content")) for m in second]
     assert not any("我叫小明，请记住" in t for t in texts)   # 不读盘，从零开跑
-    assert [m["role"] for m in second] == ["system"]         # 没有任何播种
+    assert [m["role"] for m in second] == ["system", "user", "user"]  # 没有任何播种（末两条是运行期拼的）
     # 但档案照写不误（可观测 / 可续读）
     assert [t["user"] for t in rt.ws.read_turns(-1)] == ["我叫小明，请记住", "我叫什么？"]
 
@@ -183,7 +183,7 @@ def test_runtime_session_remembers_prior_turns(tmp_path):
     assert any("我叫什么？" in t for t in texts)
     # 当前任务照旧在 system 里（三）；上一轮以 user/assistant 播种在消息层。
     assert second[0]["role"] == "system" and "我叫什么？" in second[0]["content"]
-    assert [m["role"] for m in second] == ["system", "user", "assistant"]
+    assert [m["role"] for m in second] == ["system", "user", "assistant", "user", "user"]
     assert second[1]["content"] == "我叫小明，请记住"
 
 
@@ -203,7 +203,7 @@ def test_runtime_end_session_forgets(tmp_path):
     rt.run("我叫小明，请记住")
     rt.end_session()
     rt.run("我叫什么？")
-    assert [m["role"] for m in rt.llm.calls[-1]] == ["system"]   # 会话已关，不播种
+    assert [m["role"] for m in rt.llm.calls[-1]] == ["system", "user", "user"]   # 会话已关，不播种
 
 
 def test_runtime_resume_reads_transcript_explicitly(tmp_path):
@@ -232,7 +232,7 @@ def test_runtime_turns_zero_is_single_turn(tmp_path):
     rt.begin_session()
     rt.run("我叫小明，请记住")
     rt.run("我叫什么？")
-    assert len(rt.llm.calls[-1]) == 1                    # 只剩 system
+    assert len(rt.llm.calls[-1]) == 3                    # 只剩 system + 自维护段 + 处境
     assert len(rt.ws.read_turns(-1)) == 2                # 但原文照样入档
 
 

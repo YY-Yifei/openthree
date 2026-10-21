@@ -1,0 +1,124 @@
+"""提示词前缀：内核不许在 system 里放「每步都会变」的值。
+
+为什么这条值得单独一个文件：服务端的前缀缓存从**第一个不同的字节**开始断开，
+而一次请求的序列化顺序是 system → tools → messages。于是 system 里只要有
+一个每秒都在变的值（时间、步数、上次行动），它之后的工具 schema（一万多
+token）与全部历史就每步都要重算 —— 实测命中率从 ~92% 跌到 ~6%。
+
+四条被保护的不变量：
+  I1  同一份状态连续组装两次，system 逐字节相同。
+  I2  每步刷新的字段只出现在**最后一条**消息里，不在 system 里。
+  I3  自维护段与此刻段都不写回 history —— 下一步它们会被真实的一步取代。
+  I4  模型改计划不会改变 system 的字节（否则写一次计划就重算一次工具 schema）。
+"""
+from __future__ import annotations
+
+import io
+
+from openthree.prompt import (build_context_block, build_messages,
+                              build_situation_block, build_static_block)
+
+from conftest import *  # noqa: F401,F403  复用 ws / registry 夹具
+
+HISTORY = [{"role": "user", "content": "帮我修个 typo"}]
+
+# 这些是「此刻」的字段行标记 —— 只在最后一条消息里出现。
+# 用整行标记而不是裸词，是因为工具清单里也有「获取当前时间」这种正常描述。
+PER_STEP_FIELDS = ("- 当前时间：", "- 这是第", "# 你上次的行动")
+
+
+def _assemble(ws, registry, *, iteration: int, last_action: str):
+    return build_messages(
+        ws, registry, HISTORY, model="m", iteration=iteration, max_iterations=200,
+        last_action=last_action, fold_range="1-2",
+        context_stats={"used_chars": iteration * 100, "budget_chars": 100000,
+                       "ratio": iteration / 1000.0, "fold_range": "1-2",
+                       "auto_fold": True, "compactions": 0},
+        limits_stats={"max_iterations": 200, "max_rounds": 3, "max_tokens": 8192,
+                      "tool_result_limit": 4000, "temperature": 0.3, "locked": False},
+        round_stats={"index": 1, "max": 3, "next": True},
+    )
+
+
+# ---------------------------------------------------------------- I1：逐字节稳定
+def test_system_is_byte_identical_across_steps(ws, registry):
+    """内核往 system 里塞任何每步变的值，这条就会红。"""
+    a = _assemble(ws, registry, iteration=1, last_action="读了 a.py")
+    b = _assemble(ws, registry, iteration=2, last_action="读了 b.py")
+    assert a[0]["content"] == b[0]["content"]
+
+
+def test_static_block_is_byte_identical_on_repeat(ws, registry):
+    assert (build_static_block(ws, registry, model="m")
+            == build_static_block(ws, registry, model="m"))
+
+
+# ---------------------------------------------------------------- I2：动态只在末尾
+def test_per_step_fields_live_in_the_tail_message(ws, registry):
+    msgs = _assemble(ws, registry, iteration=7, last_action="读了 a.py")
+    tail = msgs[-1]["content"]
+    system = msgs[0]["content"]
+
+    assert tail.startswith("# 此刻的处境")
+    assert "当前时间" in tail and "本轮第 7 步" in tail and "读了 a.py" in tail
+    for field in PER_STEP_FIELDS:
+        assert field not in system, f"{field} 不该出现在 system 里（会让缓存每步断开）"
+
+
+def test_situation_block_changes_with_step(ws, registry):
+    one = build_situation_block(iteration=1, max_iterations=200, last_action="a")
+    two = build_situation_block(iteration=2, max_iterations=200, last_action="b")
+    assert one != two
+    assert "本轮第 1 步" in one and "本轮第 2 步" in two
+
+
+# ---------------------------------------------------------------- I3：不写回 history
+def test_tail_messages_are_not_written_back_to_history(ws, registry):
+    msgs = _assemble(ws, registry, iteration=3, last_action="x")
+    assert len(msgs) == len(HISTORY) + 3          # system + history + 自维护段 + 处境
+    assert msgs[1:1 + len(HISTORY)] == HISTORY    # 原样不动
+    assert msgs[-2]["content"].startswith("# 你的计划")
+    assert all(m["content"] != msgs[-1]["content"] for m in HISTORY)
+
+
+def test_system_still_carries_the_stable_parts(ws, registry):
+    """拆成三段之后，内核常量（工具清单 / 任务）仍在 system 里。"""
+    system = build_static_block(ws, registry, model="m")
+    assert "# 你的工具（二）" in system
+    assert "# 当前任务（三）" in system
+
+
+def test_self_maintained_parts_live_after_history(ws, registry):
+    """计划 / 记忆 / 演化史在 system 之外 —— 它们是模型自己会改的文件。"""
+    system = build_static_block(ws, registry, model="m")
+    context = build_context_block(ws)
+    assert "# 你的计划" not in system
+    assert "# 你的长期记忆" not in system
+    assert "# 你的计划" in context and "# 你的长期记忆" in context
+
+
+# ---------------------------------------------------------------- I4：改计划不动 system
+def test_rewriting_plan_does_not_change_system(ws, registry):
+    """写一次计划就重算一次工具 schema 是这轮要消灭的浪费。
+
+    `write_plan` 是模型在长任务里最常做的事之一；只要计划还在 system 里，
+    每写一次就要把一万多 token 的工具 schema 重新算一遍。
+    """
+    before = build_static_block(ws, registry, model="m")
+    before_ctx = build_context_block(ws)
+
+    plan_path = ws.plan_file
+    original = io.open(plan_path, encoding="utf-8", newline="").read() if plan_path.exists() else None
+    try:
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        with io.open(plan_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("# 另一份计划\n\n- [ ] 完全不同的事\n")
+
+        assert build_static_block(ws, registry, model="m") == before
+        assert build_context_block(ws) != before_ctx
+    finally:
+        if original is None:
+            plan_path.unlink(missing_ok=True)
+        else:
+            with io.open(plan_path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(original)

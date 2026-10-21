@@ -7,7 +7,9 @@
          + .openthree/memory/memory.jsonl             （长期记忆，跨会话可回看）
          + .openthree/prompts/user-prompts.md        （任务，模型可自改）
 
-整个 run() 每一步都重新组装，所以模型的自我修改下一步立即生效。
+整个 run() 每一步都重新组装，所以模型的自我修改下一步立即生效；但组装结果按
+**多久变一次**分三段落位（system / 自维护段 / 此刻段），让不变的前缀能被服务端缓存：
+内核往 system 里塞一个每步都变的值，它后面一万多 token 的工具 schema 就每步重算。
 
 「轮 / 步 / 会话」三层务必分清：
     * **步（step）** = ReAct 的一次「思 → 行」；一次 run() 内逐步推进。
@@ -30,38 +32,39 @@ MEMORY_INJECT_LIMIT_CHARS = 2000
 MEMORY_INJECT_MAX_ITEMS = 8
 
 
-RUNTIME_TEMPLATE = """\
+# 处境按「多久变一次」分三层组装 —— 这是提示词缓存能否命中的全部依据。
+#
+# 一次请求的序列化顺序是 system → tools → messages，而前缀缓存从**第一个
+# 不同的字节**开始断开。于是 system 里只要有一个每步都会变的值（时间、步数、
+# 上次行动），它之后的**一切**——那一万多 token 的工具 schema、以及全部历史
+# ——每步都要重算。
+#
+# 但「不在 system 里」还不够：计划和演化史是**模型自己会写**的文件，写一次
+# 计划就断一次缓存。所以按变化频率切三层，稳定的在前、易变的在后：
+#
+#   STATIC_TEMPLATE    内核常量 + 模型很少动的东西          → system
+#   CONTEXT_TEMPLATE   模型自己维护的文件（计划/记忆/演化史） → 一条消息
+#   SITUATION_TEMPLATE 每步都变（时间/步数/用量/上次行动）    → 末尾一条消息
+#
+# 后两层排在 history 之后、都不写回 history。
+#
+# 分开而不是并成一条，收益只出现在**一种**调用里：正常步进时 history 每步都在
+# 长，公共前缀到 history 末尾就断了，此刻段与自维护段谁先谁后、分不分开，对
+# 命中都没有影响（实测 94.4 % vs 94.5 %）。真正吃到分开好处的是「重发同一条
+# 消息」——模型输出被 max_tokens 截断后 agent 不 append 任何东西，两次请求
+# 只差此刻段；此时自维护段仍留在公共前缀里（96.6 % vs 94.7 %）。
+STATIC_TEMPLATE = """\
 # 你的处境（运行期自动组装）
 
 - 工作目录：`{cwd}`
 - 工作区：`{wsdir}`
-- 当前时间：{now}
 - 模型：{model}
 - {identity}
 - 可用工具：{tool_count} 个（内置 {builtin_count} / 自造 {user_count}）
-- 这是第 {round_index} 轮（本场最多 {max_rounds} 轮{next_hint}），本轮第 {iteration} 步（上限 {max_iterations}）
-- 上下文：{context}（`context_usage` 看细节 / `context_budget` 调预算）
-- 运行边界：{limits}（`limits_usage` 看细节 / `set_limits` 调）
 
 # 你的工具（二）
 
 {digest}
-
-# 你的计划（长任务的待办）
-
-{plan}
-
-# 你的长期记忆（跨会话）
-
-{memory}
-
-# 你上次的行动
-
-{last_action}
-
-# 演化史（你为自己做了哪些改造）
-
-{evolution}
 
 ---
 
@@ -70,26 +73,87 @@ RUNTIME_TEMPLATE = """\
 {user_prompt}
 """
 
+# 模型自己维护、时不时会改的内容。改一次只会让它自己和它后面那段失效，
+# 不会波及 system 与工具 schema。
+CONTEXT_TEMPLATE = """\
+# 你的计划（长任务的待办）
 
-def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: int,
-                        max_iterations: int, last_action: str = "",
-                        fold_range: str = "",
-                        context_stats: Optional[Dict[str, Any]] = None,
-                        limits_stats: Optional[Dict[str, Any]] = None,
-                        round_stats: Optional[Dict[str, Any]] = None) -> str:
-    evolution = _recent_evolution(ws, limit=10)
+{plan}
+
+# 你的长期记忆（跨会话）
+
+{memory}
+
+# 演化史（你为自己做了哪些改造）
+
+{evolution}
+"""
+
+# 每步刷新的那一段。它作为**最后一条消息**发出，发送后不写回 history，
+# 所以它只影响「这一次」的尾部，不会把它之前的前缀弄脏。
+SITUATION_TEMPLATE = """\
+# 此刻的处境（运行期每步刷新 —— 这一段不是用户说的话）
+
+- 当前时间：{now}
+- 这是第 {round_index} 轮（本场最多 {max_rounds} 轮{next_hint}），本轮第 {iteration} 步（上限 {max_iterations}）
+- 上下文：{context}（`context_usage` 看细节 / `context_budget` 调预算）
+- 运行边界：{limits}（`limits_usage` 看细节 / `set_limits` 调）
+
+# 你上次的行动
+
+{last_action}
+"""
+
+
+def build_static_block(ws: Workspace, reg: Registry, *, model: str) -> str:
+    """组装「内核自己的常量」—— 它进 system，是缓存前缀的主体。
+
+    这里只允许出现**本次任务内不会变**的东西：工作目录、工具清单、身份、任务。
+    一旦往这里塞一个每步都会变的值（时间、步数、上次行动），它之后的一切
+    ——包括那一万多 token 的工具 schema——就每步都要重算。
+
+    模型改自己的提示词或任务（`write_system_prompt` / `write_user_prompt`）
+    会改变 system 的字节，那是设计内的：自我修改本就该下一步立即生效。
+    这条不变量约束的是**内核**，不是模型。
+    """
     builtin = [t for t in reg.tools.values() if t.origin == "builtin"]
     user = [t for t in reg.tools.values() if t.origin == "user"]
-    stats = round_stats or {}
-    return RUNTIME_TEMPLATE.format(
+    return STATIC_TEMPLATE.format(
         cwd=Path.cwd(),
         wsdir=ws.dir,
-        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         model=model,
+        identity=_identity_line(ws),
         tool_count=len(reg.tools),
         builtin_count=len(builtin),
         user_count=len(user),
-        identity=_identity_line(ws),
+        digest=reg.digest(),
+        user_prompt=ws.current_task_text().strip() or "（空）",
+    )
+
+
+def build_context_block(ws: Workspace) -> str:
+    """组装「模型自己维护的文件」：计划、长期记忆、演化史。
+
+    这三样都排在 system 之后，因为它们在一次任务里会被模型自己改写
+    （尤其 `write_plan`）。放在 system 里，写一次计划就要重算整份工具
+    schema；放在这里，只让它们自己那段失效。
+    """
+    return CONTEXT_TEMPLATE.format(
+        plan=_plan_block(ws),
+        memory=_memory_block(ws),
+        evolution=_recent_evolution(ws, limit=10),
+    )
+
+
+def build_situation_block(*, iteration: int, max_iterations: int,
+                          last_action: str = "", fold_range: str = "",
+                          context_stats: Optional[Dict[str, Any]] = None,
+                          limits_stats: Optional[Dict[str, Any]] = None,
+                          round_stats: Optional[Dict[str, Any]] = None) -> str:
+    """组装「每步都变」的那一段 —— 它排在最后发出，不写回 history。"""
+    stats = round_stats or {}
+    return SITUATION_TEMPLATE.format(
+        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         max_iterations=max_iterations,
         iteration=iteration,
         round_index=int(stats.get("index", 1)),
@@ -97,13 +161,30 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
         next_hint=_next_round_hint(stats),
         context=_context_line(context_stats, fold_range),
         limits=_limits_line(limits_stats, max_iterations),
-        digest=reg.digest(),
-        plan=_plan_block(ws),
-        memory=_memory_block(ws),
         last_action=last_action or "（这是第一步）",
-        evolution=evolution,
-        user_prompt=ws.current_task_text().strip() or "（空）",
     )
+
+
+def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: int,
+                        max_iterations: int, last_action: str = "",
+                        fold_range: str = "",
+                        context_stats: Optional[Dict[str, Any]] = None,
+                        limits_stats: Optional[Dict[str, Any]] = None,
+                        round_stats: Optional[Dict[str, Any]] = None) -> str:
+    """三段拼成一份完整处境（静态段 + 自维护段 + 此刻段）。
+
+    `build_messages` 发请求时刻意把三段**分开发**（一段进 system、两段排历史之后），
+    这个函数只供「想一眼看全处境」的调用方使用：测试、自省、诊断。
+    三边共用同一组模板，所以看到的就是发出去的内容。
+    """
+    static = build_static_block(ws, reg, model=model)
+    context = build_context_block(ws)
+    situation = build_situation_block(iteration=iteration, max_iterations=max_iterations,
+                                      last_action=last_action, fold_range=fold_range,
+                                      context_stats=context_stats,
+                                      limits_stats=limits_stats,
+                                      round_stats=round_stats)
+    return f"{static}\n\n{context}\n\n{situation}"
 
 
 def _identity_line(ws: Workspace) -> str:
@@ -265,14 +346,35 @@ def build_messages(ws: Workspace, reg: Registry, history: List[Dict[str, Any]], 
                    context_stats: Optional[Dict[str, Any]] = None,
                    limits_stats: Optional[Dict[str, Any]] = None,
                    round_stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """组装完整 messages。system = 一 + 运行期三；history 是模型自己走过的路。"""
-    system_prompt = ws.read_system_prompt().strip()
-    runtime = build_runtime_block(ws, reg, model=model, iteration=iteration,
-                                  max_iterations=max_iterations, last_action=last_action,
-                                  fold_range=fold_range, context_stats=context_stats,
-                                  limits_stats=limits_stats, round_stats=round_stats)
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": f"{system_prompt}\n\n{runtime}"}
-    ]
+    """组装完整 messages：静态 system + 历史 + 自维护段 + 此刻段。
+
+    消息序列与各自的角色：
+
+    * `messages[0]`（system）= 一 + 内核常量。它必须逐字节稳定，
+      否则后面的一切（tools schema、history）都要重算 —— 见 STATIC_TEMPLATE 上的注释。
+    * `history` = 模型自己走过的路，只追加、不改写。
+    * **计划/记忆/演化史** = 模型自己会改的文件，排在 history 之后。
+    * **末尾那条** = 本步的时间/步数/上下文/上次行动。
+
+    后两条都**不写回 history**：它们只影响这一次请求的尾部。下一步它们会被
+    真实的一步（assistant + tool）取代，而那一步一旦落进 history 就同样成为
+    稳定前缀的一部分。
+
+    为什么不是把内容并进 `messages[0]`：代价相差两个数量级 ——
+    并进 system ⇒ 匹配长度 = 系统提示词那 2.8k tok；
+    排在后面 ⇒ 匹配长度 = system + tools + 全部历史。
+    """
+    static = build_static_block(ws, reg, model=model)
+    context = build_context_block(ws)
+    situation = build_situation_block(iteration=iteration,
+                                      max_iterations=max_iterations,
+                                      last_action=last_action, fold_range=fold_range,
+                                      context_stats=context_stats,
+                                      limits_stats=limits_stats, round_stats=round_stats)
+    # 「一」在最前：它是模型自己的世界观，比处境更稳定（只在模型自改时变）。
+    system = f"{ws.read_system_prompt().strip()}\n\n{static}"
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
     messages.extend(history)
+    messages.append({"role": "user", "content": context})
+    messages.append({"role": "user", "content": situation})
     return messages

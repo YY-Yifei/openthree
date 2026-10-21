@@ -191,7 +191,10 @@ def test_no_session_leak_into_later_single_run(tmp_path, monkeypatch):
     rt.llm = _FinishLLM(rt.config)
     rt.run("新的单次任务")
     roles = [m["role"] for m in rt.llm.calls[-1]]
-    assert roles == ["system"]                          # 没有播种旧 user/assistant
+    assert roles == ["system", "user", "user"]          # 没有播种旧 user/assistant
+    # 末尾两条是运行期拼的（自维护段 + 每步刷新的处境），不是旧会话里的话
+    assert rt.llm.calls[-1][-1]["content"].startswith("# 此刻的处境")
+    assert rt.llm.calls[-1][-2]["content"].startswith("# 你的计划")
     assert not any("上个会话的问题" in json.dumps(m, ensure_ascii=False)
                    for m in rt.llm.calls[-1])
 
