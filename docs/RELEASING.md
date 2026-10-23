@@ -10,12 +10,12 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；最新 `0.1.6`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.1.6`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；最新 `0.1.7`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.1.7`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ PASSED |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄） |
-| 测试 | 312 passed（仓库根 + 解包后的 sdist 内各跑一遍都全绿） |
+| 测试 | 331 passed（仓库根 + 解包后的 sdist 内各跑一遍都全绿） |
 | 依赖 | `openai>=1.0`、`PyYAML>=6.0`、`json_repair>=0.30` |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
