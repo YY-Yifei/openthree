@@ -117,12 +117,22 @@ def _runtime(tmp_path, **kw) -> Runtime:
     return rt
 
 
-def _task_in_system(rt: Runtime, idx: int = -1) -> str:
+def _flatten(content) -> str:
+    """把一条消息的 content 拍平：str 原样返回，多模态 parts 拼出文本部分。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return ""
+
+
+def _task_text(rt: Runtime, idx: int = -1) -> str:
+    """模型收到的「本轮任务」正文（它在一条 user 消息里，不在 system 深处）。"""
+    marker = "# 当前任务（三）"
     for m in rt.llm.calls[idx]:
-        if m.get("role") == "system" and isinstance(m.get("content"), str):
-            marker = "# 当前任务（三）"
-            if marker in m["content"]:
-                return m["content"].split(marker, 1)[1].strip()
+        text = _flatten(m.get("content"))
+        if marker in text:
+            return text.split(marker, 1)[1].strip()
     return ""
 
 
@@ -131,7 +141,7 @@ def test_run_none_reuses_clean_text_not_markdown(tmp_path):
     rt = _runtime(tmp_path)
     rt.run("上一次的任务：把 README 改一下")
     rt.run(None)
-    task = _task_in_system(rt)
+    task = _task_text(rt)
     assert task == "上一次的任务：把 README 改一下"        # 一字不差，无头无尾
     assert "# 当前任务" not in task
     assert "_提交于" not in task
@@ -167,16 +177,16 @@ def test_run_none_on_unfinished_round_does_not_reseed(tmp_path):
     assert len(turns) == doc["rounds_run"]
     # 每一轮的「当前任务」都是干净原文（无 markdown 头）
     for i in range(doc["rounds_run"]):
-        assert _task_in_system(rt, i) == "唯一的一次任务"
+        assert _task_text(rt, i) == "唯一的一次任务"
 
 
 def test_run_none_images_does_not_leak_seed_placeholder(tmp_path, png):
     """全新工作区只给图：模型不该把「（等待用户输入……）」当任务。"""
     rt = _runtime(tmp_path)
     rt.run(None, images=[str(png)])
-    task = _task_in_system(rt)
+    task = _task_text(rt)
     assert "等待用户输入" not in task
-    assert task == "（空）"                       # 没有任务正文，段头之外无内容
+    assert task == "（图片输入）"                  # 有图无字：如实说明这是图片输入
     blob = json.dumps(rt.llm.calls[-1], ensure_ascii=False)
     assert "图片输入" in blob                     # 图片作为正文注入
 

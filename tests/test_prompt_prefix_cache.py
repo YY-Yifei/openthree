@@ -28,6 +28,25 @@ HISTORY = [{"role": "user", "content": "帮我修个 typo"}]
 PER_STEP_FIELDS = ("- 当前时间：", "- 这是第", "# 你上次的行动")
 
 
+def _frozen_datetime():
+    """一个 `datetime` 替身：`now()` 恒返回同一时刻。
+
+    处境段里的时间戳每到一步都在变，于是「两次组装必须相等」这类断言天然
+    带一条秒级竞态。把时钟钉住，断言才只检验结构、不检验运气。
+    """
+    import datetime as _dt
+
+    class _Frozen:
+        @staticmethod
+        def now():
+            return _dt.datetime(2026, 1, 1, 12, 0, 0)
+
+        def __getattr__(self, name):
+            return getattr(_dt.datetime, name)
+
+    return _Frozen
+
+
 def _stats_kw(iteration: int) -> dict:
     """这一步的读数 —— 发送路径与兼容壳必须拿同一份，否则比的不是同一件事。"""
     return dict(
@@ -90,10 +109,30 @@ def test_tail_messages_are_not_written_back_to_history(ws, registry):
 
 
 def test_system_still_carries_the_stable_parts(ws, registry):
-    """拆成三段之后，内核常量（工具清单 / 任务）仍在 system 里。"""
+    """拆成三段之后，内核常量（工作目录 / 工具清单）仍在 system 里。
+
+    任务正文**不在** system 里：它每换一条消息就变（会让工具 schema 的缓存
+    前缀每轮失效），而且它是用户说的话，位置该是 history 末尾那条 user 消息。
+    """
     system = build_static_block(ws, registry, model="m")
     assert "# 你的工具（二）" in system
-    assert "# 当前任务（三）" in system
+    assert "# 当前任务（三）" not in system
+
+
+def test_current_input_is_a_user_message_after_history(ws, registry):
+    """本轮输入必须是 history 里的一条 user 消息，紧接在上一轮之后。
+
+    位置就是语义：它若埋在 system 深处，而消息层尾部停在上一轮的一问一答，
+    模型读到的「最后一句人话」就变成了上一轮 —— 于是像在处理上一条消息。
+    """
+    prev = [{"role": "user", "content": "上一轮的问题"},
+            {"role": "assistant", "content": "上一轮的回答"}]
+    msgs = build_messages(ws, registry, prev, model="m", iteration=1,
+                          max_iterations=200, **_stats_kw(1))
+    assert msgs[1:3] == prev                       # 上一轮原样保留在前
+    # build_messages 只管拼接既有 history；本轮输入由 Agent 注入到 history 末尾，
+    # 端到端的位置不变量见 tests/test_current_input_position.py。
+    assert [m["role"] for m in msgs[:3]] == ["system", "user", "assistant"]
 
 
 def test_self_maintained_parts_live_after_history(ws, registry):
@@ -133,14 +172,18 @@ def test_rewriting_plan_does_not_change_system(ws, registry):
 
 
 # ---------------------------------------------------------------- 兼容壳不许漂移
-def test_runtime_block_equals_what_is_actually_sent(ws, registry):
+def test_runtime_block_equals_what_is_actually_sent(ws, registry, monkeypatch):
     """`build_runtime_block` 不是第二条组装路径，而是发送内容的**同一次拼装**。
 
     它是给「想一眼看全处境」的调用方用的（诊断、自省、人肉排查），生产路径
     只走 `build_messages`。既然是兼容壳，就必须始终等于真正发出去的那三段，
     否则看诊断的人和看请求的人会看到两份不同的处境 —— 而这份壳没有任何生产
     调用方，漂移了也不会有别的东西来撞它。
+
+    时钟被钉住：三条路径各自取一次 `datetime.now()`，跨过秒边界就会让这份
+    「相等」断言偶发失败 —— 那是测试的抖动，不是兼容壳漂移。
     """
+    monkeypatch.setattr("openthree.prompt.datetime", _frozen_datetime())
     kw = _stats_kw(1)
     msgs = build_messages(ws, registry, HISTORY, model="m", iteration=1,
                           max_iterations=200, last_action="", **kw)

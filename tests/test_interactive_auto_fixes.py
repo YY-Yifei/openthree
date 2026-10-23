@@ -54,12 +54,25 @@ def _rt(tmp_path, **kw) -> Runtime:
     return rt
 
 
-def _task_in_system(call) -> str:
-    """从模型收到的一整组 messages 里取出「当前任务（三）」的正文。"""
+def _flatten(content) -> str:
+    """把一条消息的 content 拍平：str 原样返回，多模态 parts 拼出文本部分。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return ""
+
+
+def _task_text(call) -> str:
+    """从模型收到的一整组 messages 里取出「当前任务（三）」的正文。
+
+    任务是一条 **user 消息**（history 末尾），不在 system 里 —— 所以扫全部消息。
+    带图轮次的 content 是 parts 列表，要先拍平。
+    """
     for m in call:
-        if m.get("role") == "system" and isinstance(m.get("content"), str):
-            if TASK_MARK in m["content"]:
-                return m["content"].split(TASK_MARK, 1)[1].strip()
+        text = _flatten(m.get("content"))
+        if TASK_MARK in text:
+            return text.split(TASK_MARK, 1)[1].strip()
     return ""
 
 
@@ -97,7 +110,7 @@ def test_image_only_interactive_does_not_reuse_task_on_disk(tmp_path, monkeypatc
     with redirect_stdout(io.StringIO()):
         cli._interactive(rt, "", False, [], auto=0, resume=0)
 
-    tasks = [_task_in_system(c) for c in rt.llm.calls]
+    tasks = [_task_text(c) for c in rt.llm.calls]
     assert tasks[0] == "TASK-A: 第一条任务"
     # 关键：第二条（纯图）不是磁盘上那条任务，而是「空任务 + 图片输入」
     assert tasks[1] != "TASK-A: 第一条任务"
@@ -130,7 +143,7 @@ def test_image_only_cli_does_not_reuse_task_on_disk(tmp_path, monkeypatch):
 
     assert code == 0
     assert calls, "模型应被调用一次"
-    assert _task_in_system(calls[-1]) != "STALE-TASK: 磁盘上的任务"
+    assert _task_text(calls[-1]) != "STALE-TASK: 磁盘上的任务"
     assert any("图片输入" in u for u in _user_texts(calls[-1]))
 
 
@@ -157,7 +170,7 @@ def test_no_arg_run_still_reuses_task_on_disk(tmp_path, monkeypatch):
         code = cli.main(["--dir", str(tmp_path), "-q", "--no-interactive"])
 
     assert code == 0
-    assert _task_in_system(calls[-1]) == "STALE-TASK: 磁盘上的任务"
+    assert _task_text(calls[-1]) == "STALE-TASK: 磁盘上的任务"
 
 
 # ================================================================ 不变量 2：退出必收会话
@@ -191,10 +204,12 @@ def test_no_session_leak_into_later_single_run(tmp_path, monkeypatch):
     rt.llm = _FinishLLM(rt.config)
     rt.run("新的单次任务")
     roles = [m["role"] for m in rt.llm.calls[-1]]
-    assert roles == ["system", "user", "user"]          # 没有播种旧 user/assistant
+    assert roles == ["system", "user", "user", "user"]   # 没有播种旧 user/assistant
     # 末尾两条是运行期拼的（自维护段 + 每步刷新的处境），不是旧会话里的话
     assert rt.llm.calls[-1][-1]["content"].startswith("# 此刻的处境")
     assert rt.llm.calls[-1][-2]["content"].startswith("# 你的计划")
+    # 倒数第三条是本轮输入（它是用户说的话，排在 history 末尾）
+    assert rt.llm.calls[-1][-3]["content"].startswith(TASK_MARK)
     assert not any("上个会话的问题" in json.dumps(m, ensure_ascii=False)
                    for m in rt.llm.calls[-1])
 

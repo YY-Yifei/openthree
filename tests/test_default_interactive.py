@@ -81,11 +81,26 @@ def _fake_stdin(seq):
     return _input
 
 
-def _task_in_system(call) -> str:
+def _flatten(content) -> str:
+    """把一条消息的 content 拍平：str 原样返回，多模态 parts 拼出文本部分。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return ""
+
+
+def _task_text(call) -> str:
+    """模型收到的「本轮任务」正文。
+
+    任务由运行期作为一条 **user 消息**放进 history（不是 system 深处），
+    所以这里在全部消息里找 —— 它究竟落在哪条消息，由 test_current_input.py
+    专门守。带图轮次的 content 是 parts 列表，要先拍平。
+    """
     for m in call:
-        if m.get("role") == "system" and isinstance(m.get("content"), str):
-            if TASK_MARK in m["content"]:
-                return m["content"].split(TASK_MARK, 1)[1].strip()
+        text = _flatten(m.get("content"))
+        if TASK_MARK in text:
+            return text.split(TASK_MARK, 1)[1].strip()
     return ""
 
 
@@ -110,7 +125,7 @@ def test_default_no_args_runs_task_inside_interactive(tmp_path, monkeypatch, stu
         code = cli.main(["--dir", str(tmp_path), "-q"])
     assert code == 0
     assert len(stub_llm) == 1
-    assert _task_in_system(stub_llm[0].calls[-1]) == "交互里的第一句"
+    assert _task_text(stub_llm[0].calls[-1]) == "交互里的第一句"
 
 
 # ------------------------------------------------ 2) 非终端 / 显式 --no-interactive = 单次
@@ -125,7 +140,7 @@ def test_non_tty_falls_back_to_single_run(tmp_path, monkeypatch, stub_llm):
         code = cli.main(["--dir", str(tmp_path), "-q"])
     assert code == 0
     assert "交互模式。" not in out.getvalue()
-    assert _task_in_system(stub_llm[-1].calls[-1]) == "磁盘上的任务"
+    assert _task_text(stub_llm[-1].calls[-1]) == "磁盘上的任务"
 
 
 def test_no_interactive_flag_forces_single_run_even_on_tty(tmp_path, monkeypatch, stub_llm):
@@ -139,7 +154,7 @@ def test_no_interactive_flag_forces_single_run_even_on_tty(tmp_path, monkeypatch
         code = cli.main(["--dir", str(tmp_path), "-q", "--no-interactive"])
     assert code == 0
     assert "交互模式。" not in out.getvalue()
-    assert _task_in_system(stub_llm[-1].calls[-1]) == "磁盘上的任务"
+    assert _task_text(stub_llm[-1].calls[-1]) == "磁盘上的任务"
 
 
 def test_explicit_i_still_works_without_tty(tmp_path, monkeypatch, stub_llm):
@@ -163,7 +178,7 @@ def test_task_arg_never_enters_interactive(tmp_path, monkeypatch, stub_llm):
         code = cli.main(["--dir", str(tmp_path), "-q", "单次跑的任务"])
     assert code == 0
     assert "交互模式。" not in out.getvalue()
-    assert _task_in_system(stub_llm[-1].calls[-1]) == "单次跑的任务"
+    assert _task_text(stub_llm[-1].calls[-1]) == "单次跑的任务"
 
 
 def test_auto_without_task_never_enters_interactive(tmp_path, monkeypatch, stub_llm):
@@ -175,7 +190,7 @@ def test_auto_without_task_never_enters_interactive(tmp_path, monkeypatch, stub_
         code = cli.main(["--dir", str(tmp_path), "-q", "--auto", "1", "接力任务"])
     assert code == 0
     assert "交互模式。" not in out.getvalue()
-    assert _task_in_system(stub_llm[-1].calls[-1]) == "接力任务"
+    assert _task_text(stub_llm[-1].calls[-1]) == "接力任务"
 
 
 def test_resume_without_task_stays_single_run(tmp_path, monkeypatch, stub_llm):
