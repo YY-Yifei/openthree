@@ -10,8 +10,8 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；最新 `0.1.7`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.1.7`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.1.6`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | 本地 `0.1.7`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步），**待上传** |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ PASSED |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄） |
@@ -223,6 +223,23 @@ python -m twine upload dist/*
   确认 `0.1.6` 不存在 —— 文件未上传，改用 `PYTHONUTF8=1` + `--disable-progress-bar` 后成功；
   ② 本机 pip 默认源是阿里云镜像，索引同步滞后会报「找不到 0.1.6」，那是镜像而非发布失败，
   实装验证须显式 `--index-url https://pypi.org/simple/`。
+- **2026-10-23**（`openthree 0.1.7`）：把「本轮输入回到 history 末尾」这层修复打进产物 ——
+  此前「# 当前任务（三）」是 system 常量的一部分，而 history 之后只追加自维护段与处境段，
+  于是模型读到的最后一句人话永远是**上一轮**的 user 消息（表现为 `-i` 连发多条时像在处理上一条），
+  且任务正文每条消息都变、把工具 schema 的前缀缓存每轮打断。
+  现在任务正文是一条 user 消息，由 `Agent._sync_current_input()` 每步维护在 history 末尾
+  （幂等：没变不动，变了原地刷新同一条，已被上下文折叠丢掉则重新追加）；
+  `prompt.py` 新增 `CURRENT_INPUT_TEMPLATE`，`STATIC_TEMPLATE` 不再含任务正文。
+  计划段另加一句：计划跨轮存活、用户的话不跨轮，两者冲突时以当前任务为准。
+  测试数 312 → **331**（新增 `tests/test_current_input_position.py` 守 5 条不变量；
+  另修掉 `test_prompt_prefix_cache` 一处秒级竞态 —— 三处各自 `datetime.now()`，已钉住时钟）。
+  本地验收：`twine check` 两个 PASSED；sdist 无 `.openthree/` / `config.yaml` / `api_key`；
+  仓库根与解包后的 sdist 内各跑一遍 **331 passed**；whl 装到 `_live/wheelcheck` 后用中性 cwd
+  探针验收（`__file__` 指向安装目录而非源码、`__version__=0.1.7`、包内含 `CURRENT_INPUT_TEMPLATE`
+  与 `_sync_current_input`、内置工具 33 个）。
+  **状态：本地已构建并验收通过，尚未上传 PyPI**（线上 `latest` 仍为 `0.1.6`）。
+  上传前勿忘 `0.1.6` 记下的两处环境坑：`PYTHONUTF8=1` + `--disable-progress-bar` 避开 GBK 崩溃；
+  实装验证须显式 `--index-url https://pypi.org/simple/` 绕开镜像同步滞后。
 
 ### 发布上线后的「撤回 / 重发」记录
 
