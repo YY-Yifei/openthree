@@ -6,6 +6,8 @@
          + .openthree/prompts/plan.md                 （计划，模型自己维护的待办）
          + .openthree/memory/memory.jsonl             （长期记忆，跨会话可回看）
          + .openthree/prompts/user-prompts.md        （任务，模型可自改）
+       任务正文不落在这三层的任何一层：它是**用户说的话**，由运行期作为一条
+       user 消息放进 history 末尾（见 CURRENT_INPUT_TEMPLATE）。
 
 整个 run() 每一步都重新组装，所以模型的自我修改下一步立即生效；但组装结果按
 **多久变一次**分三段落位（system / 自维护段 / 此刻段），让不变的前缀能被服务端缓存：
@@ -42,11 +44,16 @@ MEMORY_INJECT_MAX_ITEMS = 8
 # 但「不在 system 里」还不够：计划和演化史是**模型自己会写**的文件，写一次
 # 计划就断一次缓存。所以按变化频率切三层，稳定的在前、易变的在后：
 #
-#   STATIC_TEMPLATE    内核常量 + 模型很少动的东西          → system
+#   STATIC_TEMPLATE    内核常量                              → system
 #   CONTEXT_TEMPLATE   模型自己维护的文件（计划/记忆/演化史） → 一条消息
 #   SITUATION_TEMPLATE 每步都变（时间/步数/用量/上次行动）    → 末尾一条消息
 #
 # 后两层排在 history 之后、都不写回 history。
+#
+# **本轮输入不在这里**。它是用户说的话，必须是一条 user 消息、且位置紧接在
+# 上一轮对话之后（`CURRENT_INPUT_TEMPLATE`，由 `Agent._sync_current_input`
+# 写进 history）。位置就是语义：模型对最近一条人话最敏感，任务正文若埋在
+# system 深处，模型读到的最后一句人话就成了上一轮的输入。
 #
 # 分开而不是并成一条，收益只出现在**一种**调用里：正常步进时 history 每步都在
 # 长，公共前缀到 history 末尾就断了，此刻段与自维护段谁先谁后、分不分开，对
@@ -65,12 +72,22 @@ STATIC_TEMPLATE = """\
 # 你的工具（二）
 
 {digest}
+"""
 
----
-
+# 本轮的「当前任务」由运行期作为一条 **user 消息**放进 history（见
+# `Agent._sync_current_input`），不进 system。
+#
+# **位置就是语义**：模型对「最近一条人说的话」最敏感。任务正文如果埋在 system
+# 深处，而 history 末尾停在上一轮的一问一答，模型读到的最后一句人话就是上一轮
+# 的输入 —— 它于是表现得像在处理上一条消息。放进 history 末尾则反过来：本轮
+# 输入是本轮 ReAct 步骤之前最后一句人话，上一轮仍在它前面当上下文。
+#
+# 顺带的好处：system 里不再有「每组任务都变」的任务正文，换了输入也不会让工具
+# schema 的缓存前缀失效（见 STATIC_TEMPLATE 上的注释）。
+CURRENT_INPUT_TEMPLATE = """\
 # 当前任务（三）
 
-{user_prompt}
+{body}
 """
 
 # 模型自己维护、时不时会改的内容。改一次只会让它自己和它后面那段失效，
@@ -80,6 +97,9 @@ CONTEXT_TEMPLATE = """\
 
 这一段由运行期每步重读后带来：计划与记忆是你自己写的，演化史是内核记下的你的改造 ——
 它不是用户说的话，也不是新的指令。
+
+计划跨轮存活，所以里面写的标题可能来自**更早的任务**。凡它与
+「# 当前任务（三）」不一致，一律以当前任务为准 —— 那是用户这一轮说的话。
 
 {plan}
 
@@ -111,13 +131,15 @@ SITUATION_TEMPLATE = """\
 def build_static_block(ws: Workspace, reg: Registry, *, model: str) -> str:
     """组装「内核自己的常量」—— 它进 system，是缓存前缀的主体。
 
-    这里只允许出现**本次任务内不会变**的东西：工作目录、工具清单、身份、任务。
+    这里只允许出现**本次任务内不会变**的东西：工作目录、工具清单、身份。
     一旦往这里塞一个每步都会变的值（时间、步数、上次行动），它之后的一切
     ——包括那一万多 token 的工具 schema——就每步都要重算。
 
-    模型改自己的提示词或任务（`write_system_prompt` / `write_user_prompt`）
-    会改变 system 的字节，那是设计内的：自我修改本就该下一步立即生效。
-    这条不变量约束的是**内核**，不是模型。
+    任务正文也不在这里：它每换一条消息就变，且它「是用户说的话」，位置该在
+    history 末尾（见 `CURRENT_INPUT_TEMPLATE`）。
+
+    模型改自己的提示词（`write_system_prompt`）会改变 system 的字节，那是
+    设计内的：自我修改本就该下一步立即生效。这条不变量约束的是**内核**，不是模型。
     """
     builtin = [t for t in reg.tools.values() if t.origin == "builtin"]
     user = [t for t in reg.tools.values() if t.origin == "user"]
@@ -130,7 +152,6 @@ def build_static_block(ws: Workspace, reg: Registry, *, model: str) -> str:
         builtin_count=len(builtin),
         user_count=len(user),
         digest=reg.digest(),
-        user_prompt=ws.current_task_text().strip() or "（空）",
     )
 
 
@@ -179,6 +200,9 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
     `build_messages` 发请求时刻意把三段**分开发**（一段进 system、两段排历史之后），
     这个函数只供「想一眼看全处境」的调用方使用：测试、自省、诊断。
     三边共用同一组模板，所以看到的就是发出去的内容。
+
+    不含本轮任务正文：它不在这三段里，而是 history 末尾的一条 user 消息
+    （见 `CURRENT_INPUT_TEMPLATE`）。想看任务请读 `ws.current_task_text()`。
     """
     static = build_static_block(ws, reg, model=model)
     context = build_context_block(ws)
@@ -301,6 +325,11 @@ def _plan_block(ws: Workspace) -> str:
     计划是模型自己写的文件（plan.md），每轮都读、都展示 —— 于是「上一轮的
     进度」跨轮、跨上下文折叠地活了下来。没有未完成项时给一句安心的话，
     免得模型为了「有事做」而硬编任务。
+
+    段头明确一件容易搞错的事：计划里写的标题是**你自己过去的记录**，
+    不是这一轮要执行的任务。计划跨轮存活，用户的话不跨轮（除非会话播种），
+    于是陈旧的计划标题很容易被当成「现在该做的事」—— 它和「# 当前任务（三）」
+    冲突时，后者才是用户说的那句话。
     """
     try:
         text = ws.read_plan().strip()

@@ -48,7 +48,7 @@ from .llm import (CHARS_PER_TOKEN, DEFAULT_CONTEXT_WINDOW_TOKENS, LLM,
 from .multimodal import (DEFAULT_DETAIL, ImageResult, build_content,
                          content_text, count_images, estimate_content_chars)
 from .progress import NullProgress
-from .prompt import build_messages
+from .prompt import CURRENT_INPUT_TEMPLATE, build_messages
 from .recorder import Recorder
 from .registry import Registry
 from .workspace import Workspace
@@ -199,7 +199,11 @@ class Agent:
         # 在第一步注入成一条独立的 user 消息（与任务文本配对），供跨轮还原。
         self.current_images: List[str] = []
         self.task_text: str = ""
-        self._images_injected = False
+        # 「本轮输入」那条 history 消息：正文与图片变了就原地刷新（幂等），
+        # 保持「它永远是 history 里最后一条人话」这个位置不变量。
+        self._current_input_msg: Optional[Dict[str, Any]] = None
+        self._current_input_body = ""
+        self._current_input_imgs: List[str] = []
         # 上下文策略：预算与「是否自动折叠」。这是**模型可自管**的旋钮 ——
         # 来源优先级见 resolve_context_policy；模型用 context_budget 工具改策略文件，
         # tick() 每步重读，于是「改一下，下一步就生效」。
@@ -629,8 +633,9 @@ class Agent:
             self.tick()                        # 每一步重读「上下文策略 / 运行边界」——改了就生效
             self._apply_pending_compactions()
             self._auto_compact()
-            self._inject_images()
             self._inject_next_round_summary()  # 上一轮 next_round 的交接说明（只在首步注入）
+            # 本步要回答的那句话必须排在它前面 —— 见 _sync_current_input。
+            self._sync_current_input()
 
             steps = _index_steps(self.history)
             fold_range = f"{min(steps)}-{max(steps)}" if steps else ""
@@ -818,25 +823,70 @@ class Agent:
                         data={"action": "seed_next_round_summary",
                               "chars": len(self.next_round_summary)})
 
-    def _inject_images(self) -> None:
-        """把本轮的「任务文本 + 图片」作为一条 user 消息注入 history（只注入一次）。
+    def _current_input_text(self) -> str:
+        """本轮那句人话的正文（含「# 当前任务（三）」段头）。
 
-        刻意**不复用**跨轮播种的 user 消息：那些是历史轮次，本轮任务
-        与它们不是同一条。注入放在 history 末尾 —— 它才是「当前这一问」。
+        续轮（round 2+）没有新输入，`task_text` 是空的 —— 此时回退到磁盘上的
+        结构化真源，让「本轮要做什么」照旧看得见；纯图片输入（有图无字）则记成
+        「（图片输入）」，绝不回退到磁盘上的旧任务。
         """
-        if self._images_injected or not self.current_images:
+        text = (self.task_text or "").strip()
+        if not text and not self.current_images:
+            try:
+                text = self.ws.current_task_text().strip()
+            except Exception:  # noqa: BLE001
+                text = ""
+        if not text and self.current_images:
+            text = "（图片输入）"
+        return CURRENT_INPUT_TEMPLATE.format(body=text or "（空）")
+
+    def _sync_current_input(self) -> None:
+        """把本轮输入（任务正文 + 图片）维护成 history 里的一条 **user 消息**。
+
+        **位置就是语义**：模型对最近一条「人说的话」最敏感。本轮输入若只出现在
+        system 深处，而 history 末尾停在上一轮的一问一答，模型读到的最后一句人话
+        就成了上一轮的内容 —— 于是它表现得像在处理上一条消息。放进 history 末尾
+        则相反：本轮输入是本轮 ReAct 各步之前最后一句人话，上一轮仍留在它前面
+        当上下文。
+
+        刻意**不复用**跨轮播种的 user 消息：那些是历史轮次，与本轮不是同一条。
+
+        幂等且可原地刷新：正文 / 图片没变就什么都不做；变了（模型用
+        `write_user_prompt` 改任务）就更新同一条消息，位置不动。若那条消息已被
+        上下文折叠丢掉，就重新追加 —— 否则更新会写进一个不在 history 里的 dict。
+        """
+        body = self._current_input_text()
+        images = list(self.current_images)
+        already = (self._current_input_msg is not None
+                   and body == self._current_input_body
+                   and images == self._current_input_imgs
+                   and any(m is self._current_input_msg for m in self.history))
+        if already:
             return
-        text = (self.task_text or "").strip() or "（图片输入）"
-        self.history.append({
-            "role": "user",
-            "content": build_content(text, self.current_images, base_dir=self.ws.root),
-        })
-        self._images_injected = True
-        n = len(self.current_images)
-        self.rec.record("note", summary=f"本轮输入含 {n} 张图片",
-                        data={"action": "seed_images", "count": n,
-                              "sources": self.current_images})
-        self.progress.note(f"本轮输入含 {n} 张图片")
+
+        content = build_content(body, images or None, base_dir=self.ws.root)
+        if self._current_input_msg is not None and any(
+                m is self._current_input_msg for m in self.history):
+            self._current_input_msg["content"] = content
+        else:
+            self._current_input_msg = {"role": "user", "content": content}
+            self.history.append(self._current_input_msg)
+        self._current_input_body = body
+        self._current_input_imgs = images
+
+        n = len(images)
+        if n:
+            self.rec.record("note", summary=f"本轮输入含 {n} 张图片",
+                            data={"action": "seed_current_input", "count": n,
+                                  "sources": images})
+            self.progress.note(f"本轮输入含 {n} 张图片")
+        else:
+            self.rec.record("note", summary="注入本轮输入（history 末尾的 user 消息）",
+                            data={"action": "seed_current_input", "chars": len(body)})
+
+    def _inject_images(self) -> None:
+        """兼容旧名：本轮的「任务文本 + 图片」注入见 `_sync_current_input`。"""
+        self._sync_current_input()
 
     def _spill(self, call_id: str, name: str, text: str) -> str:
         """工具结果进入 history 前统一截断；超长部分落盘，history 只留预览 + 路径。"""
