@@ -10,8 +10,8 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.1.6`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | 本地 `0.1.7`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步），**待上传** |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.1.7`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.1.7`，**已上传 PyPI**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ PASSED |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄） |
@@ -237,9 +237,15 @@ python -m twine upload dist/*
   仓库根与解包后的 sdist 内各跑一遍 **331 passed**；whl 装到 `_live/wheelcheck` 后用中性 cwd
   探针验收（`__file__` 指向安装目录而非源码、`__version__=0.1.7`、包内含 `CURRENT_INPUT_TEMPLATE`
   与 `_sync_current_input`、内置工具 33 个）。
-  **状态：本地已构建并验收通过，尚未上传 PyPI**（线上 `latest` 仍为 `0.1.6`）。
-  上传前勿忘 `0.1.6` 记下的两处环境坑：`PYTHONUTF8=1` + `--disable-progress-bar` 避开 GBK 崩溃；
-  实装验证须显式 `--index-url https://pypi.org/simple/` 绕开镜像同步滞后。
+  **状态：已正式上传 PyPI**（`twine upload` 输出 `View at: https://pypi.org/project/openthree/0.1.7/`）。
+  发布后验证：PyPI JSON API 的 `releases` 含 `0.1.7`、`latest=0.1.7`、两个文件 `yanked` 均为 `False`；
+  `pip download --no-deps` 从 `https://pypi.org/simple` 拉回的 whl 与本地逐字节一致
+  （133136 B / sha256 `4a67f5eb…`），sdist 同理（236974 B / `f8f9d517…`）——
+  即线上产物与本地验收过的那份完全相同，未经中间层重新打包。
+  本次上传一次通过：`PYTHONUTF8=1` + `--disable-progress-bar` 避开了 `0.1.6` 那次的 GBK 崩溃，
+  `~/.pypirc` 凭据直接生效，无需交互。
+  注：线上 sdist 内附的本文是**上传前**的快照，其「现状速览 / 本段」仍写着「待上传」——
+  这是构建早于上传的必然结果；`0.1.7` 不可覆盖，故不回填，以仓库内本文为准。
 
 ### 发布上线后的「撤回 / 重发」记录
 
