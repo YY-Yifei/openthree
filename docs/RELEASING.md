@@ -346,3 +346,41 @@ PyPI 上的版本不能删除，只能 *yank*（标记为“不建议使用”�
   `run_shell(timeout=2)` → 2.4s 返回并报「命令超时（2s），已强杀进程树」✓
 - 发布后 PyPI JSON API：`latest=0.1.5`、两个文件 sha256 与本地逐字节一致 ✓
 
+### 0.1.8 实跑补充（2026-10-27）
+
+本版内容（四项，均可从 git 历史逐条核对）：
+
+- **每个 function 文件同时是命令行程序**：模型造出的 `.py` 可被人和别的 agent 直跑；
+  CLI 参数表与工具 schema 同源（都从签名 + docstring 推导）。命名收敛成唯一判据
+  `is_registrable`（`__x__` 协议 / `_x` 私有 / `x` 公开），注册器、静态审计、
+  子进程验收、命令行入口四处共用。
+- **`-u` 升级模式**：让**这个工作区**追平本机已装内核（不是让 openthree 本身变新，
+  那是 `pip install -U openthree`）。改动先进待应用区，人确认 `:apply` 才落盘，
+  `:undo` 可撤销。`-u --check` 只扫描不改文件，有漂移退出码 1，适合 CI。
+- **自省两条通道**：`whoami` 补上内核版本 / 结构 schema / 工作区完整性（与名字同属
+  「我是谁」，不新增工具、提示词净增 0 字符）；`--help` 加尾注答「怎么查自己」，
+  静态、任何 cwd 下逐字节相同。
+- 老工作区（无 `workspace.json`）调 `whoami` 如实说「无版本戳」，**不把缺失的 schema
+  报成 0** —— 0 会被读成「结构停在第 0 版」。
+
+验收：
+
+- `pyproject.toml` / `openthree/__init__.py` 版本号一致（`0.1.8`，`tomllib` 与
+  `import` 双向核实）✓
+- **仓库根全量 pytest → 402 passed / 0 failed / 0 error / 0 skipped**（核 junit 计数，77.6s）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist 76 项，**无 `.openthree/`、无 `config.yaml`、无 `api_key` / `identity.json` /
+  `limits.json`**（按路径逐条筛，违规 0 项）✓
+- **全新 venv**（`_pub018`）装 **wheel**，在仓库之外的中性 cwd 验收：
+  `import openthree` → `0.1.8`，`__file__` 指向 site-packages ✓
+  `python -m openthree --help` → 尾注「自省」三条正确打印 ✓
+  `python -m openthree --version` → `openthree 0.1.8` ✓
+  绑一个空工作区后 `whoami()` → `内核：0.1.8（本工作区由 0.1.8 铺出；结构 schema 1/1）`、
+  `工作区：17/17 项齐备` ✓
+  `python -m openthree -u --check` 在无工作区处 → **退出码 2** 且提示「先跑一次 openthree
+  （或 --init）」，未凭空造出工作区 ✓
+
+> 体积与 sha256 不写在这里：本文件本身随 sdist 发布，写进去就会改变那些数字（自指）。
+> 因此它们只记在上传后的核对记录里，见「0.1.8 上传后核对」。
+
+
