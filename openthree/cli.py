@@ -34,6 +34,21 @@ from typing import Optional
 from . import __version__
 from .runtime import Runtime
 
+# `--help` 的尾注（argparse `epilog`）。它答「**怎么自省**」，不答「此刻是什么」——
+# 后者属于运行期状态，写进来 `--help` 就不再可 diff、不能进文档。
+# 三条命令各管一件事：我是谁、差什么、版本几。
+_EPILOG = """\
+自省（都不调模型）
+  openthree --inspect       我是谁：名字 / 工作区 / 提示词 / 计划 / 工具数 / 上下文策略
+                            （会顺手把缺失的工作区铺好，与 --init 等价）
+  openthree -u --check      我差什么：相对**本机已装内核**的漂移清单
+                            （缺 / 旧 / 不合规；只读、不改文件；有漂移退出码 1，适合 CI）
+  openthree -V              内核版本；智能体自己用 whoami 看它的版本与 schema
+
+语义边界：-u 只让**这个工作区**追平本机内核，
+让 openthree 本身体变新是 `pip install -U openthree` —— 那是两件事。
+"""
+
 
 def _force_utf8() -> None:
     """Windows 控制台默认 GBK，会让中文与符号报 UnicodeEncodeError。"""
@@ -65,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="openthree",
         description="极简 LLM Agent Harness：agent 天然自我演化（命名、长工具、改提示词）",
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("task", nargs="*",
                    help="任务描述；留空则**进入交互模式**（-i 是默认模式）。"

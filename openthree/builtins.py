@@ -1363,20 +1363,59 @@ def set_identity(name: str, motto: str = "") -> str:
             "下一步起它会出现在你的处境、终端身份卡与报告里。")
 
 
+def _kernel_card(ws) -> list:
+    """「我跑在哪套内核上」那几行 —— 内核版本、结构 schema、工作区完整性。
+
+    这三件事都属于「我是谁」，所以不另立工具：`whoami` 一条答全。
+    名字以 `_` 开头，所以它只是辅助函数，不会多出一个工具（工具清单不变重）。
+
+    老工作区没有 `workspace.json`（`read_workspace_meta()` 返回 `{}`）时，
+    如实写「无版本戳」，绝不把 0 当 schema 报出去 —— 后者会让人以为结构
+    停在第 0 版，而真相是「这版内核还没管过它」。
+    """
+    from .workspace import WORKSPACE_SCHEMA, kernel_version
+
+    kver = kernel_version() or "（未知）"
+    meta = ws.read_workspace_meta() or {}
+    if meta:
+        wver = str(meta.get("kernel_version") or "（未知）")
+        schema = meta.get("schema")
+        lines = [f"内核：{kver}（本工作区由 {wver} 铺出；结构 schema "
+                 f"{schema if schema is not None else '（未知）'}/{WORKSPACE_SCHEMA}）"]
+    else:
+        lines = [f"内核：{kver}（本工作区**无版本戳** —— 它早于版本戳机制；"
+                 "想知道差什么，跑 `openthree -u --check`）"]
+
+    entries = ws.required_entries()
+    missing = [e.path for e in entries if not (ws.dir / e.path).exists()]
+    if missing:
+        head = "、".join(missing[:6]) + ("…" if len(missing) > 6 else "")
+        lines.append(f"工作区：缺 {len(missing)}/{len(entries)} 项 —— {head}")
+    else:
+        lines.append(f"工作区：{len(entries)}/{len(entries)} 项齐备"
+                     "（内容是否过期由 `openthree -u --check` 判）")
+    return lines
+
+
 def whoami() -> str:
-    """看一眼自己是谁：名字 / 格言 / 何时起名 / 改过几次。
+    """看一眼自己是谁：内核 / schema / 名字 / 格言。
 
     还没有名字时如实说「还没有」，并提示用 `set_identity` 起一个。
+
+    Returns:
+        身份卡文本（内核 / schema / 名字 / 格言）；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
         return "[错误] 内核未就绪"
+    lines = _kernel_card(ws)
     identity = ws.read_identity()
     name = identity.get("name")
     if not name:
-        return ("你还没有名字。想清楚自己是谁时，用 "
-                "set_identity(name, motto=…) 给自己起一个。")
-    lines = [f"名字：{name}"]
+        lines.append("名字：还没有名字 —— 想清楚自己是谁时，用 "
+                     "set_identity(name, motto=…) 给自己起一个。")
+        return "\n".join(lines)
+    lines.append(f"名字：{name}")
     if identity.get("motto"):
         lines.append(f"格言：{identity['motto']}")
     lines.append(f"起名于：{identity.get('born_at') or '（未知）'}"
@@ -1405,6 +1444,9 @@ def note(thought: str, tags: str = "") -> str:
     Args:
         thought: 你的推理、判断或计划
         tags: 逗号分隔的标签，便于检索
+
+    Returns:
+        `[ok] 已记录。`
     """
     if KERNEL.recorder is not None:
         KERNEL.recorder.record("note", summary=thought[:200],
