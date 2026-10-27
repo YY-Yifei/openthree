@@ -34,6 +34,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import os
@@ -46,6 +47,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from .multimodal import ImageError, is_remote, save_asset
 
 DIRNAME = ".openthree"
+
+# 工作区**结构** schema 版本。只在「目录布局 / 必备项 / 状态文件语义」这类
+# 需要迁移的变化上 +1；改一句提示词文案、加一个新种子**不算**结构变化
+# （那走 `workspace.json` 里的 kernel_version 与种子 hash 判定）。
+WORKSPACE_SCHEMA = 1
 
 _SYSTEM_PROMPT_SEED = """\
 # 你是谁
@@ -326,6 +332,77 @@ def _version_sort_key(path: Path) -> "tuple":
     return (m.group(1), int(m.group(2) or 0))
 
 
+def _now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def atomic_write(path: Path, text: str) -> None:
+    """原子写：先写同目录临时文件，再 `os.replace` 覆盖目标。
+
+    覆写工作区里的文件（升级施工）绝不能出现「写了一半」的中间态 ——
+    进程被中断时留下半份提示词，比没升级更糟。`os.replace` 在同一文件系统内
+    是原子的，所以要么是旧的完整文件，要么是新的完整文件。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def sha256_text(text: str) -> str:
+    """一段文本的 sha256 —— 用来判「磁盘上这份还是当初铺的那份吗」。"""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def kernel_version() -> str:
+    """本机安装的内核版本号。
+
+    真源只有 `openthree.__version__` 一处（`pyproject.toml` 是它的镜像），
+    这里不另立常量。惰性 import 是必要的：`openthree/__init__.py` 在导入期
+    会拉 kernel，模块级 `from . import __version__` 会形成循环导入。
+    """
+    try:
+        from . import __version__
+
+        return str(__version__)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+@dataclass(frozen=True)
+class WorkspaceEntry:
+    """工作区必备项的一条声明 —— **必备清单的唯一真源**。
+
+    `Workspace.required_entries()` 返回它的清单，`init()`（铺工作区）与
+    `upgrade.scan_upgrade()`（找漂移）都从那一份读。若两处各自列一遍，
+    迟早会分岔 —— 本项目已经在「function 注册判据」上吃过亏。
+
+    `kind` 的语义：
+
+    * `dir`    —— 目录，必须存在。
+    * `seed`   —— **结构型**种子：内容由内核提供、且不该被随意改乱
+                  （系统提示词、README）。它登记内容 hash，于是能分清
+                  「原样未动 → 可整文件换新」与「已被改过 → 只能提议补丁」。
+    * `state`  —— **状态型**种子：内容归使用方所有（计划、边界、身份、
+                  上下文策略）。只判「在不在」，**永不对齐内容** ——
+                  否则一次升级就等于清空计划、重置边界、抹掉名字。
+    * `derive` —— 由别处逻辑生成（当前任务的结构化真源：有旧工作区迁移）。
+    """
+
+    path: str
+    kind: str
+    seed: str = ""
+    force_overwrite: bool = True
+    note: str = ""
+
+
 @dataclass
 class Workspace:
     """一个 `.openthree/` 工作区。"""
@@ -487,50 +564,173 @@ class Workspace:
     def report_file(self) -> Path:
         return self.dir / "three-report.html"
 
+    @property
+    def workspace_meta_file(self) -> Path:
+        """工作区版本戳：`{schema, kernel_version, seeds{path→sha256}, written_at}`。
+
+        它回答一个此前无处可问的问题：**这个 `.openthree/` 是由哪个内核、按哪版
+        结构铺出来的？** 升级模式（`openthree -u`）全靠它把「落后」与「没落后」
+        分开；没有它，唯一能做的判断是「文件在不在」，而那分辨不出内容已过期。
+
+        `schema` 与 `kernel_version` 分开记是两个问题：前者是**结构**变了
+        （该迁移），后者是**内核**换了（该看有没有新种子）。混成一个数会让
+        「只改了一句提示词」也报成结构迁移。
+        """
+        return self.dir / "workspace.json"
+
+    @property
+    def upgrade_dir(self) -> Path:
+        """升级模式的产物：提案与快照（`upgrade/proposal-*.md`、`upgrade/<ts>/`）。"""
+        return self.dir / "upgrade"
+
+    # ---------- 必备清单（唯一真源） ----------
+    def required_entries(self) -> List[WorkspaceEntry]:
+        """工作区**应当**有的东西 —— `init()` 与 `scan_upgrade()` 的共同真源。
+
+        Returns:
+            声明清单；`path` 一律相对 `.openthree/`，用 `/` 分隔。
+        """
+        return [
+            # --- 目录 ---
+            WorkspaceEntry(".", "dir"),
+            WorkspaceEntry("prompts", "dir"),
+            WorkspaceEntry("prompts/history", "dir"),
+            WorkspaceEntry("functions", "dir"),
+            WorkspaceEntry("assets", "dir"),
+            WorkspaceEntry("logs", "dir"),
+            WorkspaceEntry("logs/sessions", "dir"),
+            WorkspaceEntry("logs/events", "dir"),
+            WorkspaceEntry("memory", "dir"),
+            # --- 结构型种子（登记 hash：可判「原样未动」与「已被改过」） ---
+            WorkspaceEntry("prompts/system-prompts.md", "seed", seed="system_prompt",
+                           note="一：系统提示词"),
+            WorkspaceEntry("README.md", "seed", seed="readme",
+                           note="工作区路径对照表"),
+            # --- 状态型种子（只判在不在，永不对齐内容） ---
+            WorkspaceEntry("prompts/user-prompts.md", "state", seed="user_prompt",
+                           note="当前任务的渲染层"),
+            WorkspaceEntry("prompts/plan.md", "state", seed="plan",
+                           note="长任务待办（归模型所有）"),
+            WorkspaceEntry("context.json", "state", seed="context",
+                           note="上下文策略（模型自管）"),
+            WorkspaceEntry("limits.json", "state", seed="limits",
+                           note="运行边界（模型自管）"),
+            WorkspaceEntry("identity.json", "state", seed="identity",
+                           note="身份：名字 / 格言（只有它能改）"),
+            # --- 由别处逻辑生成 ---
+            WorkspaceEntry("prompts/current-task.json", "derive", seed="current_task",
+                           note="当前任务的结构化真源"),
+        ]
+
+    def seed_text(self, kind: str) -> str:
+        """按名字取一份种子内容 —— 种子的**公开访问器**。
+
+        外部（升级扫描、报告、测试）一律走这里，不再 `from .workspace import
+        _SYSTEM_PROMPT_SEED`：私有常量一旦被外部 import，就再也没法自由重构。
+
+        Args:
+            kind: `system_prompt` / `user_prompt` / `current_task` / `plan` /
+                  `context` / `limits` / `identity` / `readme`
+
+        Returns:
+            种子全文；未知名字返回空串。
+        """
+        if kind == "readme":
+            return self._readme_text()
+        return {
+            "system_prompt": _SYSTEM_PROMPT_SEED,
+            "user_prompt": _USER_PROMPT_SEED,
+            "current_task": _CURRENT_TASK_SEED,
+            "plan": _PLAN_SEED,
+            "context": _CONTEXT_SEED,
+            "limits": _LIMITS_SEED,
+            "identity": _IDENTITY_SEED,
+        }.get(kind, "")
+
+    # ---------- 版本戳 ----------
+    def read_workspace_meta(self) -> Dict[str, Any]:
+        """读版本戳；缺失 / 损坏一律返回 `{}`（老工作区即此情形）。"""
+        try:
+            if not self.workspace_meta_file.exists():
+                return {}
+            doc = json.loads(self.workspace_meta_file.read_text(encoding="utf-8") or "{}")
+            return doc if isinstance(doc, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def write_workspace_meta(self) -> Dict[str, Any]:
+        """写版本戳：登记当前内核版本与**每份结构型种子此刻的 hash**。
+
+        hash 记的是「铺下去的那份种子」，不是「磁盘现在这份」—— 读回时两者相比，
+        相等 = 原样未动（可整文件换新），不等 = 已被改过（只能提议补丁）。
+        所以这里对 seed 型条目取 `seed_text()` 的 hash，而非读文件。
+        """
+        seeds: Dict[str, str] = {}
+        for e in self.required_entries():
+            if e.kind == "seed" and e.seed:
+                seeds[e.path] = sha256_text(self.seed_text(e.seed))
+        doc = {
+            "schema": WORKSPACE_SCHEMA,
+            "kernel_version": kernel_version(),
+            "seeds": seeds,
+            "written_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        atomic_write(self.workspace_meta_file,
+                      json.dumps(doc, ensure_ascii=False, indent=2) + "\n")
+        return doc
+
     # ---------- 初始化 ----------
     def init(self, force_prompts: bool = False) -> "Workspace":
-        """幂等地把工作区铺好。已存在的内容不覆盖。"""
-        for d in (
-            self.dir,
-            self.prompts_dir,
-            self.functions_dir,
-            self.assets_dir,
-            self.logs_dir,
-            self.sessions_dir,
-            self.events_dir,
-            self.memory_dir,
-            self.transcript_dir,
-            self.versions_dir,
-        ):
-            d.mkdir(parents=True, exist_ok=True)
+        """幂等地把工作区铺好。已存在的内容不覆盖。
 
-        if force_prompts or not self.system_prompt_file.exists():
-            self.system_prompt_file.write_text(_SYSTEM_PROMPT_SEED, encoding="utf-8")
-        if force_prompts or not self.user_prompt_file.exists():
-            self.user_prompt_file.write_text(_USER_PROMPT_SEED, encoding="utf-8")
+        **「该有什么」不在本函数里硬编码** —— 一律从 `required_entries()` 读。
+        升级模式（`upgrade.scan_upgrade`）用的是同一份清单，于是「铺」与「查」
+        永远不会各说各话。
+        """
+        entries = self.required_entries()
+
+        for e in entries:
+            if e.kind == "dir":
+                (self.dir / e.path).mkdir(parents=True, exist_ok=True)
+
+        # 结构型种子（提示词 / README）：内容由内核提供，默认不覆盖已存在的。
+        for e in entries:
+            if e.kind != "seed":
+                continue
+            target = self.dir / e.path
+            force = force_prompts and e.force_overwrite
+            if force or not target.exists():
+                atomic_write(target, self.seed_text(e.seed))
+
         if not self.current_task_file.exists():
             # 新工作区：若 user-prompts.md 已有真实任务（旧工作区），迁进结构化真源；
             # 否则落种子。之后「读当前任务」只认这个 JSON，不再读 markdown 渲染层。
             self.write_current_task(_clean_task_markdown(self.read_user_prompt()),
                                     images=self.parse_images_from_prompt(
                                         self.read_user_prompt()))
-        if force_prompts or not self.plan_file.exists():
-            self.plan_file.write_text(_PLAN_SEED, encoding="utf-8")
-        if force_prompts or not self.context_policy_file.exists():
-            self.context_policy_file.write_text(_CONTEXT_SEED, encoding="utf-8")
-        if force_prompts or not self.limits_file.exists():
-            self.limits_file.write_text(_LIMITS_SEED, encoding="utf-8")
-        if not self.identity_file.exists():
-            self.identity_file.write_text(_IDENTITY_SEED, encoding="utf-8")
 
-        self._ensure_readme()
+        # 状态型种子（计划 / 边界 / 身份 / 上下文策略）：内容归使用方所有。
+        for e in entries:
+            if e.kind != "state":
+                continue
+            target = self.dir / e.path
+            force = force_prompts and e.force_overwrite
+            if force or not target.exists():
+                atomic_write(target, self.seed_text(e.seed))
+
+        # 版本戳只在「工作区首次铺成」（或显式 force_prompts 重铺种子）时写。
+        # 它是**历史记录**而不是当前镜像：每次 init 都刷新会把「当初是哪一版种子
+        # 铺的」覆盖成今天这一版，于是「原样未动」再也判不出来 —— 所有文件都退化成
+        # `merge`，升级只能打补丁、永远不能安全地整文件换新。
+        # Runtime.__init__ 每次都会调 init()，所以这条约束必须写在这里。
+        if force_prompts or not self.workspace_meta_file.exists():
+            self.write_workspace_meta()
         return self
 
-    def _ensure_readme(self) -> None:
-        readme = self.dir / "README.md"
-        if readme.exists():
-            return
-        readme.write_text(
+    @staticmethod
+    def _readme_text() -> str:
+        """工作区 README 的种子内容（`.openthree/` 里那张路径对照表）。"""
+        return (
             "# .openthree\n\n"
             "这是 openthree 智能体的工作区。\n\n"
             "| 路径 | 含义 |\n|---|---|\n"
@@ -541,14 +741,14 @@ class Workspace:
             "| `context.json` | 上下文策略：预算 / 是否自动折叠；`context_budget` 写、`context_usage` 读 |\n"
             "| `limits.json` | 运行边界：每轮步数 / 最多轮数 / 生成长度 / 工具结果宽度；`set_limits` 写、`limits_usage` 读 |\n"
             "| `identity.json` | 身份：智能体自己起的名字 / 格言；`set_identity` 写、`whoami` 读 |\n"
+            "| `workspace.json` | 工作区版本戳：铺它的内核版本、结构 schema、结构型种子的 hash |\n"
             "| `prompts/history/transcript.jsonl` | 对话档案：用户的完整原始输入（只增不改，`--resume` 可续读） |\n"
             "| `prompts/history/system-*.md` | 系统提示词的历史版本（`read_prompt_version` 回看、`restore_system_prompt` 回退） |\n"
             "| `functions/*.py` | 二：python 文件即 function |\n"
             "| `logs/` | 模型全部工作记录（json / jsonl 分门别类） |\n"
             "| `memory/memory.jsonl` | 二：长期记忆（append-only）；`remember` 写、`recall_memory` 读、每轮注入 |\n"
             "| `three-report.html` | 一页看全智能体工作 |\n\n"
-            "```bash\nopenthree \"你的任务\"\n```\n",
-            encoding="utf-8",
+            "```bash\nopenthree \"你的任务\"\n```\n"
         )
 
     # ---------- 提示词 ----------
@@ -740,14 +940,24 @@ class Workspace:
     def analysis_sections(self, text: Optional[str] = None) -> List[str]:
         """把一份 markdown 的**章节标题**列出来——自省时先看结构，再看全文。
 
-        只取 `#` 开头的行（含层级），去掉 `<!-- -->` 存档头。给 read_prompts 用。
+        只取 `#` 开头的行（含层级），去掉 `<!-- -->` 存档头，并**跳过 ``` 围栏内**的
+        内容。跳过围栏是必需的：代码示例里的 `# 命令行入口` 是一行 python 注释，
+        不是章节标题。若不跳，自省与漂移检测会把「示例代码里出现了什么」误读成
+        「提示词该有什么章节」—— 第一屏就是假警报，整份报告的可信度随之作废。
         """
         body = self.read_system_prompt() if text is None else text
         out: List[str] = []
         in_comment = False
+        in_fence = False
         for line in (body or "").splitlines():
             s = line.rstrip()
             stripped = s.strip()
+            # 围栏本身要先判：``` 行既不是注释也不是标题。
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
             if in_comment:
                 if "-->" in stripped:
                     in_comment = False

@@ -137,6 +137,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", type=int, default=0, metavar="N",
                    help="从对话档案 transcript.jsonl 续读最近 N 轮作为会话起点；"
                         "默认 0 = 不读盘，从零开始")
+    p.add_argument("-u", "--upgrade", action="store_true",
+                   help="升级模式：扫描当前项目的 .openthree/ 相对**本机已装内核**的漂移"
+                        "（缺 / 旧 / 不合规），打印清单，然后进入交互会话 —— 由模型逐条给"
+                        "升级指导，人确认/补充后才落盘。"
+                        "⚠ 它不会让你的 openthree 变新（那是 pip install -U openthree），"
+                        "只让**这个工作区**追平本机内核。与任务参数互斥")
+    p.add_argument("--check", action="store_true",
+                   help="只扫描并打印漂移清单就退出（不调模型、不改任何文件），"
+                        "适合 CI。有漂移退出码 1，没有 0")
+    p.add_argument("--dry-run", action="store_true",
+                   help="升级模式下只让模型出提案、不落盘")
     p.add_argument("-q", "--quiet", action="store_true", help="安静模式（连进度回声也关掉）")
     p.add_argument("-V", "--version", action="version", version=f"openthree {__version__}")
     return p
@@ -146,6 +157,34 @@ def main(argv=None) -> int:
     _force_utf8()
     args = build_parser().parse_args(argv)
     project_dir = Path(args.dir).resolve()
+
+    # --- 升级模式的参数校验（都在起 Runtime 之前，因为构造 Runtime 会写盘） ---
+    task_arg = " ".join(args.task).strip()
+    if args.upgrade and task_arg:
+        print("[错误] -u/--upgrade 不接受任务参数 —— 它自带升级任务。"
+              "要跑别的任务，去掉 -u。", file=sys.stderr)
+        return 2
+    if (args.check or args.dry_run) and not args.upgrade:
+        print("[错误] --check / --dry-run 要与 -u 一起用。", file=sys.stderr)
+        return 2
+    if args.upgrade and args.init:
+        print("[错误] -u 与 --init 互斥：--init 只铺工作区，-u 要读工作区。", file=sys.stderr)
+        return 2
+
+    # -u --check：只扫描、只打印、退出。**不调模型、不写任何文件** ——
+    # 所以它必须走在 Runtime 构造之前：Runtime.__init__ 会 ws.init() 落盘。
+    if args.upgrade and args.check:
+        return _upgrade_check(project_dir)
+
+    # -u 也必须在起 Runtime 之前拦住「没有工作区」的情形：Runtime.__init__ 会
+    # ws.init() 把工作区铺出来，于是「升级一个已有工作区」会悄悄变成「新建一个
+    # 全新工作区」—— 用户以为自己在升级，实际上得到的是初始化，且拿不到任何提示。
+    if args.upgrade and not (project_dir / ".openthree").is_dir():
+        print(f"[错误] {project_dir / '.openthree'} 不存在 —— 这里还没有工作区，"
+              "没有可升级的东西。\n"
+              "       新项目请直接运行 openthree（或 --init）来创建工作区。",
+              file=sys.stderr)
+        return 2
 
     # --no-auto-fold：把自动折叠的「硬闸」环境变量在起 Runtime 前设好，
     # 于是连 config 推导出来的默认预算也不会触发内核兜底折叠。
@@ -189,6 +228,29 @@ def main(argv=None) -> int:
 
     task = " ".join(args.task).strip()
     images = _collect_images(args)
+
+    # --- 升级模式：扫描 → 报告 → 进交互会话 ---
+    # 首条任务由内核生成（报告 + 规程），不是用户输入的 —— 所以这里显式覆盖 task。
+    # stdin 不是终端时不允许进升级会话：它要人逐条确认，无人应答的 REPL 毫无意义。
+    if args.upgrade:
+        from .upgrade import (build_upgrade_task, render_report, scan_upgrade,
+                              write_playbook)
+
+        if not _stdin_is_tty():
+            print("[错误] -u 需要交互终端（要人逐条确认）。"
+                  "无人值守请用 `openthree -u --check`（只扫描，不改文件）。",
+                  file=sys.stderr)
+            return 2
+        report = scan_upgrade(rt.ws)
+        print(render_report(report))
+        # 规程落盘：上下文被折叠、或模型忘了规矩时，可以 read_file 重读回来。
+        # 做成文件而不是内置工具，是因为工具的 schema 会出现在每一次请求里，
+        # 而这条规程只在升级模式用得上。
+        print(f"\n升级规程：{write_playbook(rt.ws)}")
+        print()
+        return _interactive(rt, build_upgrade_task(report, dry_run=args.dry_run),
+                            args.append, None, auto=args.auto, resume=0,
+                            upgrade=True, dry_run=args.dry_run)
 
     # 不带参数 = 进交互模式（-i 是默认模式）。前提是有人在键盘边：stdin 不是终端
     # （管道 / CI / 脚本）时 REPL 会立刻 EOF、什么也不做就退出，所以那种情况走单次。
@@ -239,6 +301,29 @@ def main(argv=None) -> int:
     return 0 if doc.get("status") == "done" and not unfinished else 1
 
 
+def _upgrade_check(project_dir: Path) -> int:
+    """`-u --check`：只扫描 + 打印，**不调模型、不写任何文件**。
+
+    它刻意不经过 `Runtime`：构造 Runtime 会 `ws.init()` 落盘，而 `--check` 对 CI
+    承诺「看一眼、不改动」。所以这里直接拿 `Workspace` 读盘扫描。
+
+    Returns:
+        0 = 没有漂移；1 = 有漂移；2 = 环境错误（工作区不存在等）。
+    """
+    from .workspace import Workspace
+
+    ws = Workspace(project_dir)
+    if not ws.dir.exists():
+        print(f"[错误] {ws.dir} 不存在 —— 这里还没有工作区。"
+              "先跑一次 openthree（或 --init）再来升级。", file=sys.stderr)
+        return 2
+    from .upgrade import render_report, scan_upgrade
+
+    report = scan_upgrade(ws)
+    print(render_report(report))
+    return 1 if report.has_drift else 0
+
+
 def _collect_images(args) -> list[str]:
     """从 --image / --images 收集图片引用（顺序保留，去重）。"""
     out: list[str] = []
@@ -262,7 +347,8 @@ def _collect_images(args) -> list[str]:
 
 def _interactive(rt: Runtime, first_task: str, append: bool,
                  first_images: Optional[list] = None, auto: int = 0,
-                 resume: int = 0) -> int:
+                 resume: int = 0, upgrade: bool = False,
+                 dry_run: bool = False) -> int:
     _force_utf8()
     _print_banner(rt)
     # 交互模式 = 一个进程内会话：逐轮累积、跨轮可见，退出即忘。
@@ -271,11 +357,18 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
               else "全部" if rt.turns < 0
               else f"最近 {rt.turns} 轮")
     print(f"交互模式。工作区 {rt.ws.dir}")
-    print(f"输入 :q 退出，:r 重建报告，:i 自省，:img 附图片；会话记忆：{memory}")
+    if upgrade:
+        print("升级模式：模型给指导，**改动先进待应用区**，你确认后才落盘")
+        print("输入 :q 退出，:staged 看待应用改动，:apply 落盘，:undo 撤销上次升级，"
+              ":r 重建报告，:i 自省")
+    else:
+        print(f"输入 :q 退出，:r 重建报告，:i 自省，:img 附图片；会话记忆：{memory}")
     if resume > 0:
         print(f"续读：已从对话档案载入最近 {resume} 轮（实际 {loaded} 轮）")
     if auto > 0:
         print(f"自动推进：开启（每轮跑完后若计划仍有未完成项，最多接力 {auto} 轮）")
+    if upgrade and dry_run:
+        print("注意：--dry-run 已开启 —— 本轮只出方案，:apply 会被拒绝")
     print(f"对话档案：{rt.ws.transcript_file}（只增不改；记忆只在本会话内）\n")
     pending = first_task
     pending_images = list(first_images or [])
@@ -291,12 +384,51 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
             if not text and not pending_images:
                 continue
             if text in (":q", ":quit", ":exit"):
+                # 升级模式退出前提醒：待应用区还有没落盘的改动，别让人以为已经生效了。
+                if upgrade:
+                    from .upgrade import list_staged
+
+                    left = list_staged(rt.ws)
+                    if left:
+                        print(f"注意：待应用区还有 {len(left)} 个文件没落盘"
+                              "（下次 :apply 才生效）：")
+                        for rel in left:
+                            print(f"  - {rel}")
                 return 0
             if text == ":r":
                 print(f"[ok] {rt.report()}")
                 continue
             if text == ":i":
                 print(rt.self_inspect())
+                continue
+            if text == ":staged":
+                from .upgrade import render_staged
+
+                print(render_staged(rt.ws))
+                continue
+            if text == ":apply":
+                if not upgrade:
+                    print(":apply 只在升级模式（-u）下可用。")
+                    continue
+                from .upgrade import apply_staged
+
+                if dry_run:
+                    print("--dry-run 已开启：只出方案，不落盘。要真正升级请去掉 --dry-run。")
+                    continue
+                res = apply_staged(rt.ws)
+                print(res.summary())
+                if res.applied:
+                    print("\n[提示] 改动已生效。提示词类的改动要下一轮才被读进上下文；"
+                          "自造 function 若要立刻可用，用 reload_functions。")
+                continue
+            if text == ":undo":
+                if not upgrade:
+                    print(":undo 只在升级模式（-u）下可用。")
+                    continue
+                from .upgrade import undo_last
+
+                res = undo_last(rt.ws)
+                print(res.summary())
                 continue
             if text == ":img" or text.startswith(":img "):
                 extra = text[len(":img"):].strip()

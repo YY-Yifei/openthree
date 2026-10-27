@@ -55,6 +55,9 @@ openthree --init                            # 只建工作区
 openthree --inspect                         # 看一眼自己当前的样子（不调模型）
 openthree --functions                       # 列出所有工具
 openthree --report                          # 重建 three-report.html
+openthree -u                                # 升级模式：把本工作区追平本机已装内核（人确认后才落盘）
+openthree -u --check                        # 只扫描、只打印清单就退出（不调模型、不改文件，适合 CI）
+openthree -u --dry-run                      # 让模型出升级方案，但不落盘
 openthree "这张报错什么意思" --image err.png # 多模态：随任务附一张图片
 openthree "对比这两张图" --images a.png,b.png
 ```
