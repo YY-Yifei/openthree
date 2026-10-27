@@ -53,6 +53,9 @@ def view_image(path: str, detail: str = "auto") -> ImageResult:
     Args:
         path: 图片路径或 http(s) 链接
         detail: 传给模型的清晰度 auto / low / high；low 更省 token
+
+    Returns:
+        `ImageResult`：`text` 是给人看的一句话，`images` 是图片路径（Agent 会注入上下文）；出错时返回 `[错误] …` 文本。
     """
     src = (path or "").strip()
     if not src:
@@ -68,6 +71,9 @@ def read_file(path: str, offset: int = 0, limit: int = 2000) -> str:
         path: 文件路径（绝对路径，或相对当前工作目录）
         offset: 起始行号（从 0 开始）
         limit: 最多读取行数；<= 0 表示读到文件末尾
+
+    Returns:
+        文件正文（带行号，超出 limit 会标注显示范围）；失败返回 `[错误] …`。
     """
     p = Path(path).expanduser()
     if not p.is_absolute():
@@ -102,6 +108,9 @@ def list_dir(path: str = ".", show_hidden: bool = False, max_items: int = 200) -
         path: 目录路径，默认当前目录
         show_hidden: 是否显示以点开头的隐藏项
         max_items: 最多显示条目数（至少 1）
+
+    Returns:
+        目录条目清单；失败返回 `[错误] …`。
     """
     p = Path(path).expanduser()
     if not p.is_absolute():
@@ -211,6 +220,9 @@ def search_files(pattern: str, path: str = ".", glob: str = "",
         ignore_case: 是否忽略大小写，默认 false
         max_results: 最多返回多少条命中，默认 100
         context: 每条命中额外显示前后各几行，默认 0
+
+    Returns:
+        「文件:行号: 内容」命中清单（无命中会说「无命中」）；失败返回 `[错误] …`。
     """
     src = (path or ".").strip() or "."
     root = Path(src).expanduser()
@@ -291,6 +303,9 @@ def code_outline(path: str, include_private: bool = True, docstrings: bool = Tru
         include_private: 是否包含 _ 开头的私有函数/方法（双下划线 dunder 始终包含）
         docstrings: 是否显示 docstring 首行
         max_items: 最多列出多少个节点，防止超大文件刷屏
+
+    Returns:
+        类 / 函数签名大纲（含行号范围）；失败返回 `[错误] …`。
     """
     try:
         p = Path(path).expanduser()
@@ -462,6 +477,9 @@ def write_file(path: str, content: str) -> str:
     Args:
         path: 目标文件路径
         content: 要写入的完整内容
+
+    Returns:
+        `[ok] 已写入 …`；失败返回 `[错误] …`。
     """
     p = Path(path).expanduser()
     if not p.is_absolute():
@@ -544,6 +562,9 @@ def run_shell(command: str, cwd: str = "", timeout: int = 60) -> str:
         command: 要执行的命令
         cwd: 工作目录（默认当前目录）
         timeout: 超时秒数（1~3600，越界会被截到边界）
+
+    Returns:
+        命令输出，末尾带 `exit=N`；进程起不来时返回 `[错误] …`。
     """
     work = cwd or str(Path.cwd())
     try:
@@ -612,10 +633,25 @@ def write_function(name: str, code: str, overwrite: bool = True) -> str:
     文件里所有公开函数（不以 _ 开头）都会注册为工具。规范：
       * 写类型注解 —— 它会变成 JSON Schema
       * 写 docstring（Args 段写参数说明）—— 它会变成工具描述
+      * **function 也可以只返回文字**（一段做法 / 规范 / 判据）：它不只是动作，
+        也可以是知识，调它就是把那段指导读进上下文。首行写成「什么时候该调我」，
+        因为那就是模型唯一的索引；正文纯文本、无副作用、可反复调
       * 首个参数若命名为 kernel，会由运行期注入，模型看不到
       * 可 `from openthree import tool, KERNEL`
       * 模块级变量是**暂存**而非长存：reload 会重载模块，别拿它当缓存
         （要长存就用 KERNEL.state）
+      * **文件末尾加命令行尾钩**，于是这个文件既是你手上的工具，也是人能直接
+        跑的命令行程序（`python 本文件.py --help`）：
+            def __main__(argv=None) -> int:
+                \"\"\"命令行入口。\"\"\"
+                from openthree.cli_tool import run_cli
+                return run_cli(globals(), argv=argv)
+
+            if __name__ == "__main__":
+                raise SystemExit(__main__())
+        入口名必须是 `__main__`：dunder 不会被注册成工具；叫 main/cli 会凭空
+        多出一个空参数工具。没加尾钩也仍可用
+        `python -m openthree.tools --file <本文件> <函数> ...` 调用。
 
     写完想更稳，可以再调 `verify_tool(name)`：它在子进程里真正 import 一次，
     能提前发现「语法没错但一 import 就炸」的问题。
@@ -624,6 +660,9 @@ def write_function(name: str, code: str, overwrite: bool = True) -> str:
         name: 文件名（不含 .py），也是这次演化的名字
         code: 完整 python 源码
         overwrite: 已存在时是否覆盖
+
+    Returns:
+        `[ok] 已写入 …` 加静态审计提示；语法错误等失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -675,6 +714,9 @@ def verify_tool(name: str) -> str:
 
     Args:
         name: 文件名（不含 .py），或任意 .py 路径
+
+    Returns:
+        验收结论（能否 import、会得到哪些工具）；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -739,7 +781,11 @@ def verify_tool(name: str) -> str:
 
 
 def reload_functions() -> str:
-    """重新扫描 .openthree/functions/ 并注册全部工具。写完新 function 后调用。"""
+    """重新扫描 .openthree/functions/ 并注册全部工具。写完新 function 后调用。
+
+    Returns:
+        加载结果（新增 / 移除 / 异常文件）与当前工具清单；失败返回 `[错误] …`。
+    """
     reg = KERNEL.registry
     if reg is None:
         return "[错误] 内核未就绪"
@@ -776,6 +822,9 @@ def delete_function(name: str) -> str:
 
     Args:
         name: 文件名（不含 .py）
+
+    Returns:
+        `[ok] 已删除 …`；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -791,7 +840,11 @@ def delete_function(name: str) -> str:
 
 
 def list_functions() -> str:
-    """列出当前所有可用工具及其来源文件。"""
+    """列出当前所有可用工具及其来源文件。
+
+    Returns:
+        工具清单（内置 + 自造 + 加载异常）；失败返回 `[错误] …`。
+    """
     reg = KERNEL.registry
     if reg is None:
         return "[错误] 内核未就绪"
@@ -814,6 +867,199 @@ def list_functions() -> str:
     return "\n".join(rows)
 
 
+def _audit_module(path: Path) -> Dict[str, Any]:
+    """对一个 function 文件做静态体检，返回各项判据的原始结果（不执行代码）。"""
+    code = path.read_text(encoding="utf-8", errors="replace")
+    rep: Dict[str, Any] = {
+        "syntax_error": "", "module_doc": "", "functions": [],
+        "private_helpers": 0, "side_effects": [], "has_main_guard": False,
+        "has_entry": False, "leaked": [],
+    }
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        rep["syntax_error"] = f"{exc.msg} (line {exc.lineno})"
+        return rep
+
+    doc = ast.get_docstring(tree) or ""
+    rep["module_doc"] = doc.strip().splitlines()[0].strip() if doc.strip() else ""
+    rep["has_main_guard"] = _has_main_guard(tree)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "__main__":
+                rep["has_entry"] = True
+            elif node.name.startswith("_"):
+                rep["private_helpers"] += 1
+            else:
+                fn_doc = ast.get_docstring(node) or ""
+                params = [a for a in node.args.args if a.arg not in ("self", "cls")]
+                rep["functions"].append({
+                    "name": node.name,
+                    "doc_first": fn_doc.strip().splitlines()[0].strip() if fn_doc.strip() else "",
+                    "params": len(params),
+                    "annotated": all(a.annotation is not None for a in params),
+                    "return_annotated": node.returns is not None,
+                    "has_args": "Args:" in fn_doc,
+                    "has_returns": "Returns:" in fn_doc,
+                })
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for tgt in targets:
+                if (isinstance(tgt, ast.Name) and isinstance(node.value, ast.Lambda)
+                        and not tgt.id.startswith("_")):
+                    rep["leaked"].append(tgt.id)
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            # 模块级裸调用（print / mkdir / 建连接）：reload 会 exec_module，等于每次加载都跑一遍
+            rep["side_effects"].append(f"`{_call_label(node.value.func) or '?'}()` 第 {node.lineno} 行")
+    return rep
+
+
+def _function_issues(rep: Dict[str, Any]) -> List[str]:
+    """把一份 `_audit_module()` 结果翻译成「规范化清单」的问题列表。
+
+    这是 function 规范化的**唯一判据**：`audit_functions`（给人看的报告）与
+    升级扫描（`upgrade.scan_upgrade` 判 nonconforming）都从这里取，不各写一份。
+    本项目在「function 注册判据」上有过 4 份拷贝、其中 1 份与注册器不一致的教训。
+
+    Args:
+        rep: `_audit_module()` 的原始结果
+
+    Returns:
+        问题描述清单；空列表 = 这条文件合规。
+    """
+    issues: List[str] = []
+
+    if rep["syntax_error"]:
+        issues.append(f"语法错误：{rep['syntax_error']}")
+    if not rep["module_doc"]:
+        issues.append("缺模块 docstring 首行（一句话说明这个文件干什么）")
+    if not rep["functions"]:
+        issues.append("没有可注册的公开函数（公开 = 不以 `_` 开头的顶层 def）")
+    for fn in rep["functions"]:
+        if not fn["annotated"]:
+            issues.append(f"`{fn['name']}`：有参数没写类型注解 → 工具 schema 与 CLI 都拿不到类型")
+        if not fn["return_annotated"]:
+            issues.append(f"`{fn['name']}`：缺返回类型注解")
+        if fn["params"] and not fn["has_args"]:
+            issues.append(f"`{fn['name']}`：docstring 缺 `Args:` 段 → 参数在 --help 里没有说明")
+        if not fn["has_returns"]:
+            issues.append(f"`{fn['name']}`：docstring 缺 `Returns:` 段 → --help 里看不到它返回什么")
+        if fn["name"] in _RESERVED_TOOL_NAMES:
+            issues.append(f"`{fn['name']}`：这是命令行入口的保留名，会与 --help 语义混淆，建议改名")
+    if rep["side_effects"]:
+        issues.append("模块级有副作用（每次加载都会执行）：" + "、".join(rep["side_effects"]))
+    if rep["leaked"]:
+        issues.append("这些公开名绑定的是 lambda（会注册成 `<lambda>` 工具，多个互相覆盖）："
+                      + ", ".join(rep["leaked"]) + "；请改成 `def` 或加 `_` 前缀")
+    if rep["functions"] and not rep["has_main_guard"]:
+        issues.append('没有命令行尾钩（`if __name__ == "__main__":`）→ 只能靠 '
+                      '`python -m openthree.tools --file` 调')
+    if rep["has_main_guard"] and not rep["has_entry"]:
+        issues.append("有 `__main__` 保护但没有 `def __main__(argv=None)` 入口函数")
+    return issues
+
+
+def function_conformance(path: Path) -> Dict[str, Any]:
+    """体检**单个** function 文件（纯静态：不执行代码、不起子进程跑 --help）。
+
+    升级扫描需要逐文件判「这个自造 function 还合不合当前规范」，而它不该
+    import `_audit_module` 这种私有名 —— 私有名一旦被外部依赖，就再也没法自由
+    重构。所以这里给一个**公开**入口，判据仍只有 `_function_issues` 一份。
+
+    Args:
+        path: function 文件路径
+
+    Returns:
+        `_audit_module()` 的全部字段，外加 `issues`（问题清单，空 = 合规）；
+        文件读不了时 `issues` 里带一条说明。
+    """
+    target = Path(path)
+    try:
+        rep = _audit_module(target)
+    except OSError as exc:
+        return {"syntax_error": "", "module_doc": "", "functions": [],
+                "private_helpers": 0, "side_effects": [], "has_main_guard": False,
+                "has_entry": False, "leaked": [],
+                "issues": [f"读不了这个文件：{exc}"]}
+    rep = dict(rep)
+    rep["issues"] = _function_issues(rep)
+    return rep
+
+
+def audit_functions(run_help: bool = True) -> str:
+    """体检 .openthree/functions/ 下每个文件的「规范化清单」，并真跑一次 --help。
+
+    检查的是「这个文件是不是一个合格的、人能独立运行的 function 文件」：
+    模块 docstring、每个公开函数的类型注解与 `Args:`/`Returns:` 段、
+    模块级有无副作用、有没有命令行尾钩、入口名是否越界（不许叫 main/cli）。
+    最后一条只有它敢承诺：**在子进程里真的跑一次 `python 本文件.py --help`**，
+    断言退出码为 0 且输出里列出每一个公开函数 —— 静态看不出的问题在这里会露出来。
+
+    写新 function 之后跑它，比事后一个个试要快。已知它是「检查」不是「修复」：
+    报告里的每一条都得靠 `write_function` 或 `replace_in_file` 去改。
+
+    Args:
+        run_help: 是否真的在子进程里跑一次 --help（默认 True；慢一点但更可信）
+    """
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    files = ws.list_function_files()
+    if not files:
+        return "[ok] .openthree/functions/ 下还没有 function 文件。"
+
+    rows: List[str] = ["# function 规范化体检"]
+    bad_files = 0
+    total_issues = 0
+
+    for path in files:
+        rep = _audit_module(path)
+        rel = _rel_to(ws.root, path)
+        issues: List[str] = _function_issues(rep)
+
+        help_note = ""
+        if run_help and rep["has_main_guard"] and not rep["syntax_error"]:
+            env = dict(os.environ)
+            prev = env.get("PYTHONPATH", "")
+            pkg_parent = str(Path(__file__).resolve().parents[1])
+            env["PYTHONPATH"] = os.pathsep.join(
+                [x for x in (str(ws.root), pkg_parent, prev) if x]
+            )
+            code, out, err = _run_capture(
+                [sys.executable, str(path), "--help"],
+                work=str(ws.root), timeout=60, env=env,
+            )
+            if code is None:
+                issues.append(f"`--help` 进程起不来：{(out or err).strip()[:300]}")
+            elif code != 0:
+                issues.append(f"`--help` 退出码 {code}（应为 0）：{(err or out).strip()[:300]}")
+            else:
+                missing = [f["name"] for f in rep["functions"] if f["name"] not in out]
+                if missing:
+                    issues.append("`--help` 里没有列出这些公开函数：" + ", ".join(missing))
+                else:
+                    help_note = f"`--help` 正常，列出 {len(rep['functions'])} 个子命令"
+
+        total_issues += len(issues)
+        if issues:
+            bad_files += 1
+            rows.append(f"\n## ⚠ {rel}（{len(issues)} 项待改）")
+            rows.extend(f"- {i}" for i in issues)
+            if help_note:
+                rows.append(f"- ✅ {help_note}")
+        else:
+            rows.append(f"\n## ✅ {rel}")
+            rows.append(f"- {len(rep['functions'])} 个公开函数，"
+                        f"{rep['private_helpers']} 个私有辅助；规范化清单 6 条全过")
+            if help_note:
+                rows.append(f"- ✅ {help_note}")
+
+    head = (f"\n共 {len(files)} 个文件：{len(files) - bad_files} 个合格，"
+            f"{bad_files} 个待改，{total_issues} 项问题。")
+    return "\n".join(rows) + head
+
+
 # ---------------------------------------------------------------- 改提示词
 
 
@@ -822,6 +1068,9 @@ def read_prompts() -> str:
 
     开头先给出系统提示词自带的**章节索引** —— 自省时先看结构一眼看清全貌，
     要用编辑器式操作改哪一段再决定；全文紧随其后。
+
+    Returns:
+        提示词全文（含章节索引）；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -844,6 +1093,9 @@ def write_system_prompt(content: str) -> str:
 
     Args:
         content: 完整的系统提示词 markdown
+
+    Returns:
+        `[ok] 系统提示词已更新 …`；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -863,6 +1115,9 @@ def write_user_prompt(content: str) -> str:
 
     Args:
         content: 完整的任务描述 markdown
+
+    Returns:
+        `[ok] 任务已更新 …`；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -875,7 +1130,11 @@ def write_user_prompt(content: str) -> str:
 
 
 def read_plan() -> str:
-    """读取你自己的计划（`.openthree/prompts/plan.md`）—— 长任务的待办清单。"""
+    """读取你自己的计划（`.openthree/prompts/plan.md`）—— 长任务的待办清单。
+
+    Returns:
+        计划全文与未完成条目数；失败返回 `[错误] …`。
+    """
     ws = KERNEL.workspace
     if ws is None:
         return "[错误] 内核未就绪"
@@ -895,6 +1154,9 @@ def write_plan(content: str) -> str:
 
     Args:
         content: 完整的计划 markdown（含勾选框）
+
+    Returns:
+        `[ok] 计划已更新 …`；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -909,7 +1171,11 @@ def write_plan(content: str) -> str:
 
 
 def list_prompt_versions() -> str:
-    """列出系统提示词的历史版本——写坏了可以回退（自省的前提是可后悔）。"""
+    """列出系统提示词的历史版本——写坏了可以回退（自省的前提是可后悔）。
+
+    Returns:
+        历史版本清单；失败返回 `[错误] …`。
+    """
     ws = KERNEL.workspace
     if ws is None:
         return "[错误] 内核未就绪"
@@ -941,6 +1207,9 @@ def read_prompt_version(version: str = "1", chars: int = 6000) -> str:
     Args:
         version: 版本序号（1 = 最新）/ 文件名 / 负数表示「回看最近 |N| 版概览」
         chars: 单版最多显示多少字符（超出截断；完整内容可用 read_file 打开原文件）
+
+    Returns:
+        指定版本的全文或概览；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -1016,6 +1285,9 @@ def restore_system_prompt(version: str) -> str:
 
     Args:
         version: 版本序号（1 = 最新）或文件名，见 list_prompt_versions
+
+    Returns:
+        `[ok] 系统提示词已回退到 …`；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -1060,6 +1332,9 @@ def set_identity(name: str, motto: str = "") -> str:
     Args:
         name: 新名字（1~24 字符；去首尾空白，禁控制字符与换行）
         motto: 可选的自我格言（一句话，会显示在身份卡上）
+
+    Returns:
+        `[ok] …`，说明新名字与下一步何时生效；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -1144,6 +1419,9 @@ def remember(content: str, tags: str = "") -> str:
     Args:
         content: 要记住的内容
         tags: 逗号分隔的标签
+
+    Returns:
+        `[ok] 已记住。`；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -1171,6 +1449,9 @@ def recall_memory(query: str = "", limit: int = 20) -> str:
     Args:
         query: 关键词；空 = 不过滤，返回最近的
         limit: 最多返回多少条（从最近的往回取），默认 20
+
+    Returns:
+        记忆条目清单（无命中 / 空时给出说明）；失败返回 `[错误] …`。
     """
     ws = KERNEL.workspace
     if ws is None:
@@ -1207,6 +1488,9 @@ def compact_context(start: int, end: int, summary: str = "") -> str:
         start: 起始步骤号（含）
         end: 结束步骤号（含）
         summary: 摘要（保留关键事实/数值/结论/未完成任务）；留空 = 直接丢弃
+
+    Returns:
+        折叠结果（省下多少字符）；失败返回 `[错误] …`。
     """
     ok, msg = False, "[错误] 内核未就绪"
     if KERNEL.agent is not None:
@@ -1227,6 +1511,9 @@ def context_usage() -> str:
     自管上下文的前提是看得见。它返回：已用 / 预算字符数、占比、当前 step 数、
     可折叠的范围、自动折叠是否开启、以及已经折叠过几次。想调整预算或开关自动
     折叠，用 `context_budget`。
+
+    Returns:
+        用量读数（已用 / 预算 / 占比 / 可折范围 / 折叠次数）；失败返回 `[错误] …`。
     """
     if KERNEL.agent is None:
         return "[错误] 内核未就绪"
@@ -1257,6 +1544,9 @@ def context_budget(budget_chars: Optional[int] = None,
     Args:
         budget_chars: 历史字符预算；0 = 关闭自动折叠。不传 = 不改预算。
         auto_fold: 是否让内核在爆仓时兜底折叠；不传 = 不改。
+
+    Returns:
+        策略变更结果；失败返回 `[错误] …`。
     """
     if KERNEL.agent is None:
         return "[错误] 内核未就绪"
@@ -1281,6 +1571,9 @@ def limits_usage() -> str:
 
     **步与轮是两层**：`max_iterations` 只管**一轮**；一轮没做完会由运行期开下一轮，
     整场最多跑 `max_rounds` 轮。长任务做不完时，先想「还差几轮」，而不是一味堆步数。
+
+    Returns:
+        边界读数（各旋钮的当前值与来源）；失败返回 `[错误] …`。
     """
     if KERNEL.agent is None:
         return "[错误] 内核未就绪"
@@ -1316,6 +1609,9 @@ def set_limits(max_iterations: Optional[int] = None,
         tool_result_limit: 单个工具结果进 history 的字符上限，超出落盘；不传 = 不改。
         temperature: 采样温度（0~2）；不传 = 不改。
         max_rounds: **整场任务**最多自动接力几轮（一轮=一次完整 ReAct 循环）；不传 = 不改。
+
+    Returns:
+        边界变更结果；失败返回 `[错误] …`。
     """
     if KERNEL.agent is None:
         return "[错误] 内核未就绪"
@@ -1353,6 +1649,9 @@ def next_round(summary: str = "") -> str:
 
     Args:
         summary: 给「下一轮的你」的交接说明（已完成什么、还剩什么、下一步做什么）。
+
+    Returns:
+        本轮收尾说明（轮预算与下一轮安排）；失败返回 `[错误] …`。
     """
     if KERNEL.agent is None:
         return "[错误] 内核未就绪"
@@ -1381,6 +1680,9 @@ def finish(answer: str) -> str:
 
     Args:
         answer: 面向用户的最终答复
+
+    Returns:
+        `[ok] 已提交最终答复。`
     """
     if KERNEL.agent is not None:
         KERNEL.agent.finish(answer)
@@ -1390,7 +1692,11 @@ def finish(answer: str) -> str:
 
 
 def get_time() -> str:
-    """获取当前时间。"""
+    """获取当前时间。
+
+    Returns:
+        `YYYY-MM-DD HH:MM:SS` 格式的当前时间。
+    """
     from datetime import datetime
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1430,6 +1736,10 @@ def _decode(data: Any) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+# 这些名字是 function 文件的「命令行入口」保留名。定义成同名公开函数，
+# 会在 CLI 里与入口抢位置，且名字本身不表达「这是个工具」，容易让人误以为是入口。
+_RESERVED_TOOL_NAMES = frozenset({"main", "cli", "run_cli"})
+
 # 「高危调用」清单：只是**提醒**（很多合法的自造工具确实要起子进程），
 # 但值得让模型知道「你写的这行会动到系统」——写出来时就说清，胜过事后排查。
 _DANGEROUS_CALLS = frozenset({
@@ -1440,19 +1750,54 @@ _DANGEROUS_CALLS = frozenset({
 })
 
 
+def _has_main_guard(tree: ast.AST) -> bool:
+    """源码里有没有 ``if __name__ == "__main__":`` 这个标准尾钩。
+
+    只认最朴素的两种写法（``__name__ == "__main__"`` 与反向），
+    以及 ``__name__ in ("__main__",)`` —— 判据太宽会把「随便比较一下」
+    当成尾钩，反而让体检失真。
+    """
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+            continue
+        left, op, right = test.left, test.ops[0], test.comparators[0]
+
+        def _is_name(n: ast.AST) -> bool:
+            return isinstance(n, ast.Name) and n.id == "__name__"
+
+        if isinstance(op, ast.Eq):
+            pair = (left, right)
+            if any(_is_name(a) for a in pair):
+                other = right if _is_name(left) else left
+                if isinstance(other, ast.Constant) and other.value == "__main__":
+                    return True
+        elif isinstance(op, ast.In) and _is_name(left):
+            if isinstance(right, (ast.Tuple, ast.List)):
+                for elt in right.elts:
+                    if isinstance(elt, ast.Constant) and elt.value == "__main__":
+                        return True
+    return False
+
+
 def _static_audit(code: str, builtin_names: Optional[set] = None) -> Dict[str, Any]:
     """对一份待落盘的 function 源码做**纯静态**体检（只解析、不执行）。
 
-    返回 dict：``syntax_error`` / ``functions``（可注册的公开函数名）/
-    ``all_functions`` / ``shadows``（覆盖了同名内置工具的公开函数）/
-    ``dangerous``（高危调用，字符串形式）。
+    返回 dict：``syntax_error``（语法错误）/ ``functions``（会被注册的公开
+    def 函数名）/ ``all_functions``（全部顶层 def）/ ``leaked``（公开名被绑成
+    lambda 的，会被注册成 ``<lambda>`` 工具）/ ``reserved``（用了 CLI 保留名
+    的公开函数）/ ``shadows``（覆盖了同名内置工具）/ ``dangerous``（高危调用）。
 
-    注册器最终会 ``exec_module``、并按「本文件定义 + 不由 _ 开头」收函数，
-    所以这里用**同一条规则**预先算一遍 —— 把「写错了」提前到写入那一刻。
+    注册器最终会 ``exec_module``、再按 ``is_registrable`` 收函数。静态审计
+    只看得到语法，所以对「公开名绑定 lambda」这类**语法合法但不该发生**的写法，
+    这里显式报出来 —— 它们真会被注册，工具名还会变成 ``<lambda>``。
     """
     result: Dict[str, Any] = {
         "syntax_error": "", "functions": [], "all_functions": [],
-        "shadows": [], "dangerous": [],
+        "leaked": [], "reserved": [], "shadows": [], "dangerous": [],
+        "has_main_guard": False,
     }
     try:
         tree = ast.parse(code)
@@ -1465,13 +1810,24 @@ def _static_audit(code: str, builtin_names: Optional[set] = None) -> Dict[str, A
 
     public: List[str] = []
     all_names: List[str] = []
+    leaked: List[str] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             all_names.append(node.name)
             if not node.name.startswith("_"):
                 public.append(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = node.value
+            for tgt in targets:
+                if (isinstance(tgt, ast.Name) and isinstance(value, ast.Lambda)
+                        and not tgt.id.startswith("_")):
+                    leaked.append(tgt.id)
     result["functions"] = public
     result["all_functions"] = all_names
+    result["leaked"] = leaked
+    result["reserved"] = sorted(n for n in public if n in _RESERVED_TOOL_NAMES)
+    result["has_main_guard"] = _has_main_guard(tree)
     if builtin_names:
         result["shadows"] = sorted(n for n in public if n in builtin_names)
 
@@ -1509,6 +1865,28 @@ def _audit_notes(audit: Dict[str, Any]) -> List[str]:
         warn = _public_function_warning_from_audit(audit)
         if warn:
             notes.append("⚠ " + warn)
+    if audit.get("leaked"):
+        notes.append("⚠ 这些公开名绑定的是 lambda：" + ", ".join(audit["leaked"])
+                     + "。注册器会把它注册成工具，但工具名会变成 `<lambda>`，"
+                     "多个这样的名字还会互相覆盖。请改成 `def`，或加上 `_` 前缀。")
+    if audit.get("reserved"):
+        notes.append("⚠ 这些公开函数用了命令行入口的保留名：" + ", ".join(audit["reserved"])
+                     + "。它们会被注册成工具，但也会与 `python 文件.py --help` 的"
+                     "入口语义混淆。建议改成能表达用途的名字。")
+    if audit.get("functions") and not audit.get("has_main_guard"):
+        notes.append("提示：这个文件还没有命令行尾钩，人/其他脚本只能通过 "
+                     "`python -m openthree.tools --file <本文件> <函数> ...` 调用它。"
+                     "想让 `python 本文件.py --help` 直接可用，在文件末尾加上：\n"
+                     "    def __main__(argv=None) -> int:\n"
+                     "        \"\"\"命令行入口。\"\"\"\n"
+                     "        from openthree.cli_tool import run_cli\n"
+                     "        return run_cli(globals(), argv=argv)\n"
+                     "\n"
+                     "\n"
+                     "    if __name__ == \"__main__\":\n"
+                     "        raise SystemExit(__main__())\n"
+                     "（入口名必须是 `__main__`：dunder 不会被注册成工具，"
+                     "叫 main/cli 会凭空多出一个空参数工具。）")
     if audit.get("shadows"):
         notes.append("⚠ 这些公开函数与**内置工具同名**，reload 后会覆盖内置："
                      + ", ".join(audit["shadows"])
@@ -1568,10 +1946,11 @@ def main():
         return
     rep["ok"] = True
     try:
-        from openthree.tool import build_tool
+        from openthree.tool import build_tool, is_registrable
     except BaseException as e:
         rep["warnings"].append(f"无法 import openthree.tool（{type(e).__name__}: {e}）")
         build_tool = None
+        is_registrable = None
     import inspect
     for nm in dir(mod):
         if nm.startswith("_"):
@@ -1580,10 +1959,17 @@ def main():
         if isinstance(obj, type):
             rep["classes"].append(nm)
             continue
-        if not callable(obj):
-            continue
-        if getattr(obj, "__module__", None) != mod.__name__:
-            continue
+        # 与注册器共用同一判据，验收结果才对得上 reload 之后真正拿到的东西。
+        if is_registrable is not None:
+            if not is_registrable(mod.__name__, nm, obj):
+                continue
+        else:
+            # 退化路径：openthree.tool 都 import 不到时，验收本身已不可信，
+            # 这里只做最基本的过滤，并已在 warnings 里说明原因。
+            if not callable(obj):
+                continue
+            if getattr(obj, "__module__", None) != mod.__name__:
+                continue
         item = {"name": nm, "signature": nm, "error": "", "brief": _first_doc(obj),
                 "needs_kernel": False}
         try:
@@ -1697,6 +2083,7 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "reload_functions": reload_functions,
     "delete_function": delete_function,
     "list_functions": list_functions,
+    "audit_functions": audit_functions,
     "read_prompts": read_prompts,
     "write_system_prompt": write_system_prompt,
     "write_user_prompt": write_user_prompt,
@@ -1719,3 +2106,23 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "finish": finish,
     "get_time": get_time,
 }
+
+
+def __main__(argv=None) -> int:
+    """命令行入口：`python -m openthree.builtins --help` 看全部内置函数。
+
+    这个模块在 package 内，顶层有相对导入（``from .kernel import KERNEL``），
+    所以**只能用 `-m` 运行**；`python openthree/builtins.py` 会在到达本函数之前
+    就因「no known parent package」失败。用户函数（``.openthree/functions/*.py``）
+    才用 `python xxx.py` 直接跑。
+
+    命名成 dunder 是刻意的：注册器与 CLI 共用同一条判据，dunder 永不注册成工具；
+    这个函数的参数表里也没有 ``kernel``，所以它既不是工具、也不会污染工具集。
+    """
+    from .cli_tool import run_cli
+
+    return run_cli(globals(), argv=argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(__main__())

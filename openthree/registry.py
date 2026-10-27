@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from .tool import Tool, build_tool
+from .tool import Tool, build_tool, is_registrable
 from .workspace import Workspace
 
 _MODULE_PREFIX = "openthree_user_functions"
@@ -108,15 +108,10 @@ class Registry:
 
         count = 0
         for attr_name in dir(module):
-            if attr_name.startswith("_"):
-                continue
             obj = getattr(module, attr_name)
-            if not callable(obj):
+            # 唯一判据：dunder / 下划线 / 非函数 / 非本模块定义 一律跳过。
+            if not is_registrable(mod_name, attr_name, obj):
                 continue
-            if isinstance(obj, type):
-                continue
-            if getattr(obj, "__module__", None) != mod_name:
-                continue  # 只收本文件定义的函数，排除 import 进来的
             try:
                 t = build_tool(obj, origin="user", source_file=str(path))
             except Exception as exc:  # noqa: BLE001

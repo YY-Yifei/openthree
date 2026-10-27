@@ -171,6 +171,57 @@ def pdf_to_text(path: str, pages: str = "") -> str:
 然后 `reload_functions()` —— 从下一刻起，`pdf_to_text` 就在它的工具列表里了。
 整个过程不需要人类改一行代码。
 
+## 每个 function 文件也是一个命令行程序
+
+模型造出来的 `.py` 文件，人和别的 agent 也能直接在命令行里跑 ——
+CLI 的参数表与模型看到的工具 schema **同源**（都从签名 + docstring 推导），
+不会出现「模型 7 个参数、命令行只有 5 个」。
+
+文件末尾的尾钩让它自足：
+
+```python
+def __main__(argv=None) -> int:
+    """命令行入口。"""
+    from openthree.cli_tool import run_cli
+    return run_cli(globals(), argv=argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(__main__())
+```
+
+```bash
+python .openthree/functions/safe_edit.py --help          # 看清它能干什么
+python .openthree/functions/safe_edit.py replace_in_file --path a.py --old x --new y
+python .openthree/functions/safe_edit.py replace_in_file --path a.py --old x --new y --json
+```
+
+入口名必须是 `__main__`：dunder 是「协议 / 入口」命名空间，**永远不会被注册成工具**；
+若叫 `main` / `cli`，你就凭空多出一个空参数工具。
+
+**没加尾钩的文件也能跑**，用保底通道（对存量和将来新造的都有用）：
+
+```bash
+python -m openthree.tools --list                      # 内置工具一览
+python -m openthree.tools read_file --path README.md --limit 20
+python -m openthree.tools audit_functions             # 体检本目录所有 function 文件
+python -m openthree.tools --file .openthree/functions/safe_edit.py --list
+python -m openthree.tools --file .openthree/functions/safe_edit.py \
+    replace_in_file --path a.py --old x --new y
+```
+
+退出码就是判据：`0` 成功、`1` 函数返回 `[错误] …`、`2` 抛异常。输出恒为 UTF-8
+（Windows 控制台默认 GBK，会让按 UTF-8 解码的调用方直接崩）。`--json` 给其他 agent 用：
+单行、纯 ASCII，`{"ok":…,"fn":…,"result":…}`，空格分隔的 shell 管道里不会被正文换行打断。
+
+> `openthree/builtins.py` 在包内，顶层有相对导入，所以只能
+> `python -m openthree.builtins --help`；`python openthree/builtins.py` 会如实报
+> `ImportError`。用户 function（`.openthree/functions/*.py`）才是 `python xxx.py` 直跑。
+
+CLI 下 `recorder` 与 `agent` 都是 `None`，所以 `finish` / `context_*` / `limits_*`
+这类依赖 Agent 循环的函数会返回「未就绪」—— 这是划界不是坏了：
+演化史记的是智能体的自我改造，人手动改的不该混进去。
+
 ## 长任务：模型自己维护计划，自主推进
 
 `system-prompts.md` 只是**第一稿骨架**，不是枷锁——种子提示词里就写明「你完全可以、

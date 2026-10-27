@@ -192,3 +192,34 @@ def tool(func: Callable[..., Any]) -> Callable[..., Any]:
     """装饰器：给函数打个记号。注册由加载器统一完成。"""
     setattr(func, "__openthree_tool__", True)
     return func
+
+
+_DUNDER = re.compile(r"^__.+__$")
+
+
+def is_registrable(module_name: Optional[str], attr: str, obj: Any) -> bool:
+    """一个模块属性是否该成为「模型的工具」。全仓库唯一判据。
+
+    三档命名空间：
+
+    1. ``__x__``  dunder —— 协议 / 入口（如 ``__main__``）。永不注册。
+    2. ``_x``     单下划线 —— 私有辅助。永不注册。
+    3. ``x``      公开 —— 作为候选，再按「必须是本模块定义的函数」过滤。
+
+    注册器（registry）、写函数时的静态审计（builtins._static_audit）、
+    子进程验收（_VERIFY_SCRIPT）与命令行入口（cli_tool）都走这一份判据，
+    否则「模型看到的工具」与「人/审计看到的函数」会慢慢发散。
+
+    Args:
+        module_name: 目标模块的 ``__name__``，用于排除 import 进来的函数
+        attr: 模块属性名
+        obj: 该属性取到的对象
+
+    Returns:
+        该属性是否应被注册为工具
+    """
+    if _DUNDER.match(attr) or attr.startswith("_"):
+        return False
+    if not callable(obj) or isinstance(obj, type):
+        return False
+    return getattr(obj, "__module__", None) == module_name
