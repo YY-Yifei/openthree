@@ -31,7 +31,9 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 from .agent import Agent, resolve_context_budget
 from .builtins import BUILTIN_FUNCTIONS
 from .kernel import KERNEL
-from .llm import LLM, LLMConfig, load_config, parse_token_count
+from .llm import (LLM, LLMConfig, REASONING_PLACEHOLDER_FIELD, is_always_replay,
+                  is_known_replay_mode, is_never_replay, load_config,
+                  parse_token_count, resolve_reasoning_placeholder)
 from .progress import Progress
 from .recorder import Recorder
 from .registry import Registry
@@ -48,6 +50,7 @@ class Runtime:
                  tool_result_limit: Optional[int] = None,
                  max_tokens: Optional[int] = None,
                  temperature: Optional[float] = None,
+                 reasoning_effort: Optional[str] = None,
                  context_budget_chars: Optional[int] = None,
                  context_window_tokens: Optional[int] = None,
                  heartbeat: float = 15.0,
@@ -61,6 +64,9 @@ class Runtime:
         self.tool_result_limit = tool_result_limit    # 同上：显式才锁，否则模型可自管
         self.max_tokens = max_tokens
         self.temperature = temperature
+        # 推理强度：None = 完全没提，交给 config.yaml 的 llm.reasoning_effort，
+        # 再没有就一个键都不发。显式给了就是「人类锁定」，模型改不动（见 agent）。
+        self.reasoning_effort = reasoning_effort
         # 整场最多几轮（每轮一次完整 ReAct）；None = 交给模型（limits.json），内核默认 10。
         self.max_rounds = max_rounds
         # 先记住是否显式给了预算/窗口，等 config 读出来后再统一解析。
@@ -373,6 +379,9 @@ class Runtime:
                            tool_result_limit=self.tool_result_limit,
                            max_tokens=self.max_tokens,
                            temperature=self.temperature,
+                           # 推理强度同理：只传**显式**给出的值（None = 没提），
+                           # 没提时 Agent 一个键都不发，完全交给 config/LLM 决定。
+                           reasoning_effort=self.reasoning_effort,
                            # 传**原始**显式参数（None = 未显式给）：Agent 据此决定
                            # 「策略文件里的预算」能否生效；已推导的默认值不当覆写。
                            context_budget_chars=self._explicit_budget,
@@ -585,6 +594,42 @@ class Runtime:
     def report(self) -> Path:
         return write_report(self.ws)
 
+    def reasoning_effort_label(self) -> str:
+        """当前生效的推理强度 + 它是谁定的（给人看的一行）。"""
+        explicit = (self.reasoning_effort or "").strip()
+        if explicit:
+            return f"{explicit}（--reasoning-effort 显式锁定）"
+        from_cfg = (getattr(self.config, "reasoning_effort", None) or "").strip()
+        if from_cfg:
+            return f"{from_cfg}（config.yaml 的 llm.reasoning_effort）"
+        return "未设置（请求里不带 reasoning_effort 字段）"
+
+    def reasoning_replay_label(self) -> str:
+        """reasoning 回传策略 + 本机会不会真的补占位（给人看的一行）。
+
+        只回答「配置看起来会怎样」：`auto` 那两档的判据（端点像不像 DeepSeek
+        家族）这里能算，但「推理是否真的开着」要到运行时才知道 —— 所以 `auto`
+        一律按「推理开着」预览，宁可把「会补」说清楚，让人知道该核查什么。
+        取值不认识时也如实说：静默按 auto 处理会让人误以为自己写对了。
+        """
+        cfg = self.config
+        mode = str(getattr(cfg, "reasoning_content_replay", "auto") or "auto").strip()
+        unknown = ("" if is_known_replay_mode(mode)
+                   else f"「{mode}」不是已知取值，按 auto 处理 → ")
+        if is_never_replay(mode):
+            return (f"never（永不补 {REASONING_PLACEHOLDER_FIELD} 占位；收到的 reasoning "
+                    f"仍照原样回放 —— 端点要求这个字段时会 400）")
+        field = resolve_reasoning_placeholder(
+            mode, base_url=getattr(cfg, "base_url", "") or "",
+            model=getattr(cfg, "model", "") or "", reasoning_active=True)
+        if field is None:
+            return (f"{unknown}auto（端点不像 DeepSeek 家族 → 不补占位，只原样回放收到的 "
+                    f"reasoning；若端点其实要求它，写成 always）")
+        if is_always_replay(mode):
+            return f"always（每条 assistant 消息都补 {field} 占位）"
+        return (f"{unknown}auto（端点像 DeepSeek 家族 → 推理开着时补 {field} 占位；"
+                f"判不出厂商就写 always）")
+
     # ---------------------------------------------------------------- 自省
     def self_inspect(self) -> str:
         """不需要模型的一句话自省摘要。"""
@@ -607,6 +652,8 @@ class Runtime:
             f"（会话内记忆 {self.turns if self.turns >= 0 else '全部'} 轮对话；"
             "单次任务不读盘，-i / --auto 才逐轮累积）",
             f"工具     {len(reg)} 个（内置 {len(reg.builtins)} / 自造 {len(reg.user_tools())}）",
+            f"推理强度 {self.reasoning_effort_label()}",
+            f"reasoning 回传 {self.reasoning_replay_label()}",
             f"上下文   窗口 {_fmt_tokens(self.context_window_tokens)} token"
             f" → 预算 {_fmt_chars(self.context_budget_chars)} 字符"
             f"（{self.context_budget_source}；模型可用 context_budget 改）"

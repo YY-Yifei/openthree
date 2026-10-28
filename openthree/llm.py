@@ -18,7 +18,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import yaml
@@ -48,6 +48,15 @@ class LLMConfig:
     # 模型上下文窗口（token）。上下文预算的默认值的来源。
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     temperature: float = 0.3
+    # 推理强度（OpenAI 风格 `reasoning_effort`：minimal / low / medium / high）。
+    # None = 请求里**不带这个键** —— 不发 null，因为严格校验的 provider 会因此 400。
+    # 写在这一层而不是只丢给 `extra`：`extra` 是给「内核不认识的键」的透传口，
+    # 而这个是内核认识的旋钮，要有字段、有来源、能被 --reasoning-effort 按调用覆盖。
+    reasoning_effort: Optional[str] = None
+    # reasoning 回传策略：`auto` / `always` / `never`，语义见
+    # resolve_reasoning_placeholder()。它管的是**回传**（assistant 消息上的
+    # 占位字段），与上面的 reasoning_effort（请求参数）是两件事。
+    reasoning_content_replay: str = "auto"
     timeout: float = 600.0
     # connect 阶段单独设一个短超时：read=600s 是合理的（等模型生成），
     # 但「连不上主机」跟「模型想得久」是两回事——不分开就会把 connect 也
@@ -64,6 +73,136 @@ class LLMConfig:
     @property
     def usable(self) -> bool:
         return bool(self.api_key and self.base_url and self.model)
+
+
+def _clean_effort(value: Any) -> Optional[str]:
+    """把 reasoning_effort 归一成小写字符串；空 / None 一律当「不设置」。
+
+    **不校验取值**：`reasoning_effort` 不是 OpenAI 独有的词表，各家 provider
+    有自己的档位（`minimal` / `low` / `medium` / `high` / `none` / `xhigh`…），
+    这里硬编码白名单只会把新档位挡在门外。真正合不合法由 provider 说了算，
+    错了会得到一句明确的 400 —— 那比内核替它猜要诚实。
+
+    但**大小写要归一**：OpenAI 一侧的枚举全是小写，`HIGH` 会被当成非法取值
+    400 掉，而人写配置时大小写是随手的事。归一不改变词表，只抹掉这个坑。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+# ---------------------------------------------------------------- reasoning 回传
+# provider 用哪个字段名吐 reasoning，就用哪个名字回放 —— 这三个都是 OpenAI 兼容
+# 生态里真实存在的写法（DeepSeek / GLM / Kimi 用 `reasoning_content`，部分网关用
+# `reasoning` 或 `reasoning_text`）。顺序即优先级：取第一个非空的。
+# **不硬编码单一字段名**：字段名是端点的属性，猜错等于整段 reasoning 被丢掉。
+REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_text")
+
+# 「每条 assistant 消息都必须带这个字段」时用的占位字段。值可以是空串 ——
+# 端点校验的是**键存在**，不是内容非空。
+REASONING_PLACEHOLDER_FIELD = "reasoning_content"
+
+_REASONING_REPLAY_ALWAYS = ("always", "on", "yes", "true", "1")
+_REASONING_REPLAY_NEVER = ("never", "off", "no", "false", "0")
+
+
+def _clean_replay_mode(value: Any) -> str:
+    """把 `reasoning_content_replay` 归一成 `auto` / `always` / `never`。
+
+    缺省与空串 → `auto`。布尔与 0 **保留**（`false` / `0` 就是 `never`）——
+    一律按「假值 → 回落 auto」处理会把「我要关掉它」悄悄翻成「自动」，
+    而那正是最难查的那种配置事故。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "auto"
+    return str(value).strip()
+
+
+def extract_reasoning(message: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
+    """找出这条 message 里的 reasoning，返回 `(字段名, 文本)`；没有则 None。
+
+    按 `REASONING_FIELDS` 的顺序取**第一个非空**的。空串与非字符串一律跳过 ——
+    端点偶尔会吐 `reasoning_content: ""`，那不算「有 reasoning」。
+    """
+    for field in REASONING_FIELDS:
+        value = (message or {}).get(field)
+        if isinstance(value, str) and value:
+            return field, value
+    return None
+
+
+def _looks_deepseek(base_url: str, model: str) -> bool:
+    """端点像不像 DeepSeek 家族（pi-ai 的探测规则，放宽一处）。
+
+    pi-ai 只认 `baseUrl.includes("deepseek.com")`。openthree 的 base_url 却常是
+    自建代理（`https://gw.internal/deepseek/v1`），域名里根本没有 deepseek.com，
+    所以这里改判「base_url 里出现 deepseek，或 model 名以 deepseek 开头」，
+    并始终保留显式覆盖（`always` / `never`）—— 私有网关的 URL 说明不了什么，
+    最终得由人说了算。
+    """
+    return ("deepseek" in (base_url or "").lower()
+            or (model or "").lower().startswith("deepseek"))
+
+
+def is_always_replay(mode: Any) -> bool:
+    """`reasoning_content_replay` 是否落在「无条件补占位」那一档（含别名）。
+
+    单独暴露出来，是为了让「谁算 always」只有一份定义：`resolve_reasoning_placeholder`
+    与 Runtime 的身份卡都判这一处，日后加别名不会改一处漂一处。
+    """
+    return str(mode if mode is not None else "").strip().lower() in _REASONING_REPLAY_ALWAYS
+
+
+def is_never_replay(mode: Any) -> bool:
+    """是否落在「永不补占位」那一档（含别名）。"""
+    return str(mode if mode is not None else "").strip().lower() in _REASONING_REPLAY_NEVER
+
+
+def is_known_replay_mode(mode: Any) -> bool:
+    """这个取值是不是认识的（`auto` / `always` / `never` 及其别名，空 = auto）。
+
+    不认识的取值不会报错 —— `resolve_reasoning_placeholder` 按 `auto` 处理。
+    这里只是让调用方能如实告诉人「你写的那个词没用上」。
+    """
+    normalized = str(mode if mode is not None else "").strip().lower()
+    return (not normalized) or normalized == "auto" \
+        or is_always_replay(mode) or is_never_replay(mode)
+
+
+def resolve_reasoning_placeholder(mode: Any, *, base_url: str = "", model: str = "",
+                                  reasoning_active: bool = False) -> Optional[str]:
+    """要不要在每条 assistant 消息上补一个 reasoning 占位字段？返回字段名或 None。
+
+    某些 OpenAI 兼容端点在推理模式下要求**每一条** assistant 消息都带
+    `reasoning_content`，否则下一次请求就会被 400 拒掉
+    （"The reasoning_content in the thinking mode must be passed back to the API"）。
+    难点在于：模型并不是每轮都吐 reasoning —— 没有 reasoning 的那一轮若把字段
+    一起省掉，下一请求就挂了。所以「没内容」时要发一个空串占位。
+
+    三档（config.yaml 的 `llm.reasoning_content_replay`）：
+
+    * `auto`（默认）：端点像 DeepSeek 家族 **且** 推理确实开着时才补；
+    * `always`：无条件补 —— 逃生口，给「代理 URL 看不出厂商 + 模型默认就在想
+      却不吐 delta」这种 `auto` 判不出来的组合；
+    * `never`：永不补。
+
+    **三档管的都只是「占位」**：已经收到的 reasoning 仍然照 provider 的字段名
+    原样回放（见 `extract_reasoning` 与 `Agent._attach_reasoning`）—— `never`
+    的名字容易被读成「完全不回传」，它不是那个意思。
+
+    「推理确实开着」由调用方判断（`reasoning_active`）：openthree 没有模型注册表，
+    无法像 pi-ai 那样查 `model.reasoning`，只能从「人类设了推理档位（含
+    `config.extra` 透传）」或「本场已经见过 reasoning」这些真实信号推断。
+    不认识的取值按 `auto` 处理。
+    """
+    if is_never_replay(mode):
+        return None
+    if is_always_replay(mode):
+        return REASONING_PLACEHOLDER_FIELD
+    if not reasoning_active or not _looks_deepseek(base_url, model):
+        return None
+    return REASONING_PLACEHOLDER_FIELD
 
 
 def parse_token_count(value: Any) -> Optional[int]:
@@ -151,6 +290,10 @@ def load_config(project_dir: Optional[Path] = None, model_override: Optional[str
         max_tokens=int(parse_token_count(merged.get("max_tokens")) or 32768),
         context_window_tokens=int(window),
         temperature=float(merged.get("temperature", 0.3) or 0.3),
+        reasoning_effort=_clean_effort(merged.get("reasoning_effort")),
+        reasoning_content_replay=_clean_replay_mode(
+            merged.get("reasoning_content_replay",
+                       merged.get("requires_reasoning_content"))),
         timeout=float(merged.get("timeout", 600) or 600),
         connect_timeout=float(merged.get("connect_timeout", 5) or 5),
         retries=int(merged.get("retries", 3) or 0),
@@ -198,16 +341,21 @@ class LLM:
              tools: Optional[List[Dict[str, Any]]] = None,
              tool_choice: str = "auto",
              max_tokens: Optional[int] = None,
-             temperature: Optional[float] = None) -> Dict[str, Any]:
+             temperature: Optional[float] = None,
+             reasoning_effort: Optional[str] = None) -> Dict[str, Any]:
         """返回 {message, usage, elapsed_ms, raw_request, raw_response, attempts}。
 
         `attempts` 是**本次调用真正打到线上的次数**（含重试；>1 说明重试过且最终
         成功/放弃）。失败与成功两条路径都会带上它，供日志与进度显示用。
 
-        `max_tokens` / `temperature` 可**按次覆盖**配置里的值 —— 调用方（Agent）
-        由此把「模型自管的运行边界」按调用传进来，而不必去改 `self.config`。
-        这很关键：Runtime 在 `-i` / `--auto` 下复用同一个 LLM，若靠原地改 config，
-        这一轮写进去的边界会污染下一轮的「内核默认」。
+        `max_tokens` / `temperature` / `reasoning_effort` 可**按次覆盖**配置里的值
+        —— 调用方（Agent）由此把「模型自管的运行边界」按调用传进来，而不必去改
+        `self.config`。这很关键：Runtime 在 `-i` / `--auto` 下复用同一个 LLM，
+        若靠原地改 config，这一轮写进去的边界会污染下一轮的「内核默认」。
+
+        `reasoning_effort` 的优先级是**显式 > config 字段 > config.extra**：
+        显式值必须能压过 `extra` 里那份（否则人类在命令行给的值会被配置文件
+        里顺手写的透传值悄悄吃掉）。
         """
         client = self._ensure_client()
         eff_max_tokens = (self.config.max_tokens if max_tokens is None
@@ -222,6 +370,12 @@ class LLM:
         }
         for k, v in (self.config.extra or {}).items():
             payload.setdefault(k, v)
+        # 推理强度放在 extra **之后**：显式参数 > 配置字段 > extra 透传。
+        # 三项都没有时一个键都不加 —— 不发 null，严格校验的 provider 会因此 400。
+        eff_effort = _clean_effort(reasoning_effort) or _clean_effort(
+            self.config.reasoning_effort)
+        if eff_effort is not None:
+            payload["reasoning_effort"] = eff_effort
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
@@ -308,8 +462,33 @@ def _backoff(attempt: int) -> float:
     return min(30.0, (2 ** attempt)) + random.uniform(0, 0.5)
 
 
+# 日志里每段 reasoning 保留多少字符。reasoning 会被**回放**进后续每个请求，
+# 全量落盘会让日志体积随步数近似平方增长（每一步都重带前面所有轮的 reasoning）。
+_LOG_REASONING_CHARS = 200
+
+
+def _shrink_reasoning(msg: Any) -> Any:
+    """把一条消息里的 reasoning 截成「头 N 字符 + 省略计数」—— **只用于日志**。
+
+    与图片 base64 同一个思路：真实请求照发全文，日志只留可辨识的痕迹。
+    返回新 dict，绝不原地改 —— 这份 payload 还要真的发出去。
+    """
+    if not isinstance(msg, dict):
+        return msg
+    out = dict(msg)
+    for fld in REASONING_FIELDS:
+        val = out.get(fld)
+        if isinstance(val, str) and len(val) > _LOG_REASONING_CHARS:
+            out[fld] = (f"{val[:_LOG_REASONING_CHARS]}…"
+                        f"<日志省略 {len(val) - _LOG_REASONING_CHARS} 字符>")
+    return out
+
+
 def _redact(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """日志里不留 api_key；图片 base64 折叠成占位符，避免日志被撑爆。"""
+    """日志里不留 api_key；图片 base64 折叠、reasoning 截断，避免日志被撑爆。"""
     out = dict(payload)
     out.pop("api_key", None)
+    msgs = out.get("messages")
+    if isinstance(msgs, list):
+        out["messages"] = [_shrink_reasoning(m) for m in msgs]
     return sanitize_for_log(out)

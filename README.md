@@ -37,6 +37,8 @@ llm:
   base_url: https://api.deepseek.com
   model: deepseek-v4.1-flash
   max_tokens: 32768
+  reasoning_effort: high          # 可选：minimal/low/medium/high；不写 = 请求里不带该字段
+  reasoning_content_replay: auto  # 可选：auto/always/never —— 推理模式下 reasoning 的回传策略
   context_window_tokens: 128k   # 上下文窗口，决定自动折叠预算；可写 1M/128k/1000000，缺省 1M
 ```
 
@@ -392,6 +394,14 @@ openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已
 - **超时是分层的。** `llm.timeout`（默认 600s）管 read/write/pool——等模型慢慢
   生成是合理的；`llm.connect_timeout`（默认 5s）单独管「连不上主机」，快速失败
   后交给重试。两层不分开的话，「主机不可达」这一种失败也会干等满 600s。
+- **推理模式下 reasoning 会原样回传。** provider 用哪个字段名吐（`reasoning_content` /
+  `reasoning` / `reasoning_text`），就用哪个名字放回下一轮历史——改名等于端点认不出来。
+  端点要求「每条 assistant 消息都带 `reasoning_content`」时，**没有 reasoning 的那一轮补空串**
+  （校验的是键存在，不是内容非空）：漏了这一步，模型某轮不吐 reasoning 会让**下一次**请求 400。
+  策略由 `llm.reasoning_content_replay` 决定：`auto`（默认，端点像 DeepSeek 家族且推理开着才补）/
+  `always`（代理 URL 判不出厂商时的逃生口）/ `never`；`--inspect` 会显示当前判定。
+  **三档管的都只是「占位」**：已经收到的 reasoning 仍照原样回放，所以 `never` 不等于
+  「完全不回传」——它只是不再给没有 reasoning 的那一轮补空串。
 - **输出被截断可恢复。** `finish_reason=length` 时如实报错，**并要求模型重发**那条消息
   （更精简），最多 2 次——而不是把半截 `tool_calls` 当成正常回复、或白白杀死整场任务。
   连续重发仍截断才失败，并提示模型用 `set_limits(max_tokens=…)` 自己调大生成上限

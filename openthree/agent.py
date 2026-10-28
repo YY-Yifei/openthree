@@ -43,8 +43,9 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .kernel import KERNEL
-from .llm import (CHARS_PER_TOKEN, DEFAULT_CONTEXT_WINDOW_TOKENS, LLM,
-                  parse_token_count)
+from .llm import (CHARS_PER_TOKEN, DEFAULT_CONTEXT_WINDOW_TOKENS,
+                  REASONING_FIELDS, LLM, extract_reasoning, parse_token_count,
+                  resolve_reasoning_placeholder)
 from .multimodal import (DEFAULT_DETAIL, ImageResult, build_content,
                          content_text, count_images, estimate_content_chars)
 from .progress import NullProgress
@@ -148,6 +149,7 @@ class Agent:
                  tool_result_limit: Optional[int] = None,
                  max_tokens: Optional[int] = None,
                  temperature: Optional[float] = None,
+                 reasoning_effort: Optional[str] = None,
                  context_budget_chars: Optional[int] = None,
                  seed_turns: Optional[Sequence[Dict[str, Any]]] = None,
                  progress: Optional[Any] = None,
@@ -166,6 +168,13 @@ class Agent:
         self._explicit_tool_result_limit = tool_result_limit
         self._explicit_max_tokens = max_tokens
         self._explicit_temperature = temperature
+        # 推理强度不在这五个「运行边界」里：它不是模型的旋钮（模型没有 set_limits
+        # 那一套去改它），而是人类在启动时给 provider 的一个采样参数。显式给了就
+        # 一路透传到 chat()，不落 limits.json、不参与 tick() 的重读。
+        self._explicit_reasoning_effort = reasoning_effort
+        # 本场是否已经见过 reasoning（模型吐过 thinking）。它是「推理开着」的证据：
+        # 没有模型注册表可查，只能靠真实信号推断（见 _reasoning_active）。
+        self._saw_reasoning = False
         self._explicit_max_rounds = max_rounds
         self._limits_env = os.environ.get(LIMITS_LOCK_ENV)
         # 生成参数的「内核默认」基线：**构造时快照一次，之后只读**。
@@ -616,7 +625,10 @@ class Agent:
                                 "content": build_content(user, imgs,
                                                          base_dir=self.ws.root)})
             if answer:
-                history.append({"role": "assistant", "content": answer})
+                # 播种的 assistant 消息同样要过占位闸门：`-i` 的第 2 轮若缺
+                # `reasoning_content`，DeepSeek thinking 下第一条消息就 400。
+                history.append(self._pad_reasoning(
+                    {"role": "assistant", "content": answer}))
         if history:
             self.rec.record("system", summary=f"跨轮记忆：播种会话内 {len(turns)} 轮对话",
                             data={"action": "seed_session_turns",
@@ -651,9 +663,15 @@ class Agent:
                 round_stats=self.round_stats(),
             )
             self.progress.llm_start(self.llm.config.model)
+            # 推理强度**只在人类显式给了时才传**：`chat()` 多了一个可选参数，
+            # 但调用方不该因此强制所有实现都签上它（自造 function 可能直接用
+            # 自己的 LLM 子类）。没显式给就完全交给 LLM 自己按 config 决定。
+            gen_kwargs: Dict[str, Any] = {}
+            if self._explicit_reasoning_effort:
+                gen_kwargs["reasoning_effort"] = self._explicit_reasoning_effort
             result = self.llm.chat(messages, tools=self.reg.schemas() or None,
                                    max_tokens=self.max_tokens,
-                                   temperature=self.temperature)
+                                   temperature=self.temperature, **gen_kwargs)
             msg = result.get("message") or {}
             self.progress.llm_done(result.get("elapsed_ms", 0.0), result.get("usage"),
                                    result.get("error"), result.get("attempts", 1))
@@ -701,6 +719,7 @@ class Agent:
             assistant_msg: Dict[str, Any] = {"role": "assistant", "content": msg.get("content") or ""}
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
+            self._attach_reasoning(assistant_msg, msg)
             self.history.append(assistant_msg)
 
             if not tool_calls:
@@ -725,6 +744,96 @@ class Agent:
                                   "max_rounds": self.max_rounds})
 
         return self.answer or ""
+
+    # ---------------------------------------------------------------- reasoning
+    def _reasoning_active(self) -> bool:
+        """推理是不是真的开着：人类设了档位，或本场已经见过 reasoning。
+
+        openthree 没有模型注册表，无法像 pi-ai 那样查 `model.reasoning`，只能从
+        两个真实信号推。宁可判「没开」—— 已开却没补占位只是维持现状（那是原来的
+        行为），没开却补了却可能把本来能跑的配置弄坏。
+        """
+        cfg = getattr(self.llm, "config", None)
+        effort = (self._explicit_reasoning_effort
+                  or getattr(cfg, "reasoning_effort", None))
+        if not str(effort or "").strip():
+            # `config.extra.reasoning_effort` 也算数：`LLM.chat` 会真的把它发出去
+            # （优先级 显式 > 配置字段 > extra），端点因此进入推理模式。这里若漏掉
+            # 它，就会「明明开着推理 → 判没开 → 不补占位 → 下一次请求 400」。
+            extra = getattr(cfg, "extra", None)
+            if isinstance(extra, dict):
+                effort = extra.get("reasoning_effort")
+        return bool(str(effort or "").strip()) or self._saw_reasoning
+
+    def _placeholder_field(self) -> Optional[str]:
+        """本机现在要不要补 reasoning 占位？返回字段名或 None。
+
+        「补不补」的判据只此一处：调用 `chat()` 的路径上每一条 assistant 消息
+        （模型这轮吐的、折叠摘要节点、`-i` 播种的）都走它，免得三处各判一遍、
+        日后改一处漂两处。门控逻辑本身在 `resolve_reasoning_placeholder`。
+        """
+        cfg = getattr(self.llm, "config", None)
+        return resolve_reasoning_placeholder(
+            getattr(cfg, "reasoning_content_replay", "auto"),
+            base_url=getattr(cfg, "base_url", "") or "",
+            model=getattr(cfg, "model", "") or "",
+            reasoning_active=self._reasoning_active())
+
+    def _pad_reasoning(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        """给一条 assistant 消息补上空占位（若本机需要且它还缺）。原地改并返回它。
+
+        占位只在键**缺失**时补：已经有真 reasoning 的消息不该被空串盖掉。
+        """
+        field = self._placeholder_field()
+        if field and msg.get(field) is None:
+            msg[field] = ""
+        return msg
+
+    def _pad_history_reasoning(self) -> None:
+        """给 history 里每条 assistant 消息补齐占位（幂等，判据同 `_pad_reasoning`）。
+
+        只在「本场第一次见到 reasoning」时调用（见 `_attach_reasoning`）——那是
+        判据翻真的唯一时刻。为什么要回头补、而不是只在追加时补：判据里含「本场
+        见过 reasoning」这一项，它翻真之前追加的消息一律拿不到占位，而端点校验
+        的是「**每条** assistant 都有这个键」，一条缺口就是一次 400。
+        """
+        if self._placeholder_field() is None:
+            return
+        for msg in self.history:
+            if msg.get("role") == "assistant":
+                self._pad_reasoning(msg)
+
+    def _attach_reasoning(self, assistant_msg: Dict[str, Any],
+                          msg: Dict[str, Any]) -> None:
+        """把这一轮的 reasoning 挂到 assistant 消息上，供下一次请求回放。
+
+        两件事，缺一不可：
+
+        1. **原样回放** —— provider 用哪个字段名吐的（`reasoning_content` /
+           `reasoning` / `reasoning_text`），就用哪个名字放回去。字段名是端点的
+           属性，改名等于对方认不出来，整段 reasoning 白存。
+        2. **空串占位** —— 端点要求「每条 assistant 消息都带 `reasoning_content`」
+           时，没有 reasoning 的那一轮也必须补一个空串（`""`）上去：校验的是
+           **键存在**，不是内容非空。缺了这一条，模型某轮不吐 reasoning 就会让
+           **下一次**请求 400 —— 只回放「收到过的」并不够。
+
+        占位严格受 `llm.reasoning_content_replay`（auto / always / never）门控，
+        见 `resolve_reasoning_placeholder`：给不要求这个字段的端点发多余键，
+        同样是 400。
+        """
+        hit = extract_reasoning(msg)
+        if hit is not None:
+            field, text = hit
+            assistant_msg[field] = text
+            if not self._saw_reasoning:
+                self._saw_reasoning = True
+                # 判据从「没开」翻成「开着」的这一刻，要回头补齐**已有的**历史：
+                # 早先追加的消息（含 `-i` 播种进来的）当时都被判过「不需要补」，
+                # 它们留在历史里就是下一次请求的 400。翻真只有一次，补一次就够。
+                self._pad_history_reasoning()
+        # 与 pi-ai 同序：先按收到的字段名回放，再看占位字段是否仍然缺 ——
+        # 端点用 `reasoning` 吐、却要求 `reasoning_content` 时，两个键都要有。
+        self._pad_reasoning(assistant_msg)
 
     # ---------------------------------------------------------------- 执行工具
     def _run_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> None:
@@ -995,8 +1104,11 @@ class Agent:
         head = self.history[:lo_idx]
         tail = self.history[hi_idx + 1:]
         if parts:
-            node = {"role": "assistant",
-                    "content": f"[已折叠 step {lo}-{hi}] " + "; ".join(parts)}
+            # 折叠节点是内核自己造的 assistant 消息 —— 它同样要有 reasoning 占位，
+            # 否则「折叠之后的下一次请求」就是那个 400（正是本功能要消灭的故障）。
+            node = self._pad_reasoning(
+                {"role": "assistant",
+                 "content": f"[已折叠 step {lo}-{hi}] " + "; ".join(parts)})
             tail = [node] + tail
         self.history = head + tail
         self._compaction_count += 1
@@ -1162,6 +1274,12 @@ def _estimate_chars(history: List[Dict[str, Any]]) -> int:
     total = 0
     for m in history:
         total += estimate_content_chars(m.get("content"))
+        # reasoning 也算上下文：它进 history 就会被**每次请求重发**，漏计它等于
+        # 系统性低估用量（折叠阈值随之偏高，长跑里可能直接撞真实窗口）。
+        for field in REASONING_FIELDS:
+            value = m.get(field)
+            if isinstance(value, str):
+                total += len(value)
         for tc in (m.get("tool_calls") or []):
             try:
                 total += len(json.dumps(tc, ensure_ascii=False))

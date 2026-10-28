@@ -125,6 +125,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "不传则由 config.yaml 的 llm.max_tokens / limits.json 决定，模型可用 set_limits 改")
     p.add_argument("--temperature", type=float, default=None,
                    help="采样温度（显式给出即锁定）；不传则由 config.yaml / limits.json 决定")
+    # 三种写法都收：`--reasoning-effort`（标准）、`--reasoning`（短别名）、
+    # `-reasoning`（单横线）。最后那个不是笔误 —— argparse 允许显式注册单横线
+    # 长选项，而 `-reasoning low` 正是最容易脱口而出的写法，顺手认了比让人
+    # 对着 "unrecognized arguments" 猜要好。
+    p.add_argument("--reasoning-effort", "--reasoning", "-reasoning", default=None,
+                   metavar="EFFORT", dest="reasoning_effort",
+                   help="推理强度（显式给出即锁定）：minimal / low / medium / high；"
+                        "不传则取 config.yaml 的 llm.reasoning_effort，再退回「不传这个字段」。"
+                        "取值不设白名单 —— 各家 provider 档位不同，写错由 provider 报错")
     p.add_argument("--heartbeat", type=float, default=15.0,
                    help="长等待（模型/工具）期间每隔多少秒打印一次心跳，0 关闭，默认 15")
     p.add_argument("--append", action="store_true", help="把任务追加到 user-prompts.md 而不覆盖")
@@ -219,6 +228,7 @@ def main(argv=None) -> int:
         tool_result_limit=args.tool_result_limit,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
+        reasoning_effort=args.reasoning_effort,
         heartbeat=args.heartbeat,
         turns=args.turns,
         max_rounds=args.max_rounds,
