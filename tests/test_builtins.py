@@ -181,7 +181,9 @@ def test_registry_records_name_conflict(ws):
         reg.register_builtin(name, fn)
     reg.freeze_builtins()
     reg.reload()
-    assert any("冲突" in e.error for e in reg.load_errors)
+    # 同名覆盖不许静默 —— 但它记在 overrides（距离裁决的正常结果），
+    # 不是 load_errors（真故障）。两者混在一起，模型会把正常覆盖当异常。
+    assert any(o.tool == "read_file" and o.loser_kind == "builtin" for o in reg.overrides)
     assert reg.get("read_file").origin == "user"
 
 

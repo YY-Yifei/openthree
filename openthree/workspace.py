@@ -39,6 +39,7 @@ import itertools
 import json
 import os
 import re
+import tokenize
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -361,6 +362,19 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+def sha256_file(path: Any) -> str:
+    """文件的 sha256 —— 登记簿用它记「你当初授权的是哪一版代码」。
+
+    只做证据、不做拦截：内容变了就如实报告，绝不自作主张回滚或拦截
+    （拦截会让「引用」退化成「复制」）。
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def kernel_version() -> str:
     """本机安装的内核版本号。
 
@@ -401,6 +415,60 @@ class WorkspaceEntry:
     seed: str = ""
     force_overwrite: bool = True
     note: str = ""
+
+
+def canon_path(path: Path) -> str:
+    """把一个路径拍成「可比较的唯一键」：`resolve` + `normcase`。
+
+    「同一个目录」不能按字符串判：Windows 大小写不敏感，符号链接、`..`、
+    短路径都能指向同一处。所有「去重 / 是不是同一个源」的判断都走这一个键。
+    """
+    try:
+        return os.path.normcase(str(Path(path).resolve(strict=False)))
+    except (OSError, RuntimeError):
+        return os.path.normcase(str(path))
+
+
+def read_source(path: Any) -> str:
+    """读一个 py 文件的源码，按 **PEP 263 编码声明**解码。
+
+    function 文件是人（和模型）手写的，磁盘上不一定就是 UTF-8：中文 Windows 上
+    `# -*- coding: gbk -*-` 很常见。这里让「编码声明」说话，与 `import` 自己的
+    规则一致 —— 否则同一份文件「能被 import」却「加载不了」，两个判据各说一套。
+
+    没有声明时按 UTF-8（`tokenize.open` 的行为，与 python 3 的默认一致）。
+    读不了 / 声明与内容矛盾时抛 `OSError` / `SyntaxError` / `UnicodeDecodeError`，
+    由调用方转成给人看的信息。
+    """
+    with tokenize.open(str(path)) as fh:
+        return fh.read()
+
+
+@dataclass(frozen=True)
+class FunctionSource:
+    """一个 function **来源目录** —— 「从哪找 function」的一档。
+
+    `kind` 只有三档：`project`（本项目）/ `ancestor`（祖先目录）/ `user`（用户目录）。
+    它只是**标签**（`label` 才是给人看的那个）—— 代码判「这是不是本项目的」请用
+    `distance == 0`，不要比较这里的字符串：同一件事只该有一个判据。
+    外部**登记加载**的文件不是「源」，它是一条条路径，由登记簿另外记着（见
+    `functions_meta_file`）—— 「哪些文件被授权加载」与「去哪发现」是两件事。
+
+    `distance` 是**同名词的唯一裁决依据**：越小越近，近者生效。
+    project 恒为 0 —— 模型自己写下的东西永远压过外部；祖先每上一层 +1；
+    user 排在最后；内置在最底层。
+    """
+
+    kind: str
+    label: str
+    path: Path
+    distance: int
+
+
+FUNCTIONS_META_NAME = "functions.json"
+USER_FUNCTION_DISTANCE = 1_000_000
+REGISTERED_FUNCTION_DISTANCE = 1_000_001
+_MAX_SOURCE_DEPTH = 64
 
 
 @dataclass
@@ -1259,6 +1327,113 @@ class Workspace:
     def count_memory(self) -> int:
         """长期记忆的条目数（自省 / 报告用）。"""
         return len(self.read_memory())
+
+    # ---------- functions：来源与登记簿 ----------
+    def function_sources(self, include_missing: bool = False) -> List[FunctionSource]:
+        """function 的来源目录清单，**按距离升序**（由近到远）—— 「从哪找」的唯一真源。
+
+        只认 `<dir>/.openthree/functions` 这一种版式。裸的 `<dir>/functions/`
+        一律不认：在 python 项目里它是常见包名，误扫等于把别人的库当成工具加载。
+        不递归、不看进程 cwd（`root` 在 `__post_init__` 里已经 resolve 过）。
+
+        这里**只枚举、不加载** —— 发现与授权是两件事（见 `lookup_functions`）。
+
+        Args:
+            include_missing: 是否把不存在的目录也列出来（`lookup` 用来说明「看过哪」）
+
+        Returns:
+            `FunctionSource` 清单，`distance` 升序；project 恒在首位。
+        """
+        out: List[FunctionSource] = []
+        seen: set = set()
+
+        def _add(src: FunctionSource) -> None:
+            key = canon_path(src.path)
+            if key in seen:          # 同一个目录（user 恰在祖先链上时会发生）
+                return
+            seen.add(key)
+            if not include_missing and not src.path.is_dir():
+                return
+            out.append(src)
+
+        _add(FunctionSource("project", "project", self.functions_dir, 0))
+
+        depth = 0
+        cur = self.root.parent
+        while depth < _MAX_SOURCE_DEPTH:
+            depth += 1
+            _add(FunctionSource("ancestor", f"ancestor:{cur}",
+                                cur / DIRNAME / "functions", depth))
+            parent = cur.parent
+            if parent == cur:        # 已到盘符根 / 文件系统根
+                break
+            cur = parent
+
+        try:
+            home = Path.home()
+        except (OSError, RuntimeError):   # pragma: no cover - 环境异常
+            home = None
+        if home is not None:
+            _add(FunctionSource("user", "user", home / DIRNAME / "functions",
+                                USER_FUNCTION_DISTANCE))
+
+        return sorted(out, key=lambda s: s.distance)
+
+    def function_source_for(self, path: Any) -> Optional[FunctionSource]:
+        """一个文件属于哪个来源目录；不属于任何一档（外部登记文件）返回 None。"""
+        target = canon_path(Path(path).parent)
+        for src in self.function_sources(include_missing=True):
+            if canon_path(src.path) == target:
+                return src
+        return None
+
+    def function_distance(self, path: Any) -> int:
+        """一个文件的「距离」—— 同名裁决用的那个数（越小越近）。
+
+        不在任何来源目录里的文件取 `REGISTERED_FUNCTION_DISTANCE`（排在 user 之后）。
+        这是**兜底**：登记簿里的路径由 `Registry.load_plan` 按同一套边界复核，
+        族外的条目直接拒绝加载，所以真正走到这一档的只有「传了个族外路径来问
+        距离」—— 它答得出数，但那个文件不会被加载。
+        """
+        src = self.function_source_for(path)
+        return src.distance if src is not None else REGISTERED_FUNCTION_DISTANCE
+
+    @property
+    def functions_meta_file(self) -> Path:
+        """外部 function 的登记簿：`{schema, registered: [{path, sha256, ...}]}`。
+
+        与 `workspace.json` 分开：后者是**内核的结构戳**（`init()` 与升级都会重写），
+        而登记簿是**模型的决策记录**，升级不该碰它。所以它也不是
+        `required_entries()` 的必备项 —— 不存在就当空表，第一次登记才创建。
+        """
+        return self.dir / FUNCTIONS_META_NAME
+
+    def read_functions_meta(self) -> Dict[str, Any]:
+        """读登记簿；缺失 / 损坏一律返回空表（老工作区即此情形）。"""
+        empty: Dict[str, Any] = {"schema": 1, "registered": []}
+        try:
+            if not self.functions_meta_file.exists():
+                return empty
+            doc = json.loads(self.functions_meta_file.read_text(encoding="utf-8") or "{}")
+        except Exception:  # noqa: BLE001
+            return empty
+        if not isinstance(doc, dict):
+            return empty
+        regs = doc.get("registered")
+        doc["registered"] = [r for r in regs
+                             if isinstance(r, dict) and r.get("path")] if isinstance(regs, list) else []
+        doc.setdefault("schema", 1)
+        return doc
+
+    def write_functions_meta(self, doc: Dict[str, Any]) -> Path:
+        """写登记簿（原子写）。`registered` 的**顺序不是优先级** —— 优先级只由距离决定。"""
+        out = dict(doc or {})
+        out.setdefault("schema", 1)
+        if not isinstance(out.get("registered"), list):
+            out["registered"] = []
+        atomic_write(self.functions_meta_file,
+                     json.dumps(out, ensure_ascii=False, indent=2) + "\n")
+        return self.functions_meta_file
 
     # ---------- functions 扫描 ----------
     def list_function_files(self) -> list[Path]:

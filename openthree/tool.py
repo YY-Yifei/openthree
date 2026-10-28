@@ -76,6 +76,11 @@ class Tool:
     source_file: Optional[str] = None
     origin: str = "user"          # user / builtin
     needs_kernel: bool = False
+    # 来源标识：project / user / `ancestor:<目录>`（逐层）/ builtin。
+    # 它来自 `workspace.FunctionSource.label`，是给人看的一行说明，**不是**判据 ——
+    # 判据是下面的 distance，别拿它的字符串做相等比较。
+    source_kind: str = "project"
+    source_distance: int = 0      # 同名裁决用的距离（越小越近，见 workspace.FunctionSource）
 
     def schema(self) -> Dict[str, Any]:
         """OpenAI function-calling 格式。"""

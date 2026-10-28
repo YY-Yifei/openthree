@@ -35,11 +35,14 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 from .kernel import KERNEL
 from .multimodal import ImageResult
+from .workspace import (REGISTERED_FUNCTION_DISTANCE, canon_path, read_source,
+                        sha256_file)
 
 # ---------------------------------------------------------------- 看世界
 
@@ -800,6 +803,21 @@ def reload_functions() -> str:
         lines.append("新增：" + ", ".join(added))
     if removed:
         lines.append("移除：" + ", ".join(removed))
+    if reg.overrides:
+        lines.append(f"同名覆盖（按距离裁决，近者生效）{len(reg.overrides)} 条：")
+        for o in reg.overrides:
+            win = Path(o.winner).name if o.winner != "内置" else "内置"
+            lose = Path(o.loser).name if o.loser != "内置" else "内置"
+            lines.append(f"  - {o.tool}：{win} [{o.winner_kind}] 盖住 {lose} [{o.loser_kind}]")
+    if reg.missing_registered:
+        lines.append(f"⚠ {len(reg.missing_registered)} 个已登记的文件不在了（条目保留，没自动清）：")
+        for p in reg.missing_registered:
+            lines.append(f"  - {p}")
+    if reg.changed_registered:
+        lines.append(f"⚠ {len(reg.changed_registered)} 个已登记文件内容已变"
+                     f"（按引用加载，用的就是新内容）：")
+        for c in reg.changed_registered:
+            lines.append(f"  - {c['path']}  {c['registered_sha256'][:12]} → {c['current_sha256'][:12]}")
     if reg.load_errors:
         lines.append(f"⚠ {len(reg.load_errors)} 个文件有问题：")
         for e in reg.load_errors:
@@ -839,6 +857,260 @@ def delete_function(name: str) -> str:
     return f"[ok] 已删除 {path.name}，调用 reload_functions 生效。"
 
 
+def register_function(path: str, dry_run: bool = False, note: str = "") -> str:
+    """把**已有的** function 文件登记为本项目的工具 —— 只登记路径，不复制文件。
+
+    什么时候该调我：`lookup_functions` 列出某个「可注册」的文件，而你判断它能用。
+    内核默认只加载本项目的 function；上级目录、用户目录里写好的工具一直存在，
+    但没被你授权就不生效 —— 这个工具就是那次授权。
+
+    它按**引用**工作，不复制：源文件修好 bug，下次 `reload_functions` 就吃到。
+    代价是不可复现 —— 源被改、被移走，行为就跟着变。所以登记时记下 sha256，
+    之后每次 reload 拿它比对，变了就**如实报告**（只报告，不拦截、不回滚）。
+
+    接受的路径**必须**落在 `.openthree/functions` 目录族内（本项目 / 祖先目录 /
+    用户目录）。不接受任意 `.py`：那等于给自己开一个静默的任意代码入口。
+    `lookup_functions` 给出的绝对路径正好都在这个范围里。
+
+    登记成功 **≠** 工具生效：同名工具按**距离**裁决（越近越优先）。你登记的那份
+    若被更近的同名工具盖住，这里会明说「未生效」并告诉你是谁盖的 —— 不假装成功，
+    否则你会反复登记同一个文件、却一直拿不到那个能力。
+
+    Args:
+        path: function 文件的**绝对路径**（来自 lookup_functions 的输出）
+        dry_run: 只算不写 —— 先看哪些会生效、哪些会被盖住，再决定要不要落笔
+        note: 给自己留的一句话，记进登记簿（例如「用它抽 PDF」）
+
+    Returns:
+        登记结果（逐工具「生效 / 未生效 + 出路」）与 reload 增量；失败返回 `[错误] …`。
+    """
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    reg = KERNEL.registry
+
+    raw = str(path or "").strip().strip('"').strip("'")
+    if not raw:
+        return "[错误] 需要一个 function 文件的绝对路径（先用 lookup_functions() 找）"
+    cand = Path(raw).expanduser()
+    if not cand.is_absolute():
+        return (f"[错误] 只接受绝对路径：{raw}\n"
+                f"lookup_functions() 给出的就是绝对路径，直接把它传进来。")
+    try:
+        cand = cand.resolve()
+    except (OSError, RuntimeError):  # pragma: no cover - 路径异常
+        pass
+    if cand.suffix.lower() != ".py":
+        return f"[错误] 只接受 .py 文件：{cand}"
+    if not cand.is_file():
+        return f"[错误] 不是一个可读文件（不存在 / 是目录）：{cand}"
+
+    src = ws.function_source_for(cand)
+    if src is None:
+        scope = "\n".join(f"  - {s.label}：{s.path}"
+                          for s in ws.function_sources(include_missing=True))
+        return (f"[错误] {cand}\n"
+                f"不在 function 的源目录族内 —— 只接受这些位置下的文件：\n{scope}\n"
+                f"（不接受任意 .py：那等于给自己开一个静默的任意代码入口。）")
+
+    try:
+        # 按 PEP 263 编码声明解码：手写 function 在中文 Windows 上常是 GBK，
+        # 硬按 UTF-8 读会抛 UnicodeDecodeError —— 那是 ValueError，不是 OSError，
+        # 于是异常逃出工具、打断调用链，而不是回一句 `[错误] …`。
+        code = read_source(cand)
+    except (OSError, ValueError, SyntaxError) as exc:
+        return f"[错误] 读不了 {cand}：{type(exc).__name__}: {exc}"
+    builtin_names = set(reg.builtins) if reg is not None else None
+    audit = _static_audit(code, builtin_names=builtin_names)
+    if audit["syntax_error"]:
+        return f"[错误] {cand.name} 语法检查未通过，未登记：\n{audit['syntax_error']}"
+    if not audit["functions"]:
+        return (f"[错误] {cand.name} 没有可注册的公开函数，未登记。\n"
+                f"{_public_function_warning_from_audit(audit)}")
+
+    if src.distance == 0:       # 判据只有距离（project 恒为 0），`kind` 只是标签
+        # 本项目的文件本来就会被自动加载。登记它只有副作用：从此每次改自己的
+        # function 都会在 list_functions 里多出一条「已登记文件内容已变」的噪声。
+        return (f"[无需登记] {cand}\n"
+                f"它就在本项目的 functions 目录里（{src.path}）—— 这一档的文件自动加载，\n"
+                f"登记是多余的。改完直接 reload_functions() 就生效。")
+
+    names: List[str] = list(audit["functions"])
+    try:
+        sha = sha256_file(cand)
+    except OSError as exc:      # 文件锁 / 权限：别让异常逃出工具打断调用链
+        return f"[错误] 读不了 {cand}（算 sha256 失败）：{type(exc).__name__}: {exc}"
+    meta = ws.read_functions_meta()
+    regs = meta["registered"]
+    key = canon_path(cand)
+    existed = None
+    for rec in regs:
+        try:
+            if canon_path(rec.get("path")) == key:
+                existed = rec
+                break
+        except (OSError, RuntimeError):  # pragma: no cover - 脏记录
+            continue
+
+    if not dry_run:
+        stamp = datetime.now().isoformat(timespec="seconds")
+        if existed is not None:
+            existed.update({"sha256": sha, "registered_at": stamp})
+            if note:
+                existed["note"] = note
+        else:
+            regs.append({"path": str(cand), "sha256": sha,
+                         "registered_at": stamp, "note": note})
+        ws.write_functions_meta(meta)
+
+    before = set(reg.tools) if reg is not None else set()
+    if not dry_run and reg is not None:
+        reg.reload()
+    after = set(reg.tools) if reg is not None else set()
+
+    head = "预演（未写入）" if dry_run else ("已更新登记" if existed else "已登记")
+    lines = [f"[{head}] {cand}",
+             f"  来源：{src.label}（d={src.distance}）｜sha256 {sha[:12]}"]
+    ok: List[str] = []
+    blocked: List[tuple] = []
+    warned: List[tuple] = []
+    beats: List[tuple] = []
+    for n in names:
+        st = (_lookup_status(ws, reg, cand, n) if reg is not None
+              else _LookupStatus(_STATUS_UNREGISTERED, "未注册"))
+        if st.code == _STATUS_WOULD_LOSE:
+            blocked.append((n, st.text))
+        elif st.code == _STATUS_BEATS_BUILTIN:
+            # 顶掉内置也是「生效」，但它是**后果最重**的那种生效：
+            # `read_file` / `run_shell` 这些是模型的感知通道，被顶掉就没了。
+            beats.append((n, st.text))
+        elif st.code == _STATUS_SAME_DISTANCE:
+            warned.append((n, st.text))
+        else:
+            ok.append(n)
+
+    if ok:
+        lines.append("  ✓ 生效：" + ", ".join(ok))
+    for n, st in beats:
+        lines.append(f"  ⚠ 会顶掉内置：{n} ← {st}")
+    for n, st in warned:
+        lines.append(f"  ⚠ 会同距冲突：{n} ← {st}")
+    for n, st in blocked:
+        lines.append(f"  ✗ 未生效：{n} ← {st}")
+    if beats:
+        lines.append("     外部这份比内置近，所以内置先被顶掉 —— 这是本意吗？"
+                     "顶掉内置会砍掉你自己的一条感知通道；要两全只能给其中一个改名。")
+    if blocked:
+        lines.append("     同名按距离裁决，近者生效。三条出路："
+                     "给更近的那个改名 / 用 delete_function 删掉它 / 给本文件的工具换个名字。")
+    if warned:
+        lines.append("     同距时距离裁决不了：按加载顺序后加载者生效，同时会记一条 load_error。"
+                     "趁早把其中一个改名。")
+    # 静态审计里其余的 ⚠（lambda / 保留名 / 高危调用）同样适用于「外部登记」这条通道：
+    # 登记即生效，事后没人再回头看它 —— 所以要把警告摆在它生效的这一刻。
+    # 内置覆盖已由上面对「会顶掉内置」逐条报过，这里不重复。
+    lines.extend("  " + n for n in _audit_notes(audit, shadows=not beats)
+                 if n.startswith("⚠"))
+
+    if not dry_run:
+        added = sorted(after - before)
+        removed = sorted(before - after)
+        delta = f"已重新加载：+{len(added)}/-{len(removed)}，当前 {len(after)} 个工具"
+        if added:
+            delta += f"（新增 {', '.join(added)}）"
+        lines.append(delta)
+        if KERNEL.recorder is not None:
+            KERNEL.recorder.record(
+                "evolution",
+                summary=f"登记外部 function: {cand.name}",
+                data={"action": "register_function", "path": str(cand),
+                      "sha256": sha, "source": src.label, "distance": src.distance,
+                      "tools": names, "blocked": [n for n, _ in blocked],
+                      "note": note},
+            )
+    else:
+        lines.append("  预演结束：没有写登记簿。确认无误后把 dry_run 去掉再调一次。")
+    return "\n".join(lines)
+
+
+def unregister_function(path: str) -> str:
+    """撤销一次 `register_function` 的授权 —— 只删登记项，**不删文件**。
+
+    什么时候该调我：某个外部工具不再需要 / 已经过期 / 你要改用更近的那一份。
+    文件可能还是别的项目共用的库，所以这里绝不动它；要删本项目自己的文件，
+    用 `delete_function`。
+
+    Args:
+        path: 登记时用的那个绝对路径
+
+    Returns:
+        `[ok] 已撤销登记 …` 与随之失效的工具；没登记过则返回 `[错误] …` 并列出现有登记。
+    """
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    reg = KERNEL.registry
+    raw = str(path or "").strip().strip('"').strip("'")
+    if not raw:
+        return "[错误] 需要登记时的那个绝对路径"
+    cand = Path(raw).expanduser()
+    if cand.is_absolute():
+        try:
+            cand = cand.resolve()
+        except (OSError, RuntimeError):  # pragma: no cover
+            pass
+    key = canon_path(cand)
+
+    meta = ws.read_functions_meta()
+    regs = meta["registered"]
+    keep: List[Dict[str, Any]] = []
+    hit = None
+    for rec in regs:
+        try:
+            same = canon_path(rec.get("path")) == key
+        except (OSError, RuntimeError):  # pragma: no cover
+            same = False
+        if same:
+            if hit is None:
+                hit = rec
+            continue        # 同一路径重复登记时**全部**摘掉：只删第一条的话，剩下的仍会被加载
+        keep.append(rec)
+    if hit is None:
+        listing = "\n".join(f"  - {r.get('path')}" for r in regs) or "  （没有登记任何外部 function）"
+        return f"[错误] 没登记过这个路径：{cand}\n当前登记：\n{listing}"
+
+    meta["registered"] = keep
+    ws.write_functions_meta(meta)
+
+    gone = [t.name for t in (reg.user_tools() if reg is not None else [])
+            if t.source_file and canon_path(t.source_file) == key]
+    before = set(reg.tools) if reg is not None else set()
+    if reg is not None:
+        reg.reload()
+    after = set(reg.tools) if reg is not None else set()
+    removed = sorted(before - after)
+
+    lines = [f"[ok] 已撤销登记：{cand}（文件没动）"]
+    if gone:
+        lines.append("  它带来的工具：" + ", ".join(gone))
+    if removed:
+        lines.append("  随之失效：" + ", ".join(removed))
+    elif gone:
+        lines.append("  这些工具仍可用 —— 说明还有更近的那一份在提供它们（同名按距离裁决）")
+    src = ws.function_source_for(cand)
+    if src is not None and src.distance == 0:
+        lines.append("  注意：它就在本项目的 functions 目录里，会继续被自动加载；"
+                     "要连文件一起删，用 delete_function。")
+    lines.append(f"已重新加载，当前 {len(after)} 个工具。")
+    if KERNEL.recorder is not None:
+        KERNEL.recorder.record(
+            "evolution", summary=f"撤销登记: {cand.name}",
+            data={"action": "unregister_function", "path": str(cand),
+                  "removed": removed},
+        )
+    return "\n".join(lines)
+
+
 def list_functions() -> str:
     """列出当前所有可用工具及其来源文件。
 
@@ -854,12 +1126,36 @@ def list_functions() -> str:
     rows.append(f"\n## 内置（{len(builtin)}）")
     for t in sorted(builtin, key=lambda x: x.name):
         rows.append(f"- `{t.signature_hint()}`")
-    rows.append(f"\n## 自造（{len(user)}）—— 你的演化成果")
-    if user:
-        for t in sorted(user, key=lambda x: x.name):
+    # 「自己写的」= 距离 0（本项目 functions 目录）：判据只有 distance，
+    # `source_kind` 是给人看的标签，别拿它的字符串做相等比较。
+    local = [t for t in user if t.source_distance == 0]
+    external = [t for t in user if t.source_distance != 0]
+    rows.append(f"\n## 自造（{len(local)}）—— 你的演化成果")
+    if local:
+        for t in sorted(local, key=lambda x: x.name):
             rows.append(f"- `{t.signature_hint()}`  ← {Path(t.source_file or '').name}")
     else:
         rows.append("- （还没有。当内置工具不够用时，用 write_function 长出新的）")
+    if external:
+        rows.append(f"\n## 外部登记（{len(external)}）—— lookup_functions + register_function 拿来的")
+        for t in sorted(external, key=lambda x: x.name):
+            rows.append(f"- `{t.signature_hint()}`  ← {t.source_file}"
+                        f"  [{t.source_kind}, d={t.source_distance}]")
+    if reg.overrides:
+        rows.append(f"\n## 同名覆盖（{len(reg.overrides)}）—— 按距离裁决，近者生效（正常现象）")
+        for o in reg.overrides:
+            win = Path(o.winner).name if o.winner != "内置" else "内置"
+            lose = Path(o.loser).name if o.loser != "内置" else "内置"
+            rows.append(f"- `{o.tool}`：{win} [{o.winner_kind}] 盖住 {lose} [{o.loser_kind}]")
+    if reg.missing_registered:
+        rows.append(f"\n## 已登记但文件不在了（{len(reg.missing_registered)}）—— 条目保留，没自动清")
+        for p in reg.missing_registered:
+            rows.append(f"- {p}")
+    if reg.changed_registered:
+        rows.append(f"\n## 已登记文件内容已变（{len(reg.changed_registered)}）"
+                    f"—— 按引用加载，用的就是新内容")
+        for c in reg.changed_registered:
+            rows.append(f"- {c['path']}  {c['registered_sha256'][:12]} → {c['current_sha256'][:12]}")
     if reg.load_errors:
         rows.append(f"\n## 加载异常（{len(reg.load_errors)}）")
         for e in reg.load_errors:
@@ -867,14 +1163,222 @@ def list_functions() -> str:
     return "\n".join(rows)
 
 
+# `_lookup_status` 的状态码 —— 给**代码**判定用，别在给模型看的文案上做子串匹配。
+# 反例：`会被更近的 X 盖住`（会输）与 `注册后会盖住 X`（会赢）都含「盖住」，
+# 按子串判就会把「会赢」误判成「被覆盖」，于是 lookup 把一个更近、本会生效的工具
+# 藏起来 —— 恰好抹掉这个功能存在的意义。
+_STATUS_ACTIVE = "active"                # 已经生效（就是这份文件）
+_STATUS_UNREGISTERED = "unregistered"    # 注册表里没人占这个名字
+_STATUS_BEATS_BUILTIN = "beats_builtin"  # 注册后顶掉内置
+_STATUS_WOULD_WIN = "would_win"          # 注册后盖住更远的那份
+_STATUS_SAME_DISTANCE = "same_distance"  # 同距：距离裁决不了，按加载顺序
+_STATUS_WOULD_LOSE = "would_lose"        # 注册后被更近的那份盖住
+
+
+class _LookupStatus(NamedTuple):
+    """一个（文件, 工具名）此刻的状态：`code` 给代码判，`text` 给人 / 模型看。"""
+
+    code: str
+    text: str
+    winner: str = ""            # 当前占着这个名字的文件名（内置为「内置」）
+    winner_distance: int = -1
+
+
+def _lookup_status(ws: Any, reg: Any, path: Path, name: str,
+                   dist_of: Optional[Callable[[Any], int]] = None) -> _LookupStatus:
+    """一个（文件, 工具名）**此刻**的状态 —— 只查内存里的注册表，不执行任何代码。
+
+    状态是「要不要 register」的唯一依据，所以要能分清五件事：
+    已经生效了 / 注册后会盖住谁 / 注册后会被谁盖住 / 同距裁决不了 / 内置占着会被你顶掉。
+
+    `dist_of` 让调用方把距离表算一次：`lookup_functions` 要对「每个文件 × 每个
+    函数」都问一遍，而 `ws.function_distance` 每次调用都会重建整条祖先链。
+    """
+    dist = dist_of or ws.function_distance
+    win = reg.get(name) if reg is not None else None
+    if win is None:
+        return _LookupStatus(_STATUS_UNREGISTERED, "未注册")
+    if win.source_file and canon_path(win.source_file) == canon_path(path):
+        return _LookupStatus(_STATUS_ACTIVE, "已生效", Path(win.source_file).name)
+    if win.origin == "builtin":
+        return _LookupStatus(_STATUS_BEATS_BUILTIN, "未注册·注册后覆盖内置", "内置")
+    d_new = dist(path)
+    d_win = dist(win.source_file) if win.source_file else 10 ** 9
+    winner = Path(win.source_file).name if win.source_file else "内置"
+    shown = f"{winner} (d={d_win})"
+    if d_win < d_new:
+        return _LookupStatus(_STATUS_WOULD_LOSE, f"未注册·会被更近的 {shown} 盖住",
+                             winner, d_win)
+    if d_win == d_new:
+        # 与 registry._note_conflict 同一口径：同距不是「谁更近」，而是裁决不了。
+        return _LookupStatus(
+            _STATUS_SAME_DISTANCE,
+            f"未注册·与 {shown} 距离相同 —— 距离裁决不了，按加载顺序（后加载者生效）",
+            winner, d_win)
+    return _LookupStatus(_STATUS_WOULD_WIN, f"未注册·注册后会盖住 {shown}",
+                         winner, d_win)
+
+
+def lookup_functions(query: str = "", include_shadowed: bool = True,
+                     limit: int = 20) -> str:
+    """内置工具不够用时，先看看周围有什么现成 function —— **纯发现：不注册、不执行、不写盘**。
+
+    它沿项目逐级向上找 `<dir>/.openthree/functions`，再加上 `~/.openthree/functions`，
+    用 ast 静态解析出每个文件的工具名 / 签名 / docstring 首行，让你判断「这个工具
+    我要不要用」——**而不是**替你把代码跑起来。有没有语法错、会不会被别人盖住，
+    也在这里一次看清。
+
+    为什么需要它：内核只自动注册**本项目**的 function。上级目录、用户目录里写好的
+    工具一直存在，但你看不见，于是很容易重写一个本来已经有的东西。发现之后，
+    用 `register_function('<绝对路径>')` 才真正拿到那个能力。
+
+    发现与授权是两件事：本工具**永不留痕**（不写 functions.json、不改
+    sys.modules、不 import 任何文件），所以可以反复调、随便调。
+
+    Args:
+        query: 只显示文件名 / 工具名 / docstring 首行包含它的（不区分大小写，空 = 全部）
+        include_shadowed: 是否显示「会被更近的同名工具盖住」的文件（默认显示 —— 那正是判断依据）
+        limit: 每个来源最多列几个文件（默认 20；超出的会告诉你还有多少个没显示）
+
+    Returns:
+        来源清单（由近到远，带绝对路径与每个工具的状态）；失败返回 `[错误] …`。
+    """
+    ws = KERNEL.workspace
+    if ws is None:
+        return "[错误] 内核未就绪"
+    reg = KERNEL.registry
+    q = (query or "").strip().lower()
+    cap = max(1, int(limit or 20))
+
+    # 距离表只算一次：`ws.function_distance` 每次调用都会重建整条祖先链，
+    # 而下面要对「每个文件 × 每个函数」都问一遍状态 —— 不缓存就是 O(n·m·depth) 次系统调用。
+    all_sources = ws.function_sources(include_missing=True)
+    dist_by_dir = {canon_path(s.path): s.distance for s in all_sources}
+
+    def dist_of(p: Any) -> int:
+        return dist_by_dir.get(canon_path(Path(p).parent), REGISTERED_FUNCTION_DISTANCE)
+
+    rows: List[str] = ["# function 来源（由近到远｜同名时：近者生效）"]
+    found_any = False
+    hidden_total = 0
+
+    for src in [s for s in all_sources if s.path.is_dir()]:
+        try:
+            files = [p for p in sorted(src.path.glob("*.py")) if not p.name.startswith("_")]
+        except OSError:  # pragma: no cover - 权限异常
+            files = []
+        blocks: List[str] = []
+        for path in files:
+            rep = _audit_module(path)
+            fns = rep.get("functions") or []
+            hay = " ".join([path.stem] + [f["name"] for f in fns]
+                           + [f.get("doc_first", "") for f in fns]).lower()
+            if q and q not in hay:
+                continue
+
+            statuses = [(f, _lookup_status(ws, reg, path, f["name"], dist_of=dist_of))
+                        for f in fns]
+            # 只有「会被更近的盖住」才是真的没戏；「会同距」和「会盖住别人」都还能生效。
+            shadowed = bool(statuses) and all(st.code == _STATUS_WOULD_LOSE
+                                              for _, st in statuses)
+            if shadowed and not include_shadowed:
+                continue
+
+            if rep.get("read_error"):
+                level = f"读不了：{rep['read_error']}"
+            elif rep.get("syntax_error"):
+                level = f"解析失败：{rep['syntax_error']}"
+            elif not fns:
+                level = "无公开函数（会静默不生效）"
+            elif any(st.code == _STATUS_ACTIVE for _, st in statuses):
+                level = "已注册"
+            elif shadowed:
+                level = "被覆盖（注册了也不会生效）"
+            else:
+                level = "可注册"
+
+            line = [f"- [{level}] {path.name}  →  {path}"]
+            for f, st in statuses:
+                doc = f.get("doc_first") or "（无 docstring）"
+                line.append(f"    - `{f['signature']}` — {doc}    ｜ {st.text}")
+            blocks.append("\n".join(line))
+
+        if not blocks:
+            continue
+        found_any = True
+        shown = blocks[:cap]
+        hidden_total += max(0, len(blocks) - cap)
+        rows.append(f"\n## {src.label} · d={src.distance} · {src.path}")
+        rows.extend(shown)
+        if len(blocks) > cap:
+            rows.append(f"- …… 还有 {len(blocks) - cap} 个文件没显示（调小 query 或加大 limit）")
+
+    if not found_any:
+        rows.append("\n（搜索范围内没有匹配的 function 文件）")
+
+    searched = "\n".join(f"- {s.label}：{s.path}"
+                         + ("" if s.path.is_dir() else "（不存在）")
+                         for s in ws.function_sources(include_missing=True))
+    rows.append("\n## 搜索范围（由近到远）\n" + searched)
+    if hidden_total:
+        rows.append(f"\n（另有 {hidden_total} 个文件因 limit 未显示）")
+    rows.append("\n注册用 `register_function('<上面那条绝对路径>')`：它会先算给你看"
+                "哪些工具会生效、哪些会被更近的同名工具盖住；都不合用，才用 "
+                "`write_function` 自己造。")
+    return "\n".join(rows)
+
+
+def _ast_signature(node: Any) -> str:
+    """把一个 `def` 的形参表还原成 `f(a, b=)` 这样一行（只读 ast，不执行代码）。
+
+    默认值只标「有/无」（`b=`），不展开表达式：`lookup` 要的是「这个工具怎么调」，
+    不是把源码里的默认值原样抄一遍 —— 抄了反而会看错成「默认值就是这串字面量」。
+    """
+    args = getattr(node, "args", None)
+    if args is None:  # pragma: no cover - 防御：非 def 节点
+        return getattr(node, "name", "")
+    names: List[str] = []
+    posonly = list(getattr(args, "posonlyargs", []))
+    pos = posonly + list(args.args)
+    defaults = list(args.defaults)
+    first_default = len(pos) - len(defaults)
+    for i, a in enumerate(pos):
+        if a.arg in ("self", "cls"):
+            continue
+        names.append(a.arg if i < first_default else f"{a.arg}=")
+        # `/` 必须还原：它是「仅位置」的分界，漏了就让人以为能用关键字传。
+        if posonly and i == len(posonly) - 1 and i < len(pos) - 1:
+            names.append("/")
+    if args.vararg:
+        names.append("*" + args.vararg.arg)
+    elif args.kwonlyargs:
+        names.append("*")
+    for a in args.kwonlyargs:
+        names.append(f"{a.arg}=")
+    if args.kwarg:
+        names.append("**" + args.kwarg.arg)
+    return f"{getattr(node, 'name', '?')}({', '.join(names)})"
+
+
 def _audit_module(path: Path) -> Dict[str, Any]:
-    """对一个 function 文件做静态体检，返回各项判据的原始结果（不执行代码）。"""
-    code = path.read_text(encoding="utf-8", errors="replace")
+    """对一个 function 文件做静态体检，返回各项判据的原始结果（不执行代码）。
+
+    解码走 `read_source`（PEP 263 编码声明），与注册器**同一套规则**：中文 Windows
+    上手写文件常带 `# -*- coding: gbk -*-`，硬按 UTF-8 读会让同一个文件
+    「能被 import / 能被加载」却「被判成解析失败或无公开函数」—— 两个判据各说一套，
+    `lookup_functions` 就会把一个真能用的文件藏起来。读不了（编码声明与内容矛盾、
+    权限、文件消失）时接连口都没有，如实记进 `read_error` 而不是拿乱码硬解析。
+    """
     rep: Dict[str, Any] = {
-        "syntax_error": "", "module_doc": "", "functions": [],
+        "syntax_error": "", "read_error": "", "module_doc": "", "functions": [],
         "private_helpers": 0, "side_effects": [], "has_main_guard": False,
         "has_entry": False, "leaked": [],
     }
+    try:
+        code = read_source(path)
+    except (OSError, ValueError, SyntaxError) as exc:
+        rep["read_error"] = f"{type(exc).__name__}: {exc}"
+        return rep
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
@@ -896,6 +1400,7 @@ def _audit_module(path: Path) -> Dict[str, Any]:
                 params = [a for a in node.args.args if a.arg not in ("self", "cls")]
                 rep["functions"].append({
                     "name": node.name,
+                    "signature": _ast_signature(node),
                     "doc_first": fn_doc.strip().splitlines()[0].strip() if fn_doc.strip() else "",
                     "params": len(params),
                     "annotated": all(a.annotation is not None for a in params),
@@ -930,6 +1435,8 @@ def _function_issues(rep: Dict[str, Any]) -> List[str]:
     """
     issues: List[str] = []
 
+    if rep.get("read_error"):
+        issues.append(f"读不了这个文件（{rep['read_error']}）—— 编码声明与内容矛盾 / 权限 / 已删除")
     if rep["syntax_error"]:
         issues.append(f"语法错误：{rep['syntax_error']}")
     if not rep["module_doc"]:
@@ -1898,8 +2405,14 @@ def _call_label(func: ast.AST) -> str:
     return ".".join(reversed(parts))
 
 
-def _audit_notes(audit: Dict[str, Any]) -> List[str]:
-    """把静态审计结果翻译成给模型看的提示行（没有问题时返回空列表）。"""
+def _audit_notes(audit: Dict[str, Any], shadows: bool = True) -> List[str]:
+    """把静态审计结果翻译成给模型看的提示行（没有问题时返回空列表）。
+
+    Args:
+        audit: `_static_audit()` 的结果
+        shadows: 是否报「覆盖内置工具」。调用方若已经逐条报过「会顶掉哪个内置」
+            （`register_function` 用 `_lookup_status` 报得更具体），传 False 免得重复。
+    """
     notes: List[str] = []
     if audit.get("functions"):
         notes.append(f"可注册工具：{', '.join(audit['functions'])}")
@@ -1929,7 +2442,7 @@ def _audit_notes(audit: Dict[str, Any]) -> List[str]:
                      "        raise SystemExit(__main__())\n"
                      "（入口名必须是 `__main__`：dunder 不会被注册成工具，"
                      "叫 main/cli 会凭空多出一个空参数工具。）")
-    if audit.get("shadows"):
+    if shadows and audit.get("shadows"):
         notes.append("⚠ 这些公开函数与**内置工具同名**，reload 后会覆盖内置："
                      + ", ".join(audit["shadows"])
                      + "。若非本意，请改名（覆盖内置会砍掉你自己的感知通道）。")
@@ -2124,6 +2637,9 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "verify_tool": verify_tool,
     "reload_functions": reload_functions,
     "delete_function": delete_function,
+    "lookup_functions": lookup_functions,
+    "register_function": register_function,
+    "unregister_function": unregister_function,
     "list_functions": list_functions,
     "audit_functions": audit_functions,
     "read_prompts": read_prompts,

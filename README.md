@@ -227,6 +227,47 @@ CLI 下 `recorder` 与 `agent` 都是 `None`，所以 `finish` / `context_*` / `
 这类依赖 Agent 循环的函数会返回「未就绪」—— 这是划界不是坏了：
 演化史记的是智能体的自我改造，人手动改的不该混进去。
 
+## function 从哪来：发现 ≠ 授权
+
+工具是**加载**出来的，而「去哪找」与「哪些被授权」是两件事 —— 分开之后，
+「你在哪个目录」决定你能**看见**什么，能力集合只由显式决定改变。
+
+**发现（`lookup_functions`）** 沿项目逐级向上找，再加上用户目录：
+
+```
+<本项目>/.openthree/functions        ← 自动加载（d=0）
+<父目录>/.openthree/functions        ← 只发现（d=1，再上一层 d=2 …）
+~/.openthree/functions               ← 只发现（d=1000000）
+```
+
+它**纯读**：不 import、不写盘、不改 `sys.modules`，所以可以随便调。用 ast 静态解析出
+每个文件的工具名、签名与 docstring 首行，并标出每条工具此刻的状态（已注册 / 可注册 /
+注册后会盖住谁 / 会被更近的盖住 / 同距裁决不了）。裸的 `<dir>/functions/` 一律不认：
+在 python 项目里它是常见包名，误扫等于把别人的库当成工具加载。
+
+**授权（`register_function`）** 是显式的一步：把某个绝对路径写进
+`.openthree/functions.json` 登记簿，`reload` 时才真正执行它。
+
+```bash
+# 模型侧：先看有什么，再决定要不要
+lookup_functions(query="pdf")
+register_function(path="/home/u/.openthree/functions/pdf_to_text.py", dry_run=True)
+register_function(path="/home/u/.openthree/functions/pdf_to_text.py")
+unregister_function(path="/home/u/.openthree/functions/pdf_to_text.py")
+```
+
+几条边界是刻意这么定的：
+
+- **只收 `.openthree/functions` 目录族内的 `.py`。** 不接受任意路径 —— 那等于给自己开一个
+  静默的任意代码入口。`functions.json` 是**数据**不是可信清单：手写一条族外路径，
+  `reload` 也会按同一套规矩复核并拒绝加载，记进 `load_errors`。
+- **按引用，不复制。** 源文件改好，下次 `reload` 用的就是新内容；登记时记下 `sha256`，
+  之后变了就**如实报告**（只报告，不拦截、不回滚）。
+- **登记成功 ≠ 工具生效。** 同名按距离裁决。登记一份会顶掉**内置**工具时，回执里有
+  ⚠ ——`read_file` / `run_shell` 这些是模型的感知通道，被顶掉就没了。
+- **辅助模块按目录隔离。** 两个目录各有 `helper.py` 时，各自 `import helper` 拿到的是
+  自己那份；`reload` 会连辅助模块一起重读，不会出现「改了没生效」。
+
 ## 长任务：模型自己维护计划，自主推进
 
 `system-prompts.md` 只是**第一稿骨架**，不是枷锁——种子提示词里就写明「你完全可以、
@@ -434,8 +475,10 @@ openthree 的设计不变（仍然是那个极简的 ReAct 循环），但它已
   `reload_functions()` 并用 `list_functions()` 确认它真在清单里——文件写成功 ≠ 工具注册成功。
   想更稳还可先 `verify_tool(name)`：它在**子进程**里真正 import 一次并按注册器的同一路径
   构造工具，把「语法没错但一 import 就炸」提前暴露，且**零污染**（子进程死掉不影响内核）。
-  工具重名会记入 `load_errors`；`compact_context` 的区间会先校验，折不动就如实告诉你，
-  不会假报成功。
+  工具重名**不是故障**：同名按距离裁决（近者生效），记进 `overrides`；只有「距离
+  解释不了的冲突」（同一来源目录内两个文件同名）才进 `load_errors` —— 分开记账，
+  免得把自己的正常覆盖当成异常、又对真故障视而不见。`compact_context` 的区间会先校验，
+  折不动就如实告诉你，不会假报成功。
 - **看代码有感知带宽。** `search_files`（grep 式，先定位后精读）与
   `code_outline`（ast 大纲，只解析不执行，对大文件安全且快）——先看结构、先搜再读，
   别硬啃整份文件。
