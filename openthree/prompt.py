@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .registry import Registry
-from .workspace import Workspace
+from .workspace import USER_FUNCTION_DISTANCE, Workspace
 
 # 运行期注入「最近长期记忆」的字符预算上限 —— 记忆是提示，不是正文，
 # 不能让它把上下文挤爆（尤其是模型自己写了很长记忆之后）。
@@ -44,7 +44,7 @@ MEMORY_INJECT_MAX_ITEMS = 8
 # 但「不在 system 里」还不够：计划和演化史是**模型自己会写**的文件，写一次
 # 计划就断一次缓存。所以按变化频率切三层，稳定的在前、易变的在后：
 #
-#   STATIC_TEMPLATE    内核常量                              → system
+#   STATIC_TEMPLATE_*  内核常量（HEAD/TAIL，中间可插 profile 一行） → system
 #   CONTEXT_TEMPLATE   模型自己维护的文件（计划/记忆/演化史） → 一条消息
 #   SITUATION_TEMPLATE 每步都变（时间/步数/用量/上次行动）    → 末尾一条消息
 #
@@ -60,12 +60,17 @@ MEMORY_INJECT_MAX_ITEMS = 8
 # 命中都没有影响（实测 94.4 % vs 94.5 %）。真正吃到分开好处的是「重发同一条
 # 消息」——模型输出被 max_tokens 截断后 agent 不 append 任何东西，两次请求
 # 只差此刻段；此时自维护段仍留在公共前缀里（96.6 % vs 94.7 %）。
-STATIC_TEMPLATE = """\
+# 拆成 HEAD / TAIL 两段，是为了让「挂了 profile」时多一行、**不挂时一个字节都不多**：
+# 这一段是缓存前缀的主体，凭空多一个空行，后面一万多 token 的工具 schema 就要重算。
+STATIC_TEMPLATE_HEAD = """\
 # 你的处境（运行期自动组装）
 
 - 工作目录：`{cwd}`
 - 工作区：`{wsdir}`
 - 模型：{model}
+"""
+
+STATIC_TEMPLATE_TAIL = """\
 - {identity}
 - 可用工具：{tool_count} 个（内置 {builtin_count} / 自造 {user_count}）
 
@@ -83,7 +88,7 @@ STATIC_TEMPLATE = """\
 # 输入是本轮 ReAct 步骤之前最后一句人话，上一轮仍在它前面当上下文。
 #
 # 顺带的好处：system 里不再有「每组任务都变」的任务正文，换了输入也不会让工具
-# schema 的缓存前缀失效（见 STATIC_TEMPLATE 上的注释）。
+# schema 的缓存前缀失效（见 STATIC_TEMPLATE_HEAD 上的注释）。
 CURRENT_INPUT_TEMPLATE = """\
 # 当前任务（三）
 
@@ -143,16 +148,33 @@ def build_static_block(ws: Workspace, reg: Registry, *, model: str) -> str:
     """
     builtin = [t for t in reg.tools.values() if t.origin == "builtin"]
     user = [t for t in reg.tools.values() if t.origin == "user"]
-    return STATIC_TEMPLATE.format(
-        cwd=Path.cwd(),
-        wsdir=ws.dir,
-        model=model,
+    head = STATIC_TEMPLATE_HEAD.format(
+        cwd=Path.cwd(), wsdir=ws.dir, model=model)
+    tail = STATIC_TEMPLATE_TAIL.format(
         identity=_identity_line(ws),
         tool_count=len(reg.tools),
         builtin_count=len(builtin),
         user_count=len(user),
         digest=reg.digest(),
     )
+    return head + _profile_line(ws, user) + tail
+
+
+def _profile_line(ws: Workspace, user: List[Any]) -> str:
+    """「挂了哪些 profile」那一行；**没挂时返回空串**，一个字节都不多。
+
+    这一行说明的是「这些工具从哪来」，不是「我是谁」—— profile 不参与身份，
+    所以它只报来源与数量，绝不去拼接别人的提示词或记忆。
+
+    报**路径**而不是目录名：两个不同位置都可能叫 `base`，只报名字会显示成
+    「base, base」，既分不清挂了什么，也看不出先写的那个（更近）。
+    """
+    if not ws.profiles:
+        return ""
+    names = ", ".join(str(p) for p in ws.profiles)
+    extra = sum(1 for t in user
+                if 0 < t.source_distance < USER_FUNCTION_DISTANCE)
+    return f"- profile：{names}（额外 {extra} 个工具；同名时本项目优先）\n"
 
 
 def build_context_block(ws: Workspace) -> str:
@@ -383,7 +405,7 @@ def build_messages(ws: Workspace, reg: Registry, history: List[Dict[str, Any]], 
     消息序列与各自的角色：
 
     * `messages[0]`（system）= 一 + 内核常量。它必须逐字节稳定，
-      否则后面的一切（tools schema、history）都要重算 —— 见 STATIC_TEMPLATE 上的注释。
+      否则后面的一切（tools schema、history）都要重算 —— 见 STATIC_TEMPLATE_HEAD 上的注释。
     * `history` = 模型自己走过的路，只追加、不改写。
     * **计划/记忆/演化史** = 模型自己会改的文件，排在 history 之后。
     * **末尾那条** = 本步的时间/步数/上下文/上次行动。

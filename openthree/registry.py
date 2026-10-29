@@ -9,9 +9,11 @@
     * 同名工具**近者生效**：加载顺序即裁决 —— 从远到近加载，后加载的覆盖先加载的。
 
 「从哪加载」只有两处**显式**来源：本项目 `.openthree/functions/*.py`，以及
-`functions.json` 里登记过的路径。祖先目录、用户目录里的文件**不会**自动加载 ——
-它们只被 `lookup_functions` 发现，要不要用由模型自己 `register_function` 决定。
-于是「你在哪个目录」决定你能**看见**什么，而能力集合只由显式决定改变。
+`functions.json` 里登记过的路径。用户目录里的文件**不会**自动加载 —— 它只被
+`lookup_functions` 发现，要不要用由模型自己 `register_function` 决定。
+命令行 `-profile` 点名的目录是第三处，它们**会**自动加载：点名就是授权。
+于是「你在哪个目录、挂了谁」决定你能**看见**什么，而默认能力集合只由显式
+决定改变。
 """
 from __future__ import annotations
 
@@ -24,8 +26,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .tool import Tool, build_tool, is_registrable
-from .workspace import (DIRNAME, Workspace, canon_path, read_source,
-                        sha256_file)
+from .workspace import (DIRNAME, USER_FUNCTION_DISTANCE, Workspace, canon_path,
+                        read_source, sha256_file)
 
 _MODULE_PREFIX = "openthree_user_functions"
 _BUILTIN_DISTANCE = 10 ** 9
@@ -74,8 +76,8 @@ class LoadPlanItem:
     """本次要加载的一个文件，以及它来自哪一档源。"""
 
     path: Path
-    source: str       # 进模块名的稳定标识：project / ancestor1 / user / registered2
-    label: str        # 给人看的来源：project / ancestor:D:\projects / user / registered
+    source: str       # 进模块名的稳定标识：project / profile1 / user / registered2
+    label: str        # 给人看的来源：project / profile:~/prof/base / user / registered
     distance: int     # 越小越近；同名时近者生效
 
 
@@ -128,7 +130,8 @@ class Registry:
     def load_plan(self) -> List[LoadPlanItem]:
         """本次要加载的文件清单，**从远到近**排序 —— 顺序本身就是同名裁决。
 
-        加载集合只有两处显式来源：本项目的 functions 目录，以及登记簿里的路径。
+        加载集合来自：project 的 functions 目录、命令行点名的 profile 目录
+        （两者都自动加载），以及登记簿里的路径。
         登记项若同时也在某个源目录里，按 canonical 路径去重、保留**更近**的那条：
         同一份代码只加载一次，并按它物理位置的距离参与裁决。
         """
@@ -136,8 +139,8 @@ class Registry:
         entries: List[Tuple[int, int, LoadPlanItem]] = []
         seq = 0
 
-        # 来源表算一次：`ws.function_source_for` 每调一次都要重建整条祖先链，
-        # 而下面要对每条登记项问一遍 —— 那是 O(登记数 × 目录深度) 次路径解析。
+        # 来源表算一次：`ws.function_source_for` 每调一次都要重建整条来源表，
+        # 而下面要对每条登记项问一遍 —— 那是 O(登记数 × 来源档数) 次路径解析。
         sources = ws.function_sources(include_missing=True)
         by_dir = {canon_path(s.path): s for s in sources}
 
@@ -188,11 +191,14 @@ class Registry:
             seq += 1
 
         for i, src in enumerate(sources):
-            # 只自动加载**本项目**的 functions：祖先目录与用户目录里的文件
-            # 属于「发现了但没被授权」，要加载必须显式 register_function。
-            # 这条判断就是「存在 ≠ 可用」在代码里的落点，别删。
-            # 判据是距离（project 恒为 0）—— `kind` 只是标签，别拿字符串做相等比较。
-            if src.distance != 0:
+            # 自动加载**命令行点名过的**档：project（d=0）与 profile（d=1,2,…）。
+            # 用户目录（d=USER_FUNCTION_DISTANCE）里的文件属于「发现了但没被授权」
+            # —— 它是整个账户共用的库，不该因为某个人放过一个文件就在别处自动执行，
+            # 要加载必须显式 register_function。这条判断就是「存在 ≠ 可用」在代码里
+            # 的落点，别删。
+            # 判据只有一个数：近于 user 的档自动加载。`kind` 只是标签，别拿它做
+            # 相等比较 —— 那样每加一档就得回来再改一次这里。
+            if src.distance >= USER_FUNCTION_DISTANCE:
                 continue
             try:
                 files = sorted(src.path.glob("*.py"))

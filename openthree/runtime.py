@@ -38,7 +38,8 @@ from .progress import Progress
 from .recorder import Recorder
 from .registry import Registry
 from .report import write_report
-from .workspace import DEFAULT_AGENT_NAME, Workspace
+from .workspace import (DEFAULT_AGENT_NAME, USER_FUNCTION_DISTANCE,
+                        Workspace)
 
 
 class Runtime:
@@ -56,7 +57,8 @@ class Runtime:
                  heartbeat: float = 15.0,
                  turns: Optional[int] = None,
                  max_rounds: Optional[int] = None,
-                 name: Optional[str] = None) -> None:
+                 name: Optional[str] = None,
+                 profiles: Sequence[Path] = ()) -> None:
         self.project_dir = Path(project_dir or Path.cwd()).resolve()
         self.quiet = quiet
         self.name_arg = (name or "").strip() or None    # --name：人类给的「命名种子」
@@ -80,7 +82,8 @@ class Runtime:
         self._session_active = False
         self._session_turns: List[Dict[str, Any]] = []
 
-        self.ws = Workspace(self.project_dir).init(force_prompts=force_prompts)
+        self.ws = Workspace(self.project_dir, profiles=tuple(profiles)).init(
+            force_prompts=force_prompts)
         self._seed_identity()
         self.config: LLMConfig = load_config(self.project_dir, model_override=model)
         # CLI 显式给的上下文窗口覆盖 config 里的值（config 已在 load_config 里兜过底）。
@@ -659,6 +662,11 @@ class Runtime:
             f"（{self.context_budget_source}；模型可用 context_budget 改）"
             + ("（已关闭自动折叠）" if self.context_budget_chars <= 0 else ""),
         ]
+        if self.ws.profiles:
+            extra = [t for t in reg.user_tools()
+                     if 0 < t.source_distance < USER_FUNCTION_DISTANCE]
+            lines.insert(2, f"profile  {'、'.join(str(p) for p in self.ws.profiles)}"
+                            f"（额外 {len(extra)} 个工具；同名时本项目优先）")
         for t in reg.user_tools():
             lines.append(f"         ↳ {t.name}  ← {Path(t.source_file or '').name}")
         if reg.load_errors:

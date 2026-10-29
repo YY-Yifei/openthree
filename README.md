@@ -56,6 +56,8 @@ openthree --turns 8                         # 会话内保留最近 8 轮（默�
 openthree --init                            # 只建工作区
 openthree --inspect                         # 看一眼自己当前的样子（不调模型）
 openthree --functions                       # 列出所有工具
+openthree --profile ~/shared "用共享库里的工具" # 额外 function 来源：~/shared/.openthree/functions 自动加载
+openthree --profile a,b --profile c "…"      # 可重复给或逗号分隔；顺序即优先级，先写的更近
 openthree --report                          # 重建 three-report.html
 openthree -u                                # 升级模式：把本工作区追平本机已装内核（人确认后才落盘）
 openthree -u --check                        # 只扫描、只打印清单就退出（不调模型、不改文件，适合 CI）
@@ -234,12 +236,20 @@ CLI 下 `recorder` 与 `agent` 都是 `None`，所以 `finish` / `context_*` / `
 工具是**加载**出来的，而「去哪找」与「哪些被授权」是两件事 —— 分开之后，
 「你在哪个目录」决定你能**看见**什么，能力集合只由显式决定改变。
 
-**发现（`lookup_functions`）** 沿项目逐级向上找，再加上用户目录：
+**来源有三档**（`-profile` 就是往中间插几档）：
 
 ```
-<本项目>/.openthree/functions        ← 自动加载（d=0）
-<父目录>/.openthree/functions        ← 只发现（d=1，再上一层 d=2 …）
-~/.openthree/functions               ← 只发现（d=1000000）
+<本项目>/.openthree/functions      ← 自动加载（d=0，永远优先）
+<profile>/.openthree/functions     ← 自动加载（d=1,2,… 按 -profile 顺序，先写的更近）
+~/.openthree/functions             ← 只发现（d=1000000，要 register_function）
+```
+
+profile 是**含 `.openthree/` 的项目目录**（与 `-C` 同构），只取其中的
+`.openthree/functions/*.py` —— memory / config / prompts / identity / plan 一概
+不读，因为它们是「这具躯体的经历与设置」，换到另一个项目就不成立了。
+
+```bash
+openthree -profile ~/.openthree-profiles/base,~/work/team-tools "任务…"
 ```
 
 它**纯读**：不 import、不写盘、不改 `sys.modules`，所以可以随便调。用 ast 静态解析出

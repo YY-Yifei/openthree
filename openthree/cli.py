@@ -41,6 +41,7 @@ from typing import Optional
 
 from . import __version__
 from .runtime import Runtime
+from .workspace import DIRNAME, canon_path
 
 # `--help` 的尾注（argparse `epilog`）。它答「**怎么自省**」，不答「此刻是什么」——
 # 后者属于运行期状态，写进来 `--help` 就不再可 diff、不能进文档。
@@ -96,6 +97,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "要让「留空」走单次语义（沿用磁盘上的当前任务跑一次），"
                         "用 --no-interactive；stdin 不是终端时自动走这条路")
     p.add_argument("-C", "--dir", default=".", help="项目目录（.openthree 会建在这里），默认当前目录")
+    # 单横线长选项：argparse 允许显式注册（`-reasoning` 已有先例），而 `-profile`
+    # 正是最容易脱口而出的写法。
+    p.add_argument("-profile", "--profile", action="append", default=None,
+                   metavar="DIR", dest="profile",
+                   help="额外的 function 来源：一个**含 .openthree/ 的目录**（与 -C 同构），"
+                        "只取其中的 .openthree/functions/*.py。可重复给，也可逗号分隔"
+                        "（路径本身含逗号时只能重复给 —— 没有转义写法）。"
+                        "顺序就是优先级：先写的更近；本项目（d=0）永远压过它们。"
+                        "除 functions 之外一概不读（memory / config / prompts 都不共享）")
     p.add_argument("--name", default=None, metavar="NAME",
                    help="给这个智能体起个名字：只在它**还没有名字**时作为种子落盘"
                         "（已经有名字就不覆盖）；之后它可用 set_identity 自己改名。"
@@ -208,6 +218,26 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     project_dir = Path(args.dir).resolve()
 
+    # --- -profile 的校验（也在起 Runtime 之前，理由同上：构造 Runtime 会写盘） ---
+    # 路径打错时若等到 Runtime 之后才发现，用户拿到的是一个凭空建出来的新工作区。
+    raw_profiles = _collect_profiles(args)
+    if raw_profiles and (args.upgrade or args.check):
+        print("[错误] -u/--upgrade 与 --check 不接受 -profile —— 它们扫的是"
+              "「本项目对本机内核」的漂移，profile 不是本项目的一部分。",
+              file=sys.stderr)
+        return 2
+    profiles, profile_errors, profile_notes = _resolve_profiles(raw_profiles, project_dir)
+    if profile_errors:
+        print("[错误] -profile 有问题：", file=sys.stderr)
+        for e in profile_errors:
+            print(f"       {e}", file=sys.stderr)
+        print("       profile 是一个**含 .openthree/ 的项目目录**（与 -C 同构）；"
+              "先用 `openthree -C <该目录> --init` 把它的工作区铺出来。",
+              file=sys.stderr)
+        return 2
+    for n in profile_notes:
+        print(f"[提示] {n}", file=sys.stderr)
+
     # --- 升级模式的参数校验（都在起 Runtime 之前，因为构造 Runtime 会写盘） ---
     task_arg = " ".join(args.task).strip()
     if args.upgrade and task_arg:
@@ -257,6 +287,7 @@ def main(argv=None) -> int:
         turns=args.turns,
         max_rounds=args.max_rounds,
         name=args.name,
+        profiles=profiles,
     )
 
     if args.init:
@@ -415,6 +446,68 @@ def _collect_images(args) -> list[str]:
             seen.add(x)
             uniq.append(x)
     return uniq
+
+
+def _collect_profiles(args) -> list[str]:
+    """从 `-profile` 收集目录字符串（重复给与逗号分隔等价，按出现顺序拼接）。"""
+    out: list[str] = []
+    for chunk in (getattr(args, "profile", None) or []):
+        for x in str(chunk or "").split(","):
+            x = x.strip()
+            if x:
+                out.append(x)
+    return out
+
+
+def _resolve_profiles(raw: list[str], project_dir: Optional[Path] = None,
+                      ) -> tuple[list[Path], list[str], list[str]]:
+    """展开 / resolve / canonical 去重 / 校验 `-profile` 的每一项。
+
+    必须在构造 `Runtime` **之前**调用：`Runtime.__init__` 会 `ws.init()` 落盘，
+    所以「路径打错了」不能等到那之后才发现 —— 否则用户拿到的是一个凭空建出来
+    的新工作区，而他以为只是在挂一个共享库。
+
+    「挂了但等于没挂」不算错误（退出码仍是 0），但也绝不静默：`Workspace.
+    function_sources` 会在加载层按 canon_path 去重、按目录是否存在过滤，那里
+    只是**正确地少加载**了，不知道该向谁报告 —— 提示只能在这里给。
+
+    Args:
+        raw: `-profile` 收集来的原始字符串清单（未去重）
+        project_dir: `-C` 解析后的项目目录；给了才能认出「挂到项目自己」
+
+    Returns:
+        `(profiles, errors, notes)`；errors 非空时调用方打印并返回 exit 2，
+        notes 是给人看的提示（逐条打印，不拦）。
+    """
+    profiles: list[Path] = []
+    errors: list[str] = []
+    notes: list[str] = []
+    seen: set[str] = set()
+    own = canon_path(project_dir) if project_dir is not None else None
+    for item in raw:
+        try:
+            p = Path(item).expanduser().resolve()
+        except (OSError, RuntimeError) as exc:   # pragma: no cover - 路径异常
+            errors.append(f"{item}：路径无法解析（{exc}）")
+            continue
+        if not (p / DIRNAME).is_dir():
+            why = "" if p.is_dir() else "（这个目录本身不存在）"
+            errors.append(f"{p}：不是一个工作区{why} —— 缺 {p / DIRNAME}")
+            continue
+        key = canon_path(p)
+        if own is not None and key == own:
+            notes.append(f"{p}：与 -C 的项目目录是同一个，已忽略 —— "
+                         f"本项目本来就是最内层（d=0），不需要挂自己。")
+            continue
+        if key in seen:      # 同一目录被点名两次：按先写的（更近）算
+            notes.append(f"{p}：重复点名，按先写的（更近）算。")
+            continue
+        seen.add(key)
+        if not (p / DIRNAME / "functions").is_dir():
+            notes.append(f"{p}：这一档没有 {DIRNAME}/functions 目录，暂时不贡献任何工具"
+                         f"（仍算已挂载，可以往里写 function）。")
+        profiles.append(p)
+    return profiles, errors, notes
 
 
 def _interactive(rt: Runtime, first_task: str, append: bool,

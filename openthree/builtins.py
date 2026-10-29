@@ -41,8 +41,8 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 from .kernel import KERNEL
 from .multimodal import ImageResult
-from .workspace import (REGISTERED_FUNCTION_DISTANCE, canon_path, read_source,
-                        sha256_file)
+from .workspace import (REGISTERED_FUNCTION_DISTANCE, USER_FUNCTION_DISTANCE,
+                        canon_path, read_source, sha256_file)
 
 # ---------------------------------------------------------------- 看世界
 
@@ -625,7 +625,8 @@ def run_shell(command: str, cwd: str = "", timeout: int = 60) -> str:
 # ---------------------------------------------------------------- 改自己
 
 
-def write_function(name: str, code: str, overwrite: bool = True) -> str:
+def write_function(name: str, code: str, overwrite: bool = True,
+                   target: str = "") -> str:
     """写出一个新的 function：把 python 代码存为 .openthree/functions/<name>.py。
 
     落盘时会先做一次**纯静态审计**（不执行代码）：语法、有没有可注册的公开函数、
@@ -663,17 +664,31 @@ def write_function(name: str, code: str, overwrite: bool = True) -> str:
         name: 文件名（不含 .py），也是这次演化的名字
         code: 完整 python 源码
         overwrite: 已存在时是否覆盖
+        target: 写到哪一层。**留空 = 本项目**（默认，随手实验不污染共享库）；
+            也可以是一个**已挂载的 profile 目录**（就是 `-profile` 给过的那个路径，
+            `list_functions` 会把它们列出来）。只收路径、不收序号 —— 「哪一层」
+            只该有一个真源。
 
     Returns:
         `[ok] 已写入 …` 加静态审计提示；语法错误等失败返回 `[错误] …`。
+        落到 profile 时还会说明**它在本项目里会不会生效** —— 共享层常被本项目
+        的同名工具盖住，不说清楚就是静默失败。
     """
     ws = KERNEL.workspace
     if ws is None:
         return "[错误] 内核未就绪"
-    path = ws.function_path(name)
+    target_dir, terr = _resolve_write_target(ws, target)
+    if target_dir is None:
+        return terr
+    path = ws.function_path(name, target_dir)
     if path.exists() and not overwrite:
         return f"[错误] {path.name} 已存在（overwrite=false）"
     existed = path.exists()
+    if not target_dir.is_dir():      # profile 的 functions 目录可能还没建
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return f"[错误] 建不了 {target_dir}：{exc}"
     path.write_text(code, encoding="utf-8")
 
     builtin_names = set(KERNEL.registry.builtins) if KERNEL.registry is not None else None
@@ -699,9 +714,78 @@ def write_function(name: str, code: str, overwrite: bool = True) -> str:
     notes = _audit_notes(audit)
     head = f"[ok] 已写入 {path}"
     body = ("\n" + "\n".join(notes)) if notes else ""
-    return (f"{head}{body}"
+    shadow = _shadow_note(ws, audit["functions"], path) if (target or "").strip() else ""
+    return (f"{head}{shadow}{body}"
             f"\n下一步：reload_functions() 生效，然后 list_functions() **确认它真的在清单里**"
             f"（或用 verify_tool('{name}') 先在子进程里验收 import 与签名）。")
+
+
+def _resolve_write_target(ws, target: str) -> tuple[Optional[Path], str]:
+    """把 `write_function(target=…)` 解析成一个 functions 目录。
+
+    只接受**已挂载**的 profile。写到没挂载的地方必然是「写了不生效」——那正是
+    这里要防的坑，所以直接拒绝，并把可写的位置全列出来让人挑。
+
+    Returns:
+        `(目录, 错误信息)`；目录为 None 时错误信息非空。
+    """
+    raw = (target or "").strip()
+    if not raw:
+        return ws.functions_dir, ""
+    try:
+        want = canon_path(Path(raw).expanduser())
+    except (OSError, RuntimeError):      # pragma: no cover - 路径异常
+        return None, f"[错误] target 不是有效路径：{target}"
+    roots: List[str] = []
+    for src in ws.function_sources(include_missing=True):
+        # 只有 profile 档能被 target 指到：project 是默认（留空即可），
+        # user 档要 register_function 才生效，写它等于写一个没人加载的文件。
+        if src.distance == 0 or src.distance >= USER_FUNCTION_DISTANCE:
+            continue
+        root = src.path.parents[1]       # <p>/.openthree/functions → <p>
+        if canon_path(root) == want:
+            return src.path, ""
+        roots.append(str(root))
+    listing = ("\n".join(f"  - {r}" for r in roots)
+               or "  （一个 profile 都没挂：先用 -profile 点名）")
+    return None, (f"[错误] target={target!r} 不是任何**已挂载的** profile。\n"
+                  f"可写的位置只有这些：\n"
+                  f"  - 留空 → 本项目 {ws.functions_dir}\n"
+                  f"{listing}\n"
+                  f"不允许写到没挂载的地方 —— 那必然是「写了不生效」。")
+
+
+def _shadow_note(ws, tool_names: List[str], path: Path) -> str:
+    """写到共享层时，逐个工具名回答「那它在本项目里会不会生效」。
+
+    判据是**工具名**而不是文件名：一个文件可以提供多个工具，按文件名查会漏掉
+    「另一个文件提供了同名工具」这种最常见的影子 —— 而那正是要防的静默失败。
+
+    不拒绝、也不加 force：「更新共享版、而本项目保留自己那份」是合法的演化姿势
+    （先在项目里长熟，再提升上去），拒绝它就得再造一个开关。
+    """
+    reg = KERNEL.registry
+    if reg is None or not tool_names:
+        return ""
+    mine = canon_path(path)
+    mine_d = ws.function_distance(path)
+    losers: List[str] = []
+    for n in tool_names:
+        win = reg.get(n)
+        if win is None or not win.source_file or win.origin == "builtin":
+            continue
+        if canon_path(win.source_file) == mine:     # 就是这份：覆盖自己，不算影子
+            continue
+        if win.source_distance >= mine_d:           # 比这份更远：这份会赢
+            continue
+        losers.append(f"  - `{n}` 现在由 {Path(win.source_file).name}"
+                      f"（d={win.source_distance}）提供，比这份 d={mine_d} 更近")
+    if not losers:
+        return ""
+    return ("\n注意：以下工具在本项目里**不会**用刚写的这份，因为有更近的同名工具：\n"
+            + "\n".join(losers)
+            + "\n  → 想改本项目的：target 留空"
+              "\n  → 想让本项目也用共享这份：删掉或改名项目里提供它的那个文件")
 
 
 def verify_tool(name: str) -> str:
@@ -861,15 +945,16 @@ def register_function(path: str, dry_run: bool = False, note: str = "") -> str:
     """把**已有的** function 文件登记为本项目的工具 —— 只登记路径，不复制文件。
 
     什么时候该调我：`lookup_functions` 列出某个「可注册」的文件，而你判断它能用。
-    内核默认只加载本项目的 function；上级目录、用户目录里写好的工具一直存在，
-    但没被你授权就不生效 —— 这个工具就是那次授权。
+    内核自动加载本项目的 function 与命令行 `-profile` 点名的目录；用户目录
+    （`~/.openthree/functions`）里写好的工具一直存在，但没被你授权就不生效 ——
+    这个工具就是那次授权。
 
     它按**引用**工作，不复制：源文件修好 bug，下次 `reload_functions` 就吃到。
     代价是不可复现 —— 源被改、被移走，行为就跟着变。所以登记时记下 sha256，
     之后每次 reload 拿它比对，变了就**如实报告**（只报告，不拦截、不回滚）。
 
-    接受的路径**必须**落在 `.openthree/functions` 目录族内（本项目 / 祖先目录 /
-    用户目录）。不接受任意 `.py`：那等于给自己开一个静默的任意代码入口。
+    接受的路径**必须**落在 `.openthree/functions` 目录族内（本项目 / 命令行点名的
+    profile / 用户目录）。不接受任意 `.py`：那等于给自己开一个静默的任意代码入口。
     `lookup_functions` 给出的绝对路径正好都在这个范围里。
 
     登记成功 **≠** 工具生效：同名工具按**距离**裁决（越近越优先）。你登记的那份
@@ -928,12 +1013,22 @@ def register_function(path: str, dry_run: bool = False, note: str = "") -> str:
         return (f"[错误] {cand.name} 没有可注册的公开函数，未登记。\n"
                 f"{_public_function_warning_from_audit(audit)}")
 
-    if src.distance == 0:       # 判据只有距离（project 恒为 0），`kind` 只是标签
-        # 本项目的文件本来就会被自动加载。登记它只有副作用：从此每次改自己的
-        # function 都会在 list_functions 里多出一条「已登记文件内容已变」的噪声。
-        return (f"[无需登记] {cand}\n"
-                f"它就在本项目的 functions 目录里（{src.path}）—— 这一档的文件自动加载，\n"
-                f"登记是多余的。改完直接 reload_functions() 就生效。")
+    if src.distance < USER_FUNCTION_DISTANCE:
+        # 判据只有距离：d=0 是本项目，0<d<USER 是命令行点名的 profile —— 两档都
+        # 自动加载，登记纯属多余。对 profile 还有第二重理由：路径一旦写进
+        # functions.json，下次不挂这个 profile 运行时它就在源目录族外，每次启动
+        # 都报一条 load_error。所以劝阻的判据是「会不会自动加载」，不是「是不是本项目」。
+        if src.distance == 0:
+            where = f"它就在本项目的 functions 目录里（{src.path}）"
+            why = "这一档的文件自动加载，登记是多余的。"
+            tail = "改完直接 reload_functions() 就生效。"
+        else:
+            where = f"它在一个已挂载的 profile 里（{src.path}）"
+            why = ("-profile 点名的目录自动加载，登记是多余的；\n"
+                   "  而且登记项一旦写进 functions.json，下次不挂这个 profile 运行时\n"
+                   "  它就成了族外路径，每次启动都会报一条 load_error。")
+            tail = "改完直接 reload_functions() 就生效；下次运行记得照旧挂上它。"
+        return f"[无需登记] {cand}\n{where} —— {why}\n{tail}"
 
     names: List[str] = list(audit["functions"])
     try:
@@ -1098,9 +1193,13 @@ def unregister_function(path: str) -> str:
     elif gone:
         lines.append("  这些工具仍可用 —— 说明还有更近的那一份在提供它们（同名按距离裁决）")
     src = ws.function_source_for(cand)
-    if src is not None and src.distance == 0:
-        lines.append("  注意：它就在本项目的 functions 目录里，会继续被自动加载；"
-                     "要连文件一起删，用 delete_function。")
+    # 「撤销登记后工具还在」有两种原因，必须分清：文件在**自动加载**的档里
+    # （project d=0 / profile），或者还有更近的一份在提供同名工具。
+    if src is not None and src.distance < USER_FUNCTION_DISTANCE:
+        where = ("本项目的 functions 目录" if src.distance == 0
+                 else f"{src.label} 这一档（命令行点名的 profile）")
+        lines.append(f"  注意：它就在{where}里，会继续被自动加载 —— "
+                     "撤销登记只删登记项，不删文件；要连文件一起删，用 delete_function。")
     lines.append(f"已重新加载，当前 {len(after)} 个工具。")
     if KERNEL.recorder is not None:
         KERNEL.recorder.record(
@@ -1128,14 +1227,23 @@ def list_functions() -> str:
         rows.append(f"- `{t.signature_hint()}`")
     # 「自己写的」= 距离 0（本项目 functions 目录）：判据只有 distance，
     # `source_kind` 是给人看的标签，别拿它的字符串做相等比较。
+    # 三桶仍然只比较数字：profile 档夹在 project（0）与 user（USER_FUNCTION_DISTANCE）之间。
     local = [t for t in user if t.source_distance == 0]
-    external = [t for t in user if t.source_distance != 0]
+    from_profile = [t for t in user
+                    if 0 < t.source_distance < USER_FUNCTION_DISTANCE]
+    external = [t for t in user if t.source_distance >= USER_FUNCTION_DISTANCE]
     rows.append(f"\n## 自造（{len(local)}）—— 你的演化成果")
     if local:
         for t in sorted(local, key=lambda x: x.name):
             rows.append(f"- `{t.signature_hint()}`  ← {Path(t.source_file or '').name}")
     else:
         rows.append("- （还没有。当内置工具不够用时，用 write_function 长出新的）")
+    if from_profile:
+        rows.append(f"\n## 来自 profile（{len(from_profile)}）"
+                    f"—— `-profile` 点名的目录，自动加载")
+        for t in sorted(from_profile, key=lambda x: x.name):
+            rows.append(f"- `{t.signature_hint()}`  ← {t.source_file}"
+                        f"  [{t.source_kind}, d={t.source_distance}]")
     if external:
         rows.append(f"\n## 外部登记（{len(external)}）—— lookup_functions + register_function 拿来的")
         for t in sorted(external, key=lambda x: x.name):
@@ -1192,7 +1300,7 @@ def _lookup_status(ws: Any, reg: Any, path: Path, name: str,
     已经生效了 / 注册后会盖住谁 / 注册后会被谁盖住 / 同距裁决不了 / 内置占着会被你顶掉。
 
     `dist_of` 让调用方把距离表算一次：`lookup_functions` 要对「每个文件 × 每个
-    函数」都问一遍，而 `ws.function_distance` 每次调用都会重建整条祖先链。
+    函数」都问一遍，而 `ws.function_distance` 每次调用都会重建整条来源表。
     """
     dist = dist_of or ws.function_distance
     win = reg.get(name) if reg is not None else None
@@ -1250,7 +1358,7 @@ def lookup_functions(query: str = "", include_shadowed: bool = True,
     q = (query or "").strip().lower()
     cap = max(1, int(limit or 20))
 
-    # 距离表只算一次：`ws.function_distance` 每次调用都会重建整条祖先链，
+    # 距离表只算一次：`ws.function_distance` 每次调用都会重建整条来源表，
     # 而下面要对「每个文件 × 每个函数」都问一遍状态 —— 不缓存就是 O(n·m·depth) 次系统调用。
     all_sources = ws.function_sources(include_missing=True)
     dist_by_dir = {canon_path(s.path): s.distance for s in all_sources}

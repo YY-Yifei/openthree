@@ -448,15 +448,16 @@ def read_source(path: Any) -> str:
 class FunctionSource:
     """一个 function **来源目录** —— 「从哪找 function」的一档。
 
-    `kind` 只有三档：`project`（本项目）/ `ancestor`（祖先目录）/ `user`（用户目录）。
-    它只是**标签**（`label` 才是给人看的那个）—— 代码判「这是不是本项目的」请用
-    `distance == 0`，不要比较这里的字符串：同一件事只该有一个判据。
-    外部**登记加载**的文件不是「源」，它是一条条路径，由登记簿另外记着（见
-    `functions_meta_file`）—— 「哪些文件被授权加载」与「去哪发现」是两件事。
+    `kind` 只有三档：`project`（本项目）/ `profile`（命令行 `-profile` 点名的）/
+    `user`（用户目录）。它只是**标签**（`label` 才是给人看的那个）—— 代码判
+    「这是不是本项目的」请用 `distance == 0`，不要比较这里的字符串：同一件事
+    只该有一个判据。外部**登记加载**的文件不是「源」，它是一条条路径，由登记簿
+    另外记着（见 `functions_meta_file`）—— 「哪些文件被授权加载」与「去哪发现」
+    是两件事。
 
     `distance` 是**同名词的唯一裁决依据**：越小越近，近者生效。
-    project 恒为 0 —— 模型自己写下的东西永远压过外部；祖先每上一层 +1；
-    user 排在最后；内置在最底层。
+    project 恒为 0 —— 模型自己写下的东西永远压过外部；profile 按命令行顺序
+    从 1 起逐个 +1（先写的更近，PATH 语义）；user 排在最后；内置在最底层。
     """
 
     kind: str
@@ -468,7 +469,6 @@ class FunctionSource:
 FUNCTIONS_META_NAME = "functions.json"
 USER_FUNCTION_DISTANCE = 1_000_000
 REGISTERED_FUNCTION_DISTANCE = 1_000_001
-_MAX_SOURCE_DEPTH = 64
 
 
 @dataclass
@@ -477,10 +477,19 @@ class Workspace:
 
     root: Path                      # 用户的项目目录
     dir: Path = field(init=False)   # .openthree 目录
+    # 命令行 `-profile` 点名的目录（每项是一个**含 `.openthree/` 的项目目录**，
+    # 与 `-C` 同构）。它只贡献 `<p>/.openthree/functions/*.py` —— memory /
+    # config / prompts / identity / plan 一概不读，那是「身份」，不可共享。
+    # 顺序就是优先级：靠前的更近（见 function_sources 的 distance）。
+    profiles: Tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         self.root = Path(self.root).resolve()
         self.dir = self.root / DIRNAME
+        # 统一展开 / 规范化：调用方给什么写法都行，canonical 去重留给 function_sources
+        # （那时才需要与「指到 project 自己」一起判）。这里**不校验存在性** ——
+        # 校验由 CLI 在构造 Runtime 之前做（早于落盘）。
+        self.profiles = tuple(Path(p).expanduser().resolve() for p in self.profiles)
         # 最近一次 stage_images 里单张图片装载失败的原因（供 CLI/自省提示）
         self._last_image_error: str = ""
 
@@ -1332,9 +1341,14 @@ class Workspace:
     def function_sources(self, include_missing: bool = False) -> List[FunctionSource]:
         """function 的来源目录清单，**按距离升序**（由近到远）—— 「从哪找」的唯一真源。
 
+        三档，全在这一个函数里：project（`-C`，恒 d=0）、profile（`-profile`
+        点名的，按顺序 d=1,2,…）、user（`~/.openthree`，d=USER_FUNCTION_DISTANCE）。
+        距离既决定同名时谁生效，也决定要不要自动加载（见 `Registry.load_plan`）。
+
         只认 `<dir>/.openthree/functions` 这一种版式。裸的 `<dir>/functions/`
         一律不认：在 python 项目里它是常见包名，误扫等于把别人的库当成工具加载。
-        不递归、不看进程 cwd（`root` 在 `__post_init__` 里已经 resolve 过）。
+        不递归、不看进程 cwd（`root` 与 `profiles` 在 `__post_init__` 里已 resolve），
+        profile 里也不能再声明 profile —— 要组合就一次列全。
 
         这里**只枚举、不加载** —— 发现与授权是两件事（见 `lookup_functions`）。
 
@@ -1349,7 +1363,7 @@ class Workspace:
 
         def _add(src: FunctionSource) -> None:
             key = canon_path(src.path)
-            if key in seen:          # 同一个目录（user 恰在祖先链上时会发生）
+            if key in seen:          # 同一目录被重复点名 / profile 指到 project 自己
                 return
             seen.add(key)
             if not include_missing and not src.path.is_dir():
@@ -1358,16 +1372,11 @@ class Workspace:
 
         _add(FunctionSource("project", "project", self.functions_dir, 0))
 
-        depth = 0
-        cur = self.root.parent
-        while depth < _MAX_SOURCE_DEPTH:
-            depth += 1
-            _add(FunctionSource("ancestor", f"ancestor:{cur}",
-                                cur / DIRNAME / "functions", depth))
-            parent = cur.parent
-            if parent == cur:        # 已到盘符根 / 文件系统根
-                break
-            cur = parent
+        # 命令行点名的 profile：先写的更近（PATH 语义）。点名即授权，所以这些档
+        # 会自动加载（load_plan 的判据是 distance < USER_FUNCTION_DISTANCE）。
+        for i, p in enumerate(self.profiles):
+            _add(FunctionSource("profile", f"profile:{p}",
+                                Path(p) / DIRNAME / "functions", i + 1))
 
         try:
             home = Path.home()
@@ -1442,9 +1451,14 @@ class Workspace:
         return [p for p in sorted(self.functions_dir.glob("*.py"))
                 if not p.name.startswith("_")]
 
-    def function_path(self, name: str) -> Path:
+    def function_path(self, name: str, in_dir: Optional[Path] = None) -> Path:
+        """一个工具名对应的文件路径；`in_dir` 缺省为本项目的 functions 目录。
+
+        名字里的非法字符会被收敛成 `_`。这条规则只在这里有一份 —— 写到 profile
+        与写到这里必须落在同名文件上，否则「改写了共享那份」会变成「又造了一个新的」。
+        """
         safe = re.sub(r"[^0-9A-Za-z_]+", "_", name).strip("_") or "tool"
-        return self.functions_dir / f"{safe}.py"
+        return (in_dir or self.functions_dir) / f"{safe}.py"
 
     # ---------- 日志 ----------
     def new_session_id(self) -> str:
