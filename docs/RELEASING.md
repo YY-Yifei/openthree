@@ -10,12 +10,12 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.2.0`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.3.0`，**开发中**（`0.2.0` 已上传 PyPI、不可覆盖，本版只能作为新版本号发布；`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.3.0`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.3.0`，**已发布**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
-| 元数据 | `twine check` ✓ 两个 PASSED（0.2.0 产物） |
-| 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄） |
-| 测试 | 558 passed（仓库根，0.3.0 开发中实跑） |
+| 元数据 | `twine check` ✓ 两个 PASSED（0.3.0 产物） |
+| 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄）；`recursive-include docs *.md` 按**磁盘**收集而非 git，未跟踪的废案靠 `MANIFEST.in` 里显式 `exclude` 挡住 |
+| 测试 | 558 passed（仓库根，0.3.0 实跑） |
 | 依赖 | `openai>=1.0`、`PyYAML>=6.0`、`json_repair>=0.30`（频道层只用标准库，未新增依赖） |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
@@ -386,8 +386,8 @@ PyPI 上的版本不能删除，只能 *yank*（标记为“不建议使用”�
   `python -m openthree -u --check` 在无工作区处 → **退出码 2** 且提示「先跑一次 openthree
   （或 --init）」，未凭空造出工作区 ✓
 
-> 体积与 sha256 不写在这里：本文件本身随 sdist 发布，写进去就会改变那些数字（自指）。
-> 因此它们只记在上传后的核对记录里，见「0.1.8 上传后核对」。
+> 上传后的体积与 sha256 记在文末「上传后核对」小节：它们描述的是**已发布、不可变**的
+> 产物，所以不会因为本文自身随后被改动而失效。
 
 ### 0.2.0 实跑补充（2026-10-29）
 
@@ -410,7 +410,40 @@ PyPI 上的版本不能删除，只能 *yank*（标记为“不建议使用”�
 - **全新 venv** 装 **wheel**，在仓库之外的**中性 cwd** 验收：`import openthree` →
   `0.2.0` 且 `__file__` 指向 site-packages；`openthree channel --help` 列出
   `add / list / show / enable / disable / remove / test / path` 八个子命令 ✓
-- **未上传 PyPI**：线上仍是 `0.1.8`；`0.1.9` 从未上传，其产物已被本版取代 ✓
+- **上传**：已上传 PyPI，见文末「上传后核对」；`0.1.9` 从未上传，其产物已被本版取代 ✓
+
+### 0.3.0 实跑记录（2026-10-29）
+
+本版内容：**`-profile` 多层 function 来源** —— 命令行可多次点名 profile 目录，
+project(0) 与 profile(1..N) 按 distance 裁决，祖先目录的自动加载移除。详见
+`docs/profile-functions-proposal.md` 与 README「profile」一节。
+
+- `pyproject.toml` / `openthree/__init__.py` 版本号一致（`0.3.0`）✓
+- 全量 pytest → **558 passed / 0 failed** ✓
+- `python -m build` → wheel 252,984 B + sdist 462,404 B（先清空 `dist/` 再构建）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist 内容核验：与 `git ls-files` 比对，**未跟踪文件 0 项** —— 未跟踪的废案
+  `docs/memory-chroma-proposal.md` 由 `MANIFEST.in` 的显式 `exclude` 挡住 ✓
+- `twine upload --non-interactive` 一次成功 →
+  <https://pypi.org/project/openthree/0.3.0/> ✓
+- 双向核验：下表 0.3.0 两行与本地 `dist/` **全串一致**；`/pypi/openthree/json` 的
+  `info.version` 从 `0.2.0` 翻到 `0.3.0`（CDN 缓存约需数十秒）✓
+
+### 上传后核对（按版本）
+
+sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/json` 的
+`urls[].digests.sha256`），与本地 `dist/` 逐串比对。它们描述的是**已发布、不可变**的
+产物，所以本文随后被改动也不会让这些数字失效。
+
+| 版本 | 产物 | 字节 | sha256 |
+| --- | --- | --- | --- |
+| 0.1.8 | `openthree-0.1.8-py3-none-any.whl` | 166,856 | `bb6662c6d752e5f559ac536c214be17ba637592421a73b9ad436f97ea0aadfbd` |
+| 0.1.8 | `openthree-0.1.8.tar.gz` | 312,618 | `a8d9e169484d0f4967b5ba047b236be11bd5fe4d9400eccb58fc00ae861f3823` |
+| 0.2.0 | `openthree-0.2.0-py3-none-any.whl` | 247,643 | `17e1b65f2dbfdbb9ea59fa358334e3482805a349e72c68a319c3066f7b8e077a` |
+| 0.2.0 | `openthree-0.2.0.tar.gz` | 416,365 | `722aaa783ab159252e62d806fe4a79cd197941226f89c27f185d44eb607b29d8` |
+| 0.3.0 | `openthree-0.3.0-py3-none-any.whl` | 252,984 | `2687e36edc765364df1188c8b3447b9f0088383243b8eb0185dc1705e4072510` |
+| 0.3.0 | `openthree-0.3.0.tar.gz` | 462,404 | `f5f108538c73dcec44ab99467126c06c03566e7b50bd89047e16e201ce4e504c` |
+
 
 
 
