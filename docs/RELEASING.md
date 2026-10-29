@@ -10,13 +10,13 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.1.7`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.1.7`，**已上传 PyPI**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.1.8`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.2.0`，**本地已构建、待上传**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
-| 元数据 | `twine check` ✓ PASSED |
+| 元数据 | `twine check` ✓ 两个 PASSED（0.2.0 产物） |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄） |
-| 测试 | 331 passed（仓库根 + 解包后的 sdist 内各跑一遍都全绿） |
-| 依赖 | `openai>=1.0`、`PyYAML>=6.0`、`json_repair>=0.30` |
+| 测试 | 542 passed（仓库根，0.2.0 实跑） |
+| 依赖 | `openai>=1.0`、`PyYAML>=6.0`、`json_repair>=0.30`（频道层只用标准库，未新增依赖） |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
 > 所以务必先走 TestPyPI 演练一遍。
@@ -382,5 +382,29 @@ PyPI 上的版本不能删除，只能 *yank*（标记为“不建议使用”�
 
 > 体积与 sha256 不写在这里：本文件本身随 sdist 发布，写进去就会改变那些数字（自指）。
 > 因此它们只记在上传后的核对记录里，见「0.1.8 上传后核对」。
+
+### 0.2.0 实跑补充（2026-10-29）
+
+本版内容：**频道层** —— 微信（iLink Bot 长轮询）与钉钉（机器人 Stream 模式）两种渠道，
+`openthree -d` 后台常驻、`-i` 与频道并存。频道消息走的就是 `-i` 里那一句
+`Runtime.run()`，内核未改。详见 README「频道」一节与提交 `7c0ba7d`。
+
+验收（仓库根实跑）：
+
+- `pyproject.toml` / `openthree/__init__.py` 版本号一致（`0.2.0`）✓
+- 全量 pytest → **542 passed / 0 failed**（新增 `tests/test_channels.py` 53 条）✓
+- `python -m build` → `openthree-0.2.0-py3-none-any.whl` + `.tar.gz`；先清空 `dist/`
+  与 `openthree.egg-info` 再重建，`dist/` 只留本版 ✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- wheel 内 `openthree/channels/` **12 个模块**齐备（`__init__` / `base` / `config` /
+  `bridge` / `manager` / `wechat` / `dingtalk` / `cli` / `_http` / `_ws` / `_qr` /
+  `_qrencode`）✓
+- sdist **92 项**，按路径逐条筛**违规 0 项**（无 `.openthree/`、无 `config.yaml`、
+  无 `api_key` / `identity.json` / `limits.json`）；`tests/` 与 `docs/` 照常包含 ✓
+- **全新 venv** 装 **wheel**，在仓库之外的**中性 cwd** 验收：`import openthree` →
+  `0.2.0` 且 `__file__` 指向 site-packages；`openthree channel --help` 列出
+  `add / list / show / enable / disable / remove / test / path` 八个子命令 ✓
+- **未上传 PyPI**：线上仍是 `0.1.8`；`0.1.9` 从未上传，其产物已被本版取代 ✓
+
 
 
