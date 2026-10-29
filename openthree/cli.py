@@ -12,6 +12,14 @@
     openthree --inspect               看一眼自己当前的样子（不调模型）
     openthree --functions             列出所有工具
 
+    openthree channel add             引导式配置频道（微信 / 钉钉），写入 .openthree/channels.yaml
+    openthree -d                      后台常驻：**不读控制台**，只等频道消息
+
+频道（`.openthree/channels.yaml`）在**启动时自动加载**：`-i` 下控制台与频道并存
+（频道消息进来就像另一个用户在打字），`-d` 下只等频道、完全不碰 stdin。
+一份配置可以放多个频道，它们各自一条线程、互不拖累；内核一行都不用改 ——
+频道消息走的就是 `-i` 里那一句 `Runtime.run()`。
+
 交互模式是**默认模式**：不带任务参数、不带图片、不开 --auto，且 stdin 连着终端时，
 `openthree` 直接进 -i，不必再记那个 -i。**stdin 不是终端时**（管道 / 重定向 / CI /
 脚本，或显式 `--no-interactive`）走单次路径 —— 交互模式需要人来敲字，无人应答
@@ -163,6 +171,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", type=int, default=0, metavar="N",
                    help="从对话档案 transcript.jsonl 续读最近 N 轮作为会话起点；"
                         "默认 0 = 不读盘，从零开始")
+    p.add_argument("-d", "--daemon", action="store_true",
+                   help="后台常驻：**不再等控制台输入**，只等频道（微信 / 钉钉）消息，"
+                        "收到就当作一次用户输入跑 ReAct、把答案回到原会话。"
+                        "频道来自 .openthree/channels.yaml（用 `openthree channel add` 生成）。"
+                        "与任务参数互斥；Ctrl-C 退出")
+    p.add_argument("--no-channels", action="store_true",
+                   help="不自动加载频道（交互模式默认会加载 .openthree/channels.yaml 里启用的频道）")
+    p.add_argument("--only", default=None, metavar="NAME[,NAME]",
+                   help="只启动指定名字的频道（配合 -d / -i；默认全部启用项）")
     p.add_argument("-u", "--upgrade", action="store_true",
                    help="升级模式：扫描当前项目的 .openthree/ 相对**本机已装内核**的漂移"
                         "（缺 / 旧 / 不合规），打印清单，然后进入交互会话 —— 由模型逐条给"
@@ -181,6 +198,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     _force_utf8()
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # `openthree channel …` 是子命令：它有自己的参数（--type / --set / --online …），
+    # 主解析器不认识它们，所以在主解析器之前就截住，原样转交。
+    if raw and raw[0] in ("channel", "channels"):
+        from .channels.cli import main as channel_main
+
+        return channel_main(raw[1:])
     args = build_parser().parse_args(argv)
     project_dir = Path(args.dir).resolve()
 
@@ -253,6 +277,25 @@ def main(argv=None) -> int:
         print(rt.registry.digest())
         return 0
 
+    # --- 后台常驻：只等频道输入 ---
+    # 它和「跑一个任务」是两种东西：任务有终点，频道没有。所以先拦住任何任务参数，
+    # 否则用户会以为 `-d "顺便干点什么"` 两件事都会发生。
+    if args.daemon:
+        if " ".join(args.task).strip() or _collect_images(args):
+            print("[错误] -d 不接受任务 / 图片参数 —— 它只等频道消息。"
+                  "要跑任务就去掉 -d。", file=sys.stderr)
+            return 2
+        if args.upgrade:
+            print("[错误] -d 与 -u 互斥。", file=sys.stderr)
+            return 2
+        # -d 的全部意义就是「只跑频道」；同时说 --no-channels 是自相矛盾，
+        # 而默默忽略其中一个会让用户以为另一边生效了。
+        if args.no_channels:
+            print("[错误] -d 与 --no-channels 互斥 —— -d 就是「只跑频道」。",
+                  file=sys.stderr)
+            return 2
+        return _daemon(rt, args)
+
     task = " ".join(args.task).strip()
     images = _collect_images(args)
 
@@ -277,7 +320,8 @@ def main(argv=None) -> int:
         print()
         return _interactive(rt, build_upgrade_task(report, dry_run=args.dry_run),
                             args.append, None, auto=args.auto, resume=0,
-                            upgrade=True, dry_run=args.dry_run)
+                            upgrade=True, dry_run=args.dry_run,
+                            only=args.only, no_channels=True, quiet=args.quiet)
 
     # 不带参数 = 进交互模式（-i 是默认模式）。前提是有人在键盘边：stdin 不是终端
     # （管道 / CI / 脚本）时 REPL 会立刻 EOF、什么也不做就退出，所以那种情况走单次。
@@ -288,7 +332,8 @@ def main(argv=None) -> int:
                 and args.auto <= 0 and args.resume <= 0
                 and _stdin_is_tty())):
         return _interactive(rt, task, args.append, images, auto=args.auto,
-                            resume=args.resume)
+                            resume=args.resume, only=args.only,
+                            no_channels=args.no_channels, quiet=args.quiet)
 
     if not task and not rt.ws.has_task() and not images:
         _print_banner(rt)
@@ -375,11 +420,31 @@ def _collect_images(args) -> list[str]:
 def _interactive(rt: Runtime, first_task: str, append: bool,
                  first_images: Optional[list] = None, auto: int = 0,
                  resume: int = 0, upgrade: bool = False,
-                 dry_run: bool = False) -> int:
+                 dry_run: bool = False, only: Optional[str] = None,
+                 no_channels: bool = False, quiet: bool = False) -> int:
     _force_utf8()
     _print_banner(rt)
     # 交互模式 = 一个进程内会话：逐轮累积、跨轮可见，退出即忘。
     loaded = rt.begin_session(resume=resume)
+
+    # 频道在交互模式下**自动加载**：控制台与频道共用这一个会话、这一把锁 ——
+    # 于是频道消息进来就像另一个人在你旁边敲了一行字，回答会回到它来的那个会话。
+    bridge = channels_mgr = None
+    if not no_channels:
+        from .channels import AgentBridge, load_manager
+
+        bridge = AgentBridge(rt, echo=not quiet)
+        try:
+            channels_mgr = load_manager(rt.ws, bridge, only=_split_channel_names(only))
+        except Exception as exc:  # noqa: BLE001 - 频道配坏了不该挡住控制台
+            print(f"[频道] 配置读取失败（忽略）：{exc}")
+        if channels_mgr is not None and channels_mgr.statuses:
+            channels_mgr.start()
+            print(f"[频道] 已启动 {len(channels_mgr.statuses)} 个："
+                  f"{', '.join(channels_mgr.active)}（消息进来就像一行用户输入）")
+        elif channels_mgr is not None and channels_mgr.skipped:
+            print("[频道] 未启动：\n" + "\n".join(f"  - {s}" for s in channels_mgr.skipped))
+
     memory = ("关闭" if rt.turns == 0
               else "全部" if rt.turns < 0
               else f"最近 {rt.turns} 轮")
@@ -471,12 +536,18 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
             # 当成「沿用磁盘当前任务」，把图片附到磁盘上那条任务上。
             user_arg = text if text else ""
             try:
+                # 与控制台的频道工作线程共用一把锁：同一时刻只跑一条 ReAct 循环。
                 if auto > 0:
-                    doc = rt.run_auto(user_arg, rounds=auto, append=append,
-                                      images=images)
+                    doc = (bridge.under_lock(lambda: rt.run_auto(
+                        user_arg, rounds=auto, append=append, images=images))
+                        if bridge is not None else
+                        rt.run_auto(user_arg, rounds=auto, append=append, images=images))
                     answers = doc.get("auto_answers") or []
                 else:
-                    doc = rt.run(user_arg, append=append, images=images, session=True)
+                    doc = (bridge.under_lock(lambda: rt.run(
+                        user_arg, append=append, images=images, session=True))
+                        if bridge is not None else
+                        rt.run(user_arg, append=append, images=images, session=True))
                     answers = doc.get("round_answers") or []
                 if len(answers) > 1:
                     print("\n" + "═" * 60)
@@ -495,7 +566,60 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
     finally:
         # 退出（:q / EOF / Ctrl-C）也要收会话：否则同一个 Runtime 被复用（嵌入 /
         # 测试 / 同一进程再跑单次任务）时会莫名继承本会话记忆。
+        # 频道同理：先把线程停掉、把桥收工，再收会话，免得收尾期间还有消息进来。
+        if channels_mgr is not None:
+            channels_mgr.stop()
+        if bridge is not None:
+            bridge.stop()
         rt.end_session()
+
+
+def _split_channel_names(raw) -> Optional[list[str]]:
+    """`--only wx,ding` → `["wx", "ding"]`；空 → None（= 全部启用项）。"""
+    if not raw:
+        return None
+    names = [x.strip() for x in str(raw).replace("，", ",").split(",") if x.strip()]
+    return names or None
+
+
+def _daemon(rt: Runtime, args) -> int:
+    """后台常驻：启动频道，只等它们把消息送进来。
+
+    它不读 stdin —— 这正是 `-d` 与 `-i` 的分水岭：`-i` 等人敲字，`-d` 等人发消息。
+    两者用的是同一个 `Runtime.run()`：所以「频道消息」与「用户输入」在智能体看来
+    是同一件事，内核不需要知道 `-d` 存在。
+    """
+    from .channels import AgentBridge, load_manager
+
+    bridge = AgentBridge(rt, echo=not args.quiet)
+    try:
+        mgr = load_manager(rt.ws, bridge, only=_split_channel_names(args.only))
+    except Exception as exc:  # noqa: BLE001 - 配置坏了要给出可操作的提示
+        print(f"[错误] 读取频道配置失败：{exc}", file=sys.stderr)
+        return 2
+
+    if not mgr.statuses:
+        print("[错误] 没有可启动的频道：", file=sys.stderr)
+        print(mgr.skip_summary(), file=sys.stderr)
+        print("\n先配一个：openthree channel add\n"
+              "看现有配置：openthree channel list", file=sys.stderr)
+        return 2
+
+    _print_banner(rt)
+    rt.begin_session()
+    try:
+        mgr.start()
+        print(f"[频道] 已启动 {len(mgr.statuses)} 个：{', '.join(mgr.active)}")
+        print("[频道] 后台运行中 —— 不再读控制台输入，Ctrl-C 退出。\n", flush=True)
+        error = mgr.wait()
+        if error:
+            print(f"[频道] 有频道异常退出：{error}", file=sys.stderr)
+    except KeyboardInterrupt:
+        print("\n[频道] 收到中断，正在退出…")
+    finally:
+        mgr.stop()
+        rt.end_session()
+    return 0
 
 
 def _split_image_arg(raw: str) -> list:

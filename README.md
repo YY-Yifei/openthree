@@ -62,6 +62,8 @@ openthree -u --check                        # 只扫描、只打印清单就退�
 openthree -u --dry-run                      # 让模型出升级方案，但不落盘
 openthree "这张报错什么意思" --image err.png # 多模态：随任务附一张图片
 openthree "对比这两张图" --images a.png,b.png
+openthree channel add                        # 引导式配置频道（微信 / 钉钉）→ .openthree/channels.yaml
+openthree -d                                 # 后台常驻：不读控制台，只等频道消息
 ```
 
 **交互模式是默认模式。** 不带任务参数、不带图片、不开 `--auto`、不 `--resume`，且
@@ -562,6 +564,81 @@ recall_memory(query="pytest")     # → 把写下的经验读回来
 
 设计上这是补上「能力可生长」闭环里断掉的一环：**写下的经验，只有被读回才有价值。**
 记忆与检索都不含任何硬编码智能——它们只是给模型的手，怎么用由模型决定。
+
+## 频道：把 openthree 接到微信 / 钉钉
+
+`-i` 等的是**人敲字**，频道等的是**人发消息**。两者在智能体看来是同一件事：
+频道收到一句话就调一次 `Runtime.run()`，把 `doc["answer"]` 回到原会话 ——
+**内核（agent / llm / runtime）一行都没改**。
+
+### 一分钟上手
+
+```bash
+openthree channel add        # 引导式问答：选类型 → 填字段 → 是否启用
+openthree channel list       # 有哪些频道、就绪了没有
+openthree -d                 # 后台常驻：不读控制台，只等频道消息（Ctrl-C 退出）
+openthree -i                 # 也可以并存：控制台与频道共用一个会话
+```
+
+脚本 / CI 里不想问答就全参数：
+
+```bash
+openthree channel add --type dingtalk --name ding \
+    --set client_id=你的AppKey --set client_secret=你的AppSecret
+```
+
+### 两个渠道
+
+| 类型 | 收消息 | 发消息 | 要准备什么 |
+| --- | --- | --- | --- |
+| `wechat` | iLink Bot 长轮询（`ilink/bot/getupdates`） | `ilink/bot/sendmessage` | 不用公网地址；首次启动把二维码**直接打在控制台**上，扫码即登录，token 落到 `.openthree/channels/<频道名>.json` |
+| `dingtalk` | 机器人 Stream 模式（WebSocket） | 官方下发的 `sessionWebhook` | 钉钉开放平台自建应用的 AppKey / AppSecret；同样不用公网地址 |
+
+两者都只用标准库（`urllib` + 一个百余行的 WebSocket 客户端），**不新增任何依赖**；
+`type` 认别名：`dingding` / `钉钉` → `dingtalk`，`wx` / `微信` → `wechat`。
+
+登录二维码不走「给你一个文件路径」那条路：`openthree/channels/_qr.py` 把服务端返回的
+PNG 解成模块矩阵，用半块字符（`█ ▀ ▄`）画在控制台上，手机对着终端就能扫。
+字符集按输出流编码自己退让 —— GBK 控制台有 `█` 却没有 `▀`、`▄`，就退成每行一个模块行；
+连方块字符都不认（`ascii`）时退成 `##`。PNG 仍旧落在
+`.openthree/channels/<频道名>-qrcode.png`，事后重扫 / 转发都用得上。
+
+### 配置长什么样
+
+`.openthree/channels.yaml` 一份文件放**多个**频道：
+
+```yaml
+schema: 1
+channels:
+  - name: wx
+    type: wechat
+    enabled: true
+    options:
+      base_url: https://ilinkai.weixin.qq.com
+  - name: ding
+    type: dingtalk
+    enabled: true
+    options:
+      client_id: "..."
+      client_secret: "..."
+      require_mention: "true"     # 群聊里只回应 @ 了机器人的消息
+```
+
+启动时自动加载（`--no-channels` 关掉，`--only wx,ding` 只挑几个）。每个频道一条
+线程，扫码失败 / 掉线只影响它自己；进来的消息排进同一个队列，由一条工作线程
+一次一条地喂给同一个会话 —— 几个人同时在微信和钉钉里说话，就像几个人在同一个
+终端里轮流打字（`--only` 与 `-d` / `-i` 都可用）。
+
+排查用 `openthree channel test ding --online`：不加 `--online` 只做静态校验
+（字段齐不齐），加了才真连一次（微信拿一个二维码，钉钉换一个 Stream 接入点）。
+
+### `-d` 与 `-i` 的分水岭
+
+- `openthree -i`：控制台与频道**并存**，两边共用一把执行锁 —— 同一时刻只跑一条
+  ReAct 循环，谁先说话谁先跑。
+- `openthree -d`：**完全不碰 stdin**，只等频道消息，Ctrl-C 退出。这正是「后台运行」
+  的那一步：把它丢进 `nohup` / 计划任务 / 容器里，它就一直是那个会回消息的智能体。
+- 单次任务（`openthree "任务"`）不启动频道 —— 它一跑完就退出，挂着频道没有意义。
 
 ## 安全声明
 
