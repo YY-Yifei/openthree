@@ -104,8 +104,8 @@ python -m pip install --upgrade build twine
 #    openthree/__init__.py: __version__
 python -c "import openthree,re,pathlib;v=re.search(r'version\s*=\s*\"([^\"]+)\"',pathlib.Path('pyproject.toml').read_text()).group(1);print('pyproject',v,'| __init__',openthree.__version__);assert v==openthree.__version__, '版本号不一致!'"
 
-# 2) 全量测试
-python -m pytest -q
+# 2) 全量测试（pyproject.toml 的 addopts 已带 -q，别重复传）
+python -m pytest
 
 # 3) 清理旧产物后重建
 rmdir /s /q dist 2>nul & rmdir /s /q openthree.egg-info 2>nul
@@ -116,6 +116,12 @@ python -m twine check dist/*
 
 # 5) 安全核验：sdist 里不得出现 .openthree / config.yaml / api_key
 python -c "import tarfile,glob;n=tarfile.open(glob.glob('dist/*.tar.gz')[0]).getnames();b=[x for x in n if '.openthree' in x or x.endswith('config.yaml')];print('suspect:',b or 'NONE');assert not b"
+
+# 6) 内容核验：sdist 只应收 git 跟踪的文件
+#    MANIFEST.in 的 recursive-include 按**磁盘**收集，不看 git ——
+#    磁盘上留着但没提交的草稿会跟着一起发布出去。这里排掉 setuptools
+#    自己生成的 PKG-INFO / setup.cfg / *.egg-info。
+python -c "import subprocess,glob,tarfile;t=tarfile.open(glob.glob('dist/*.tar.gz')[0]);pre=t.getnames()[0].split('/')[0]+'/';packed={m.name[len(pre):] for m in t.getmembers() if m.isfile() and m.name.startswith(pre)};gen=lambda x:x in ('PKG-INFO','setup.cfg') or x.startswith('openthree.egg-info/');tracked={p.replace(chr(92),'/') for p in subprocess.run(['git','ls-files'],capture_output=True,text=True).stdout.split()};bad=sorted(x for x in packed-tracked if not gen(x));print('not in git:',bad or 'NONE');assert not bad"
 ```
 
 ---
