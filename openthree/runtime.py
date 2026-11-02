@@ -642,7 +642,10 @@ class Runtime:
             + (f"（set_identity 维护；改名 {self.ws.read_identity().get('renames') or 0} 次）"
                if self.agent_name() else "（用 set_identity 给自己起名）"),
             f"工作区   {self.ws.dir}",
-            f"系统提示词 {self.ws.system_prompt_file} ({len(self.ws.read_system_prompt())} 字符)",
+            f"系统提示词 {self.ws.system_prompt_file} ({len(self.ws.read_system_prompt())} 字符)"
+            + (f"；附随提示词 {len(reg.prompts)} 段 / "
+               f"{sum(len(p.text) for p in reg.prompts):,} 字符（来自 function）"
+               if getattr(reg, "prompts", None) else ""),
             f"任务     {self.ws.user_prompt_file}",
             f"计划     {self.ws.plan_file}"
             f"（未完成 {self.ws.plan_open_items()} 项 / 历史版本 "

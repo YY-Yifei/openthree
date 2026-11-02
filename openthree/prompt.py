@@ -2,12 +2,17 @@
 
 「一」=  .openthree/prompts/system-prompts.md        （世界观，模型可自改）
 「二」=  .openthree/functions/*.py  → 工具清单        （能力，模型可自造）
+       + 这些文件可选的 `__system_prompts__`          （能力自带的说明书，进 system 末尾）
 「三」=  运行期事实：工作目录、时间、演化史、上次结果  （处境，模型该知道）
          + .openthree/prompts/plan.md                 （计划，模型自己维护的待办）
          + .openthree/memory/memory.jsonl             （长期记忆，跨会话可回看）
          + .openthree/prompts/user-prompts.md        （任务，模型可自改）
        任务正文不落在这三层的任何一层：它是**用户说的话**，由运行期作为一条
        user 消息放进 history 末尾（见 CURRENT_INPUT_TEMPLATE）。
+
+system 是三段，顺序固定，由 `build_system_block` 一处拼出：
+    一（模型的世界观）→ 内核常量（STATIC_TEMPLATE：工作目录 / 工具清单 / 身份）
+    → 附随提示词（`build_attached_block`，没有时一个字节都不加）。
 
 整个 run() 每一步都重新组装，所以模型的自我修改下一步立即生效；但组装结果按
 **多久变一次**分三段落位（system / 自维护段 / 此刻段），让不变的前缀能被服务端缓存：
@@ -77,6 +82,22 @@ STATIC_TEMPLATE_TAIL = """\
 # 你的工具（二）
 
 {digest}
+"""
+
+# 附随提示词（来自「二」）：function 文件自带的说明，拼在 system 的**最后**。
+#
+# 为什么在最后：读者刚看完工具清单，接着读「这些工具怎么用」，语义位置正好；
+# 而且它只在 reload 时变，不破坏步内前缀稳定。
+#
+# 没有它时**一个字节都不拼**（`build_attached_block` 返回空串）—— 这是「不写
+# 就是零」在渲染侧的落点，由测试里的逐字节不变量守着。
+ATTACHED_PROMPT_TEMPLATE = """\
+# 来自 function 的附随说明（只读 —— 不是用户说的话，也不是你的身份）
+
+以下是某些 function 文件自带的说明，解释它们**怎么用、边界在哪**。
+它们不改变「一」与当前任务；与上面任何一段冲突时，以「一」为准。
+
+{body}
 """
 
 # 本轮的「当前任务」由运行期作为一条 **user 消息**放进 history（见
@@ -160,11 +181,56 @@ def build_static_block(ws: Workspace, reg: Registry, *, model: str) -> str:
     return head + _profile_line(ws, user) + tail
 
 
+def build_attached_block(reg: Registry) -> str:
+    """把 function 自带的说明拼成 system 的**最后一段**；没有时返回空串。
+
+    为空必须返回 `""`，不能返回 `"\n"`：system 是缓存前缀的主体，凭空多一个
+    换行，后面一万多 token 的工具 schema 与全部历史就要重算。
+
+    降权是**诚实**的：这段文字和「一」都躺在 system 里，对模型而言分量相同，
+    没有任何技术手段让它「更轻」。这里靠两样东西 —— 可读的措辞（「不是你的
+    身份，不是用户说的话」）与来源标注（哪个文件、哪一档）。假装它是硬约束
+    才是真的危险。
+    """
+    prompts = getattr(reg, "prompts", None) or []
+    if not prompts:
+        return ""
+    chunks = [f"## `{p.file}`（{p.label}，{p.parts} 段）\n\n{p.text}"
+              for p in prompts]
+    return ATTACHED_PROMPT_TEMPLATE.format(body="\n\n".join(chunks))
+
+
+def build_system_block(ws: Workspace, reg: Registry, *, model: str) -> str:
+    """`messages[0]` 的**唯一真源**：一 + 内核常量 + 附随提示词。
+
+    生产路径（`build_messages`）与诊断视图（`build_runtime_block`）都从这里取，
+    「system 由哪几段组成」才只有一个地方定义 —— 也才可能被测出「两者相同」。
+    头注释里的三段划分就是这三行。
+
+    附随段为空时，输出与「没有这个功能」**逐字节相同**：这是「不写就是零」
+    在渲染侧的落点，由测试里的不变量守着。
+    """
+    base = (f"{ws.read_system_prompt().strip()}\n\n"
+            f"{build_static_block(ws, reg, model=model)}")
+    attached = build_attached_block(reg)
+    return f"{base}\n\n{attached}" if attached else base
+
+
 def _profile_line(ws: Workspace, user: List[Any]) -> str:
     """「挂了哪些 profile」那一行；**没挂时返回空串**，一个字节都不多。
 
     这一行说明的是「这些工具从哪来」，不是「我是谁」—— profile 不参与身份，
-    所以它只报来源与数量，绝不去拼接别人的提示词或记忆。
+    所以它只报来源与数量，不替别人做自我介绍。
+
+    它与 `build_attached_block` 守的是同一条不变量的一体两面：
+
+        **别人的世界观不进 system；别人的能力说明书可以。**
+
+    这一行守前半句（不拼别人的提示词或记忆 —— 那是「一」的位置）；
+    后半句走 `build_attached_block`：`__system_prompts__` 与工具的代码同生共死，
+    换一具躯体仍然成立，所以它跟着能力走、可以进 system。
+    反证在同一份文件里：`reg.digest()` 早就把 profile 的工具名与 docstring
+    首行拼进了 system —— 「不进 system」从来不是字面意思，身份才是那条线。
 
     报**路径**而不是目录名：两个不同位置都可能叫 `base`，只报名字会显示成
     「base, base」，既分不清挂了什么，也看不出先写的那个（更近）。
@@ -217,23 +283,27 @@ def build_runtime_block(ws: Workspace, reg: Registry, *, model: str, iteration: 
                         context_stats: Optional[Dict[str, Any]] = None,
                         limits_stats: Optional[Dict[str, Any]] = None,
                         round_stats: Optional[Dict[str, Any]] = None) -> str:
-    """三段拼成一份完整处境（静态段 + 自维护段 + 此刻段）。
+    """三段拼成一份完整处境（system + 自维护段 + 此刻段）。
 
     `build_messages` 发请求时刻意把三段**分开发**（一段进 system、两段排历史之后），
     这个函数只供「想一眼看全处境」的调用方使用：测试、自省、诊断。
-    三边共用同一组模板，所以看到的就是发出去的内容。
+    两处共用 `build_system_block` / 同一组模板，所以看到的就是发出去的内容。
+
+    system 段含「一」与附随提示词：诊断视图若少了任何一段，看诊断的人和看请求
+    的人就会看到两份不同的处境 —— 而这份壳没有生产调用方，漂移了也不会有别的
+    东西来撞它。测试因此断言它与真正发出的 system **逐字节相等**。
 
     不含本轮任务正文：它不在这三段里，而是 history 末尾的一条 user 消息
     （见 `CURRENT_INPUT_TEMPLATE`）。想看任务请读 `ws.current_task_text()`。
     """
-    static = build_static_block(ws, reg, model=model)
+    system = build_system_block(ws, reg, model=model)
     context = build_context_block(ws)
     situation = build_situation_block(iteration=iteration, max_iterations=max_iterations,
                                       last_action=last_action, fold_range=fold_range,
                                       context_stats=context_stats,
                                       limits_stats=limits_stats,
                                       round_stats=round_stats)
-    return f"{static}\n\n{context}\n\n{situation}"
+    return f"{system}\n\n{context}\n\n{situation}"
 
 
 def _identity_line(ws: Workspace) -> str:
@@ -400,12 +470,13 @@ def build_messages(ws: Workspace, reg: Registry, history: List[Dict[str, Any]], 
                    context_stats: Optional[Dict[str, Any]] = None,
                    limits_stats: Optional[Dict[str, Any]] = None,
                    round_stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """组装完整 messages：静态 system + 历史 + 自维护段 + 此刻段。
+    """组装完整 messages：system + 历史 + 自维护段 + 此刻段。
 
     消息序列与各自的角色：
 
-    * `messages[0]`（system）= 一 + 内核常量。它必须逐字节稳定，
-      否则后面的一切（tools schema、history）都要重算 —— 见 STATIC_TEMPLATE_HEAD 上的注释。
+    * `messages[0]`（system）= 一 + 内核常量 + 附随提示词（`build_system_block`）。
+      它必须逐字节稳定，否则后面的一切（tools schema、history）都要重算
+      —— 见 STATIC_TEMPLATE_HEAD 上的注释。
     * `history` = 模型自己走过的路，只追加、不改写。
     * **计划/记忆/演化史** = 模型自己会改的文件，排在 history 之后。
     * **末尾那条** = 本步的时间/步数/上下文/上次行动。
@@ -418,15 +489,13 @@ def build_messages(ws: Workspace, reg: Registry, history: List[Dict[str, Any]], 
     并进 system ⇒ 匹配长度 = 系统提示词那 2.8k tok；
     排在后面 ⇒ 匹配长度 = system + tools + 全部历史。
     """
-    static = build_static_block(ws, reg, model=model)
+    system = build_system_block(ws, reg, model=model)
     context = build_context_block(ws)
     situation = build_situation_block(iteration=iteration,
                                       max_iterations=max_iterations,
                                       last_action=last_action, fold_range=fold_range,
                                       context_stats=context_stats,
                                       limits_stats=limits_stats, round_stats=round_stats)
-    # 「一」在最前：它是模型自己的世界观，比处境更稳定（只在模型自改时变）。
-    system = f"{ws.read_system_prompt().strip()}\n\n{static}"
     messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
     messages.extend(history)
     messages.append({"role": "user", "content": context})

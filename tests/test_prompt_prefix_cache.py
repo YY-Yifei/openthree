@@ -17,7 +17,7 @@ import io
 
 from openthree.prompt import (build_context_block, build_messages,
                               build_runtime_block, build_situation_block,
-                              build_static_block)
+                              build_static_block, build_system_block)
 
 from conftest import *  # noqa: F401,F403  复用 ws / registry 夹具
 
@@ -187,17 +187,19 @@ def test_runtime_block_equals_what_is_actually_sent(ws, registry, monkeypatch):
     kw = _stats_kw(1)
     msgs = build_messages(ws, registry, HISTORY, model="m", iteration=1,
                           max_iterations=200, last_action="", **kw)
-    static = build_static_block(ws, registry, model="m")
+    system = build_system_block(ws, registry, model="m")
     context = build_context_block(ws)
     situation = build_situation_block(iteration=1, max_iterations=200,
                                       last_action="", **kw)
 
-    # 发送路径：system 以内核常量段结尾，随后是自维护段与此刻段
-    assert msgs[0]["content"].endswith(static)
+    # 发送路径：system **就是** `build_system_block`（一 + 内核常量 + 附随提示词）。
+    # 断言整个 system 而不是 `endswith(static)`：后者在附随提示词非空时会漏检
+    # 「发送路径少拼了一段」，而且它天然无法发现「system 里多了一段谁也不认识的话」。
+    assert msgs[0]["content"] == system
     assert msgs[-2]["content"] == context
     assert msgs[-1]["content"] == situation
 
     # 兼容壳：同一组三段按同样顺序拼回
     assert build_runtime_block(ws, registry, model="m", iteration=1,
                                max_iterations=200, **kw) == \
-        f"{static}\n\n{context}\n\n{situation}"
+        f"{system}\n\n{context}\n\n{situation}"

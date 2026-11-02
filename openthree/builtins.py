@@ -41,6 +41,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 from .kernel import KERNEL
 from .multimodal import ImageResult
+from .registry import MAX_ATTACHED_PROMPT_CHARS, PROMPT_ATTR
 from .workspace import (REGISTERED_FUNCTION_DISTANCE, USER_FUNCTION_DISTANCE,
                         canon_path, read_source, sha256_file)
 
@@ -844,6 +845,7 @@ def verify_tool(name: str) -> str:
                 f"或 `from openthree import ...` 写错。修正后再 write_function。")
 
     tools = report.get("tools") or []
+    prompt = report.get("prompt") or {}
     lines = [f"[ok] 验收通过：{rel}（已能 import）"]
     if report.get("classes"):
         lines.append(f"  （另有类 {', '.join(report['classes'])} —— 类不会被注册为工具）")
@@ -855,8 +857,20 @@ def verify_tool(name: str) -> str:
             kernel_note = "（首参 kernel：运行期注入）" if t.get("needs_kernel") else ""
             lines.append(f"{mark}`{sig}`{kernel_note}"
                          + (f"  构造失败：{t['error']}" if t.get("error") else ""))
+    elif prompt:
+        lines.append("  这个文件没有工具，只有附随提示词 —— "
+                     "没有工具是设计，不是失败。")
     else:
         lines.append("  ⚠ 没有任何可注册的公开函数（_ 开头的会被忽略）。")
+    if prompt.get("error"):
+        # 与注册器的结论必须一致：这里说「验收通过」而 reload 时它进不了 system，
+        # 才是真的危险 —— 验收的全部意义就是提前发现这件事。
+        lines.append(f"  ⚠ 附随提示词求值失败（reload 时这段进不了 system）：{prompt['error']}")
+    elif prompt:
+        lines.append(f"  ✓ 附随提示词：{prompt.get('parts')} 段 / {prompt.get('chars'):,} 字符"
+                     "（reload 后拼进 system 末尾，不是工具）")
+        if prompt.get("first_line"):
+            lines.append(f"      首行：{prompt['first_line']}")
     for w in report.get("warnings") or []:
         lines.append(f"  ⚠ {w}")
     if err.strip():
@@ -865,6 +879,27 @@ def verify_tool(name: str) -> str:
     if not tainted:
         lines.append("  下一步：reload_functions() 生效，再 list_functions() 确认清单。")
     return "\n".join(lines)
+
+
+def _prompt_summary_lines(reg: Any) -> List[str]:
+    """「附随提示词」的共用格式：一行总数 + 逐文件来源。
+
+    `reload_functions` 与 `list_functions` 都从这里取，避免两处的计数与来源
+    标注慢慢发散。**没有一段时返回空列表** —— 调用方据此不打印空节：
+    可观测性不该靠「总有一节」来占位，那会让「到底有没有提示词」反而看不出来。
+    """
+    prompts = getattr(reg, "prompts", None) or []
+    if not prompts:
+        return []
+    total = sum(len(p.text) for p in prompts)
+    lines = [f"附随提示词：{len(prompts)} 段 / {total:,} 字符"
+             "（拼进 system 末尾，不是工具）"]
+    for p in prompts:
+        # 截断过的要写出原文长度：只报「4,000 字符」会让人以为自己的稿子就这么长。
+        cut = (f"，原文 {p.original_chars:,} 已截断"
+               if p.original_chars > len(p.text) else "")
+        lines.append(f"  - {p.file}（{p.label}，{len(p.text):,} 字符{cut}）")
+    return lines
 
 
 def reload_functions() -> str:
@@ -908,13 +943,26 @@ def reload_functions() -> str:
             lines.append(f"  - {Path(e.file).name}: {e.error}")
     else:
         lines.append("全部文件加载正常。")
+    lines.extend(_prompt_summary_lines(reg))
+    if reg.prompt_errors:
+        lines.append(f"⚠ {len(reg.prompt_errors)} 条附随提示词有问题"
+                     "（工具本身照常注册，只是这段话没进 system）：")
+        for e in reg.prompt_errors:
+            lines.append(f"  - {Path(e.file).name}: {e.error}")
     lines.append("当前工具清单：" + ", ".join(reg.names()))
     if KERNEL.recorder is not None:
         KERNEL.recorder.record(
             "evolution",
             summary=f"reload_functions: +{len(added)}/-{len(removed)}，共 {len(reg.tools)} 工具",
             data={"action": "reload_functions", "added": added, "removed": removed,
-                  "errors": [{"file": e.file, "error": e.error} for e in reg.load_errors]},
+                  "errors": [{"file": e.file, "error": e.error} for e in reg.load_errors],
+                  # 附随提示词没有 `prompts/history/` 那样的版本快照，这条事件
+                  # 是唯一能追「哪一版带来了什么」的线索（内容本身落在
+                  # logs/attached-prompts/<sha8>.md，按内容寻址、可读回）。
+                  "prompts": [{"file": p.file, "sha256": p.sha256,
+                               "chars": len(p.text),
+                               "first_line": (p.text.strip().splitlines() or [""])[0][:80]}
+                              for p in reg.prompts]},
         )
     return "\n".join(lines)
 
@@ -960,6 +1008,9 @@ def register_function(path: str, dry_run: bool = False, note: str = "") -> str:
     登记成功 **≠** 工具生效：同名工具按**距离**裁决（越近越优先）。你登记的那份
     若被更近的同名工具盖住，这里会明说「未生效」并告诉你是谁盖的 —— 不假装成功，
     否则你会反复登记同一个文件、却一直拿不到那个能力。
+
+    只带 `__system_prompts__`、没有工具的**纯提示词文件**也能登记：登记的是
+    「这个来源可信」，而它带来的是一段说明（进 system 末尾），不是一个工具。
 
     Args:
         path: function 文件的**绝对路径**（来自 lookup_functions 的输出）
@@ -1009,7 +1060,9 @@ def register_function(path: str, dry_run: bool = False, note: str = "") -> str:
     audit = _static_audit(code, builtin_names=builtin_names)
     if audit["syntax_error"]:
         return f"[错误] {cand.name} 语法检查未通过，未登记：\n{audit['syntax_error']}"
-    if not audit["functions"]:
+    if not audit["functions"] and not audit.get("has_prompts"):
+        # 纯提示词文件（只带 `__system_prompts__`）同样是正当的登记对象：
+        # 它在用户目录里写好了、被这份授权放进来，带来的是说明而不是工具。
         return (f"[错误] {cand.name} 没有可注册的公开函数，未登记。\n"
                 f"{_public_function_warning_from_audit(audit)}")
 
@@ -1066,6 +1119,11 @@ def register_function(path: str, dry_run: bool = False, note: str = "") -> str:
     head = "预演（未写入）" if dry_run else ("已更新登记" if existed else "已登记")
     lines = [f"[{head}] {cand}",
              f"  来源：{src.label}（d={src.distance}）｜sha256 {sha[:12]}"]
+    if not names and audit.get("has_prompts"):
+        # 没有工具可逐条报「生效 / 未生效」，但**它确实生效**：一段说明进了 system。
+        # 沉默会让这次登记看起来什么都没发生。
+        lines.append("  ✓ 这个文件没有工具，只带附随提示词 —— reload 后拼进 system 末尾"
+                     "（不是工具，模型调不到它）")
     ok: List[str] = []
     blocked: List[tuple] = []
     warned: List[tuple] = []
@@ -1268,6 +1326,11 @@ def list_functions() -> str:
         rows.append(f"\n## 加载异常（{len(reg.load_errors)}）")
         for e in reg.load_errors:
             rows.append(f"- {Path(e.file).name}: {e.error}")
+    prompt_lines = _prompt_summary_lines(reg)
+    if prompt_lines:
+        rows.append(f"\n## 附随提示词（{len(reg.prompts)} 段）"
+                    "—— 拼进 system 末尾，不是工具，模型调不到它")
+        rows.extend(prompt_lines[1:])
     return "\n".join(rows)
 
 
@@ -1468,6 +1531,21 @@ def _ast_signature(node: Any) -> str:
     return f"{getattr(node, 'name', '?')}({', '.join(names)})"
 
 
+def _literal_str_chars(node: Any) -> int:
+    """一个赋值右值里**静态可见**的字符数；算不出来就返回 0。
+
+    只认字符串字面量与它们的 list/tuple：审计是纯静态的，不执行代码，所以
+    「拼出来的字符串」「函数返回值」长度一律未知。这个数的用途是**提醒**
+    （「你正在往 system 里写 N 个字符」），不是精确计数 —— 精确值由注册器
+    收集后的 `Registry.prompts` 给出，那是唯一真源。
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return len(node.value)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return sum(_literal_str_chars(e) for e in node.elts)
+    return 0
+
+
 def _audit_module(path: Path) -> Dict[str, Any]:
     """对一个 function 文件做静态体检，返回各项判据的原始结果（不执行代码）。
 
@@ -1481,6 +1559,10 @@ def _audit_module(path: Path) -> Dict[str, Any]:
         "syntax_error": "", "read_error": "", "module_doc": "", "functions": [],
         "private_helpers": 0, "side_effects": [], "has_main_guard": False,
         "has_entry": False, "leaked": [],
+        # `__system_prompts__`：不是工具，是**会拼进 system 的文本**。
+        # `prompt_chars` 只统计静态可见的字面量（函数形态算不出，记 0）。
+        "has_prompts": False, "prompt_chars": 0,
+        "prompt_callable": False,
     }
     try:
         code = read_source(path)
@@ -1499,7 +1581,13 @@ def _audit_module(path: Path) -> Dict[str, Any]:
 
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name == "__main__":
+            if node.name == PROMPT_ATTR:
+                # 不是工具：它进 system。单独认出来，免得被算成「私有辅助」——
+                # 两者在「会不会进工具清单」上一样（都不进），在「会不会进
+                # system」上相反，混在一起会让审计报告沉默地漏掉一个事实。
+                rep["has_prompts"] = True
+                rep["prompt_callable"] = True
+            elif node.name == "__main__":
                 rep["has_entry"] = True
             elif node.name.startswith("_"):
                 rep["private_helpers"] += 1
@@ -1519,8 +1607,17 @@ def _audit_module(path: Path) -> Dict[str, Any]:
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for tgt in targets:
-                if (isinstance(tgt, ast.Name) and isinstance(node.value, ast.Lambda)
-                        and not tgt.id.startswith("_")):
+                if not isinstance(tgt, ast.Name):
+                    continue
+                if tgt.id == PROMPT_ATTR:
+                    # 两种赋值形态：字符串常量，或 list[str]（多段按顺序拼接）。
+                    rep["has_prompts"] = True
+                    rep["prompt_chars"] = _literal_str_chars(node.value)
+                    rep["prompt_kind"] = ("list"
+                                          if isinstance(node.value, (ast.List, ast.Tuple))
+                                          else "str")
+                    continue
+                if isinstance(node.value, ast.Lambda) and not tgt.id.startswith("_"):
                     rep["leaked"].append(tgt.id)
         elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
             # 模块级裸调用（print / mkdir / 建连接）：reload 会 exec_module，等于每次加载都跑一遍
@@ -1549,8 +1646,10 @@ def _function_issues(rep: Dict[str, Any]) -> List[str]:
         issues.append(f"语法错误：{rep['syntax_error']}")
     if not rep["module_doc"]:
         issues.append("缺模块 docstring 首行（一句话说明这个文件干什么）")
-    if not rep["functions"]:
-        issues.append("没有可注册的公开函数（公开 = 不以 `_` 开头的顶层 def）")
+    if not rep["functions"] and not rep.get("has_prompts"):
+        # 纯提示词文件（只带 `__system_prompts__`）是正当用法，不算问题。
+        issues.append("没有可注册的公开函数（公开 = 不以 `_` 开头的顶层 def）；"
+                      "只想附一段说明就写 `__system_prompts__`")
     for fn in rep["functions"]:
         if not fn["annotated"]:
             issues.append(f"`{fn['name']}`：有参数没写类型注解 → 工具 schema 与 CLI 都拿不到类型")
@@ -1693,10 +1792,24 @@ def read_prompts() -> str:
     sys_text = ws.read_system_prompt()
     sections = ws.analysis_sections(sys_text)
     idx = ("\n".join("- " + s for s in sections)) if sections else "（无章标题）"
-    return (f"# 系统提示词 ({ws.system_prompt_file})\n\n"
+    text = (f"# 系统提示词 ({ws.system_prompt_file})\n\n"
             f"## 章节索引（{len(sections)} 节）\n{idx}\n\n"
             f"## 全文\n\n{sys_text}\n\n"
             f"# 用户提示词 ({ws.user_prompt_file})\n\n{ws.read_user_prompt()}")
+    # 模型问「我到底被喂了什么」时，答案就在这里，不必多学一个工具。
+    # 没有提示词时**不加空节**：一个永远存在的空标题只会掩盖「有没有」这个事实。
+    reg = KERNEL.registry
+    prompts = (getattr(reg, "prompts", None) or []) if reg is not None else []
+    if prompts:
+        body = "\n\n".join(f"## `{p.file}`（{p.label}，{len(p.text):,} 字符）\n\n{p.text}"
+                           for p in prompts)
+        text += ("\n\n# 附随提示词（来自 function，只读 —— "
+                 "不是你的身份，也不是用户说的话）\n\n"
+                 "这几段由 function 文件自带的 `__system_prompts__` 提供，"
+                 "reload 时收进 system 末尾；与上面的「系统提示词」冲突时，"
+                 "**以「系统提示词」为准** —— 它才是你的身份，这一段只是说明书。\n\n"
+                 f"{body}")
+    return text
 
 
 def write_system_prompt(content: str) -> str:
@@ -2455,6 +2568,7 @@ def _static_audit(code: str, builtin_names: Optional[set] = None) -> Dict[str, A
         "syntax_error": "", "functions": [], "all_functions": [],
         "leaked": [], "reserved": [], "shadows": [], "dangerous": [],
         "has_main_guard": False,
+        "has_prompts": False, "prompt_chars": 0, "prompt_callable": False,
     }
     try:
         tree = ast.parse(code)
@@ -2471,14 +2585,24 @@ def _static_audit(code: str, builtin_names: Optional[set] = None) -> Dict[str, A
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             all_names.append(node.name)
-            if not node.name.startswith("_"):
+            if node.name == PROMPT_ATTR:
+                # dunder ⇒ 本来就不会进 public，但它是**会进 system** 的文本，
+                # 审计必须在落盘那一刻说一声（见 `_audit_notes`）。
+                result["has_prompts"] = True
+                result["prompt_callable"] = True
+            elif not node.name.startswith("_"):
                 public.append(node.name)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             value = node.value
             for tgt in targets:
-                if (isinstance(tgt, ast.Name) and isinstance(value, ast.Lambda)
-                        and not tgt.id.startswith("_")):
+                if not isinstance(tgt, ast.Name):
+                    continue
+                if tgt.id == PROMPT_ATTR:
+                    result["has_prompts"] = True
+                    result["prompt_chars"] = _literal_str_chars(value)
+                    continue
+                if isinstance(value, ast.Lambda) and not tgt.id.startswith("_"):
                     leaked.append(tgt.id)
     result["functions"] = public
     result["all_functions"] = all_names
@@ -2528,6 +2652,17 @@ def _audit_notes(audit: Dict[str, Any], shadows: bool = True) -> List[str]:
         warn = _public_function_warning_from_audit(audit)
         if warn:
             notes.append("⚠ " + warn)
+    if audit.get("has_prompts") and not audit.get("syntax_error"):
+        # 让人在写下它的那一刻就知道：自己改的是会进 system 的文本，不是注释。
+        how = ("零参函数（长度静态未知）" if audit.get("prompt_callable")
+               else f"{audit.get('prompt_chars') or 0} 字符")
+        notes.append(f"附随提示词：{how} → reload 后拼进 system 末尾"
+                     "（不是工具，模型调不到它；"
+                     f"单文件上限 {MAX_ATTACHED_PROMPT_CHARS} 字符）")
+        over = (audit.get("prompt_chars") or 0) - MAX_ATTACHED_PROMPT_CHARS
+        if over > 0:
+            notes.append(f"⚠ 这段比单文件上限长了 {over:,} 字符，reload 时会截断"
+                         " —— 进 system 的是较短的那一版，写长的那部分模型永远读不到")
     if audit.get("leaked"):
         notes.append("⚠ 这些公开名绑定的是 lambda：" + ", ".join(audit["leaked"])
                      + "。注册器会把它注册成工具，但工具名会变成 `<lambda>`，"
@@ -2563,6 +2698,8 @@ def _audit_notes(audit: Dict[str, Any], shadows: bool = True) -> List[str]:
 def _public_function_warning_from_audit(audit: Dict[str, Any]) -> str:
     if audit.get("syntax_error") or audit.get("functions"):
         return ""
+    if audit.get("has_prompts"):
+        return ""      # 纯提示词文件：没有工具是设计，不是失败
     names = audit.get("all_functions") or []
     hint = ("（你定义了 " + ", ".join(f"`{n}`" for n in names)
             + "，但都以下划线开头，会被当作私有函数忽略）") if names else ""
@@ -2608,6 +2745,19 @@ def main():
         print("OPENTHREE_VERIFY_JSON=" + json.dumps(rep, ensure_ascii=False))
         return
     rep["ok"] = True
+    # 附随提示词：与注册器走同一个判据。纯提示词文件「没有工具」是设计，
+    # 验收必须能说清「它带来了什么」，否则这道门对它只会说一句误导的话。
+    try:
+        from openthree.registry import PROMPT_ATTR, eval_attached_prompt
+        if getattr(mod, PROMPT_ATTR, None) is not None:
+            _text, _parts, _err = eval_attached_prompt(getattr(mod, PROMPT_ATTR))
+            rep["prompt"] = {
+                "parts": _parts, "chars": len(_text), "error": _err,
+                "first_line": ((_text.strip().splitlines() or [""])[0][:120]
+                               if _text else ""),
+            }
+    except BaseException as e:
+        rep["warnings"].append(f"无法检查 {PROMPT_ATTR}（{type(e).__name__}: {e}）")
     try:
         from openthree.tool import build_tool, is_registrable
     except BaseException as e:

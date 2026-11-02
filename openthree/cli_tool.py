@@ -13,7 +13,16 @@
     python -m openthree.tools read_file --path README.md --limit 20
     python -m openthree.tools --file .openthree/functions/safe_edit.py --list
 
+    # 看一个文件自带的附随提示词（`__system_prompts__`，可 diff、可评审）
+    python .openthree/functions/pdf_kit.py --print-prompts
+
 退出码：0 成功 / 1 函数返回 ``[错误] …`` / 2 抛异常。
+纯提示词文件（只有 `__system_prompts__`、没有工具）是正当用法：打印正文、退出 0 ——
+「没有工具」是设计，不是失败。
+`--print-prompts` 是**查询**，与「调某个工具」无关，因此在解析参数之前先认：
+文件里没写 `__system_prompts__` 时它打出零字节、退出 0（不报「未识别的参数」——
+那会把「这个文件没有那段说明」说成「这个选项不存在」）；求值失败时它退出 1 并
+把原因打到 stderr —— 与注册器同一个判据、同一个结论。
 输出编码恒为 UTF-8（Windows 控制台默认 GBK，会让外部 agent 解码失败）。
 """
 from __future__ import annotations
@@ -241,13 +250,47 @@ def _render(result: Any) -> str:
 
 
 def run_tools(tools: Dict[str, Any], argv: Optional[List[str]] = None,
-              prog: Optional[str] = None) -> int:
-    """按 tools（工具名 → Tool）跑一次命令行调用。"""
+              prog: Optional[str] = None,
+              prompts: Optional[List[str]] = None,
+              prompt_error: str = "") -> int:
+    """按 tools（工具名 → Tool）跑一次命令行调用。
+
+    ``prompts`` 是这个文件自带的附随提示词正文（`__system_prompts__` 规整后的
+    结果），``prompt_error`` 是它求值失败时的原因。两者让「纯提示词文件」也是
+    一条正当的命令行程序：没有工具、只有说明，打印出来、退出 0 —— 没有工具是
+    设计，不是失败。
+
+    ``--print-prompts`` 显式要求「只打提示词」：人与模型因此看到**同一份东西**，
+    可 diff、可评审。它不是 argparse 选项，而是在解析参数之前先认的独立动作 ——
+    「看提示词」与「调某个工具」无关，不该被工具的参数校验拦住。
+
+    **这个动作永远回答**：有没有提示词都退出 0（没有就一个字节都不打）。
+    否则文件里没写 `__system_prompts__` 时，同一个选项会变成「未识别的参数」
+    —— 那是在说「这个选项不存在」，而事实是「这个文件没有那段说明」。
+    """
     force_utf8()
     if argv is None:
         argv = sys.argv[1:]
+    prompt_texts = list(prompts or [])
+
+    if "--print-prompts" in argv:
+        if prompt_error:
+            # 与注册器同一份判据、同样的结论：写坏了就说出来，不静默当作「没有」。
+            print(f"[错误] {prompt_error}", file=sys.stderr)
+            return 1
+        if prompt_texts:          # 没有时不打空行：零字节就是零字节
+            print("\n\n".join(prompt_texts))
+        return 0
 
     if not tools:
+        if prompt_texts:
+            if "-h" in argv or "--help" in argv:
+                # `--help` 问的是「这个程序怎么用」，不是「我的正文是什么」。
+                print("（这个文件只有附随提示词，没有工具）\n"
+                      "不带参数运行打印正文；--print-prompts 同上。")
+                return 0
+            print("\n\n".join(prompt_texts))
+            return 0
         print("[错误] 这个文件里没有可注册的公开函数"
               "（公开函数 = 不以 `_` 开头的顶层 def）", file=sys.stderr)
         return 1
@@ -346,6 +389,29 @@ def run_tools(tools: Dict[str, Any], argv: Optional[List[str]] = None,
     return 1 if is_err else 0
 
 
+def _prompts_from_globals(funcs: Dict[str, Any]) -> Tuple[List[str], str]:
+    """从模块 globals 里取 `__system_prompts__` 的正文，返回 ``(正文, 错误)``。
+
+    规整走 `registry.eval_attached_prompt` —— 与注册器**同一份判据**。这里若
+    自己再判断一次类型，CLI 与 system 里那一段就会慢慢发散（工具判据当初正是
+    因为各写一套才收敛到 `tool.is_registrable` 的）。
+
+    错误**不吞**：写坏了的提示词在 CLI 里必须与注册器口径一致地说出来。
+    吞掉它，纯提示词文件就会得到「这个文件里没有可注册的公开函数」—— 一句
+    把症状说成另一个病的诊断。
+    """
+    from .registry import PROMPT_ATTR, eval_attached_prompt
+
+    if PROMPT_ATTR not in funcs:
+        return [], ""
+    text, _parts, error = eval_attached_prompt(funcs[PROMPT_ATTR])
+    if error:
+        return [], error
+    return ([text] if text else []), ""
+
+
 def run_cli(funcs: Dict[str, Any], argv: Optional[List[str]] = None) -> int:
     """给 function 文件的尾钩用：把本模块的公开函数变成一个命令行程序。"""
-    return run_tools(_build_from_globals(funcs), argv=argv)
+    prompts, prompt_error = _prompts_from_globals(funcs)
+    return run_tools(_build_from_globals(funcs), argv=argv,
+                     prompts=prompts, prompt_error=prompt_error)

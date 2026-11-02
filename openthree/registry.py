@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 import traceback
@@ -31,6 +32,58 @@ from .workspace import (DIRNAME, USER_FUNCTION_DISTANCE, Workspace, canon_path,
 
 _MODULE_PREFIX = "openthree_user_functions"
 _BUILTIN_DISTANCE = 10 ** 9
+
+# `__system_prompts__` —— function 文件自带的说明。它进 system，**不是工具**。
+# dunder 命名让它天然落在 `is_registrable` 的第一档（协议名，永不注册），
+# 与 `__main__` 同属「这个文件与内核之间的约定」。
+PROMPT_ATTR = "__system_prompts__"
+
+# 附随提示词是**唯一能零成本污染 system 的入口**：一个 50 KB 的提示词足以把
+# 工具 schema 挤到模型看不见的地方，而它看起来只是「某个文件写得啰嗦」。
+MAX_ATTACHED_PROMPT_CHARS = 4000    # 单文件
+MAX_ATTACHED_PROMPT_TOTAL = 12000   # 全部文件合计
+
+
+def eval_attached_prompt(raw: Any) -> Tuple[str, int, str]:
+    """把 `__system_prompts__` 的取值规整成 ``(正文, 段数, 错误)``。
+
+    **唯一判据**：注册器收集与命令行 `--print-prompts` 都走这一份。工具判据
+    （`tool.is_registrable`）曾有过「注册器与审计各写一套」的教训，这里不重演 ——
+    否则「模型被喂进的附随说明」与「人在 CLI 里看到的那份」会慢慢发散。
+
+    接受的三种形态：``str`` / ``list[str]``（tuple 同义）/ 零参可调用。其余一律报错
+    而不是猜一个意思：附随提示词直接进 system，**静默丢弃比报错危险得多**。
+
+    只允许零参：附随提示词是**能力的说明书**，它不需要知道「此刻在干什么」。
+    想按情境给指导，那本来就该是一个返回文字的 function，由模型自己判断要不要读。
+
+    Args:
+        raw: 模块属性 `__system_prompts__` 取到的对象
+
+    Returns:
+        ``(正文, 段数, 错误)``；错误为空串表示成功，正文为空串表示「没有内容」。
+    """
+    if callable(raw):
+        try:
+            raw = raw()
+        except Exception as exc:  # noqa: BLE001 - 用户代码，什么样的异常都可能有
+            return "", 0, f"{PROMPT_ATTR}() 求值失败：{type(exc).__name__}: {exc}"
+    if isinstance(raw, str):
+        pieces: List[Any] = [raw]
+    elif isinstance(raw, (list, tuple)):
+        pieces = list(raw)
+        for i, piece in enumerate(pieces):
+            if not isinstance(piece, str):
+                return "", 0, (f"{PROMPT_ATTR} 第 {i} 段是 {type(piece).__name__}，"
+                               "只接受 str / list[str] / 零参函数")
+    else:
+        return "", 0, (f"{PROMPT_ATTR} 是 {type(raw).__name__}，"
+                       "只接受 str / list[str] / 零参函数")
+    texts = [p.strip() for p in pieces]
+    texts = [p for p in texts if p]
+    if not texts:
+        return "", 0, ""
+    return "\n\n".join(texts), len(texts), ""
 
 
 def _in_function_dir(path: str) -> bool:
@@ -82,6 +135,26 @@ class LoadPlanItem:
 
 
 @dataclass
+class AttachedPrompt:
+    """一个 function 文件自带的说明 —— 它进 system，**但不是工具**。
+
+    `text` 是**实际进 system 的那份**（可能已截断），`sha256` 也按它算：
+    内容寻址落盘（`logs/attached-prompts/<sha8>.md`）因此能直接回答
+    「此刻 system 里那一段究竟是哪一版」。
+
+    它不参与 `digest()` / 工具清单：模型不能调用它，它的位置是「说明」。
+    """
+
+    file: str
+    text: str
+    label: str        # 给人看的来源：project / profile:~/prof/base / registered
+    distance: int     # 越小越近；顺序与总量上限都按这一根轴
+    sha256: str
+    parts: int = 1    # 由几段拼成（list 形态 / 多个 str）
+    original_chars: int = 0   # 截断前的长度；未截断时等于 len(text)
+
+
+@dataclass
 class Registry:
     """工具名 → Tool。"""
 
@@ -91,6 +164,10 @@ class Registry:
     overrides: List[Override] = field(default_factory=list)
     loaded_files: List[str] = field(default_factory=list)
     builtins: Dict[str, Tool] = field(default_factory=dict)
+    # 附随提示词（`__system_prompts__`）与它的失败记录。两者都**不是工具**：
+    # 它们进 system，不影响 `names()` / `schemas()` / `digest()`。
+    prompts: List[AttachedPrompt] = field(default_factory=list)
+    prompt_errors: List[LoadError] = field(default_factory=list)
     missing_registered: List[str] = field(default_factory=list)
     changed_registered: List[Dict[str, str]] = field(default_factory=list)
     # 本次 reload 已经清过 pyc 的目录 —— 每个目录只清一次，别对同一处反复删。
@@ -121,10 +198,13 @@ class Registry:
         self.load_errors = []
         self.overrides = []
         self.loaded_files = []
+        self.prompts = []
+        self.prompt_errors = []
         self.missing_registered = []
         self.changed_registered = []
         for item in self.load_plan():
             self._load_file(item)
+        self._finalize_prompts()
         return self
 
     def load_plan(self) -> List[LoadPlanItem]:
@@ -351,11 +431,108 @@ class Registry:
             self.tools[t.name] = t
             count += 1
 
+        has_prompt = self._collect_prompt(module, item)
         self.loaded_files.append(str(path))
-        if count == 0:
+        if count == 0 and not has_prompt:
+            # 纯提示词文件（只带 `__system_prompts__`、没有工具）是正当用法：
+            # 把一段独立规范写成 py 文件，随 profile 一起走。它不该被当成坏文件。
             self.load_errors.append(
                 LoadError(file=str(path), error="文件中没有可注册的公开函数")
             )
+
+    def _collect_prompt(self, module: Any, item: LoadPlanItem) -> bool:
+        """收一个文件自带的说明；返回「这个文件有没有非空附随提示词」。
+
+        没有 `__system_prompts__` 时**立刻返回**：不读盘、不求值、不改任何状态 ——
+        这就是「不写就是零」在代码里的落点（`prompt.build_attached_block` 拿到空
+        列表时也只返回空串，一个字节都不拼）。
+
+        失败隔离：求值抛异常 / 返回非 str 只记进 `prompt_errors`，该文件的工具
+        照常注册（注册循环在调用本方法之前就跑完了）—— 一份说明写坏了，不该
+        连带它自己的工具一起消失。
+        """
+        raw = getattr(module, PROMPT_ATTR, None)
+        if raw is None:
+            return False
+        text, parts, error = eval_attached_prompt(raw)
+        if error:
+            self.prompt_errors.append(LoadError(file=str(item.path), error=error))
+            return False
+        if not text:
+            return False                    # 空串：不占位、不多字节
+        original = len(text)
+        if original > MAX_ATTACHED_PROMPT_CHARS:
+            notice = f"\n\n（已截断，原文 {original} 字符）"
+            keep = max(0, MAX_ATTACHED_PROMPT_CHARS - len(notice))
+            # 上限包含那句截断说明：否则 `text` 会超出常量，而审计提示里写着
+            # 「单文件上限 4000 字符」—— 两个数必须说的是同一件事。
+            text = text[:keep].rstrip() + notice
+        self.prompts.append(AttachedPrompt(
+            file=str(item.path), text=text, label=item.label,
+            distance=item.distance,
+            sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            parts=parts, original_chars=original,
+        ))
+        return True
+
+    def _finalize_prompts(self) -> None:
+        """排序 + 总量裁剪 + 落盘 —— `reload()` 的最后一步。
+
+        排序按 `distance` 升序（project 先、profile 次之、user 最后）：近的先读，
+        与「同名工具近者生效」是同一根轴，不新造判据。
+
+        总量上限按同一根轴**保留近的**，被挤掉的记进 `prompt_errors` ——
+        静默丢弃会让「我写的提示词怎么没生效」变成一次考古。
+        """
+        self.prompts.sort(key=lambda p: p.distance)
+        kept: List[AttachedPrompt] = []
+        total = 0
+        for p in self.prompts:
+            if total + len(p.text) > MAX_ATTACHED_PROMPT_TOTAL:
+                self.prompt_errors.append(LoadError(
+                    file=p.file,
+                    error=(f"附随提示词超出总量上限 {MAX_ATTACHED_PROMPT_TOTAL} 字符，"
+                           "已丢弃（近者优先；删短别的提示词或缩短本段）")))
+                continue
+            kept.append(p)
+            total += len(p.text)
+        self.prompts = kept
+        self._persist_prompts()
+
+    def _persist_prompts(self) -> None:
+        """按内容寻址留一份**能读回来**的痕迹：`logs/attached-prompts/<sha8>.md`。
+
+        为什么必须有：`.openthree/` 被 `.gitignore` 整目录排除，模型自造的 function
+        没有 git 历史；recorder 事件里只留 sha256 也还原不出内容。于是「模型改了
+        自己的 system」会变成一件它自己看不见的事 —— 与「一」的
+        `snapshot_system_prompt` 是同一个承诺：**能改，也能看见自己改过什么**。
+
+        append-only 且天然去重（同一段文字反复 reload 只落一次）。写不进去
+        （只读工作区 / 权限）就安静跳过：落盘是审计手段，不该让加载失败。
+        """
+        if not self.prompts:
+            return
+        out_dir = self.workspace.logs_dir / "attached-prompts"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:  # pragma: no cover - 只读工作区 / 权限
+            return
+        for p in self.prompts:
+            path = out_dir / f"{p.sha256[:8]}.md"
+            data = p.text.encode("utf-8")
+            # 写**字节**，不写文本：Windows 上 `write_text` 会把 `\n` 改写成
+            # `\r\n`，于是文件的 sha256 与它的文件名对不上 —— 「内容寻址」就成了
+            # 假的（读回来的是另一份字节）。按字节写，文件名才真的等于内容。
+            if path.exists():
+                try:
+                    if path.read_bytes() == data:
+                        continue
+                except OSError:  # pragma: no cover - 权限 / 竞争
+                    continue
+            try:
+                path.write_bytes(data)
+            except OSError:  # pragma: no cover - 权限 / 竞争
+                continue
 
     def _note_conflict(self, prev: Tool, t: Tool, item: LoadPlanItem) -> None:
         """同名时的两种情况：距离能解释的 → overrides；解释不了的 → load_errors。
