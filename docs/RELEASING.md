@@ -10,12 +10,12 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.3.0`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.3.0`，**已发布**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.4.0`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.4.0`，**已发布**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
-| 元数据 | `twine check` ✓ 两个 PASSED（0.3.0 产物） |
+| 元数据 | `twine check` ✓ 两个 PASSED（0.4.0 产物） |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄）；`recursive-include docs *.md` 按**磁盘**收集而非 git，未跟踪的废案靠 `MANIFEST.in` 里显式 `exclude` 挡住 |
-| 测试 | 558 passed（仓库根，0.3.0 实跑） |
+| 测试 | 582 passed（仓库根，0.4.0 实跑） |
 | 依赖 | `openai>=1.0`、`PyYAML>=6.0`、`json_repair>=0.30`（频道层只用标准库，未新增依赖） |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
@@ -429,6 +429,50 @@ project(0) 与 profile(1..N) 按 distance 裁决，祖先目录的自动加载�
 - 双向核验：下表 0.3.0 两行与本地 `dist/` **全串一致**；`/pypi/openthree/json` 的
   `info.version` 从 `0.2.0` 翻到 `0.3.0`（CDN 缓存约需数十秒）✓
 
+### 0.4.0 实跑记录（2026-11-02）
+
+本版内容：**function 文件可附随系统提示词** —— 一个 function 文件除了公开函数，
+还可以用 `__system_prompts__`（`str` / `list[str]` / 零参可调用三种形态）附随一段说明；
+它在 `reload` 时求值一次，拼进 system 的**最后一段**。**只在写了这个符号时生效**：
+不写它，system 与 0.3.0 逐字节相同（没有开关、没有配置项，代码路径根本不进）。
+详见 `docs/function-system-prompts-proposal.md` 与 `docs/function-system-prompts-self-review.md`。
+
+- `pyproject.toml` / `openthree/__init__.py` 版本号一致（`0.4.0`）✓
+- 全量 pytest → **582 passed / 0 failed**（新增 `tests/test_attached_prompts.py` 13 条、
+  `tests/test_prompt_only_file.py` 5 条）✓
+- `python -m build` → wheel 262,992 B + sdist 501,009 B（先清空 `dist/` 与 egg-info）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist 内容核验：93 个文件，与 `git ls-files` 比对**未跟踪 0 项**；废案
+  `docs/memory-chroma-proposal.md` 未混入（由 `MANIFEST.in` 显式 `exclude` 挡住）✓
+- sdist 安全核验：**无 `.openthree/`、无 `config.yaml`、无 `api_key` / `identity.json` /
+  `limits.json`**（按路径逐条筛，违规 0 项）✓
+- `twine upload --non-interactive` 一次成功 →
+  <https://pypi.org/project/openthree/0.4.0/> ✓
+- 双向核验：下表 0.4.0 两行与本地 `dist/` **全串一致**；`/pypi/openthree/json` 的
+  `info.version` 从 `0.3.0` 翻到 `0.4.0`，两个文件 `yanked` 均为 `False` ✓
+
+**线上产物端到端探针**（全新 venv `_live/venv040`，从中性 cwd 跑，`__file__` 指向
+site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任何公开函数的 `kb.py` 后，
+`Registry.reload()` 收集到 1 条附随提示词，system 增量 274 字符且原文出现在末尾
+（此前缀逐字节不变）；`logs/attached-prompts/<sha8>.md` 的文件名等于内容 sha256 的前 8 位、
+内容可原样读回；再 reload 不新增文件；删掉该文件后 system **逐字节**退回基线；
+该文件**没有**被注册成工具 ✓
+
+**本次实跑踩到的三处环境坑**（供下次发布绕开）：
+
+1. `set PYTHONUTF8=1 && …` 在 cmd 里会把 `&&` 前的空格算进值，Python 直接
+   `invalid PYTHONUTF8 environment variable value` —— 必须写成 `set "PYTHONUTF8=1"`。
+2. 在仓库根用 `python -c "import openthree"` 检查 venv 是**假的**：`sys.path` 含当前目录，
+   会 import 到源码、报出源码的版本与路径。核验安装版必须换到中性 cwd，或直接断言
+   `openthree.__file__` 里有 `site-packages`。
+3. 从 pypi.org 直装依赖在本机 600s 超时（openai / pydantic / httpx2 等一长串）。
+   本版改为**只从 PyPI 取 openthree 本体**（下载件 sha256 与本地逐字节一致，已核），
+   依赖走镜像 —— 「线上产物可用」这条结论仍由 openthree 本体本身承担。
+
+> 线上 sdist 内附的本文是**上传前**的快照，其「现状速览」与本段仍写着「待上传」——
+> 构建早于上传的必然结果，`0.4.0` 不可覆盖，故不回填，以仓库内本文为准。
+
+
 ### 上传后核对（按版本）
 
 sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/json` 的
@@ -443,6 +487,8 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.2.0 | `openthree-0.2.0.tar.gz` | 416,365 | `722aaa783ab159252e62d806fe4a79cd197941226f89c27f185d44eb607b29d8` |
 | 0.3.0 | `openthree-0.3.0-py3-none-any.whl` | 252,984 | `2687e36edc765364df1188c8b3447b9f0088383243b8eb0185dc1705e4072510` |
 | 0.3.0 | `openthree-0.3.0.tar.gz` | 462,404 | `f5f108538c73dcec44ab99467126c06c03566e7b50bd89047e16e201ce4e504c` |
+| 0.4.0 | `openthree-0.4.0-py3-none-any.whl` | 262,992 | `eeb0d778d337e561c3e48d3ce6a956f18007bc4904c9c987a0242c35b19d67cb` |
+| 0.4.0 | `openthree-0.4.0.tar.gz` | 501,009 | `73509dbec6bdbc67200ab2ff15f9327d12ffc63c13d0bcb7a6da469fd7d53401` |
 
 
 
