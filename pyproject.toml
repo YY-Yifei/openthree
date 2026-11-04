@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openthree"
-version = "0.4.0"
+version = "0.5.0"
 description = "极简 LLM Agent Harness：agent 天然自我演化（命名、长工具、改提示词）"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,7 +32,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "openai>=1.0",
     "PyYAML>=6.0",
     # 模型返回非法 JSON 参数时用于修复；生产环境也需要，故列入主依赖
     "json_repair>=0.30",

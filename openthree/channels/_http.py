@@ -1,7 +1,8 @@
 """极简 HTTP/JSON 客户端（只用标准库）。
 
 为什么不用 requests / httpx：频道层要在**任何**装了 openthree 的环境里都能跑，
-而 openthree 的主依赖只有 openai / PyYAML / json_repair。urllib 够用 —— 频道
+而 openthree 的主依赖只有 PyYAML / json_repair（LLM 层同样用标准库自己发请求，
+见 llm.py 的 post_chat）。urllib 够用 —— 频道
 要的无非是「发个 JSON、读回 JSON」，以及「带 45 秒超时的长轮询」。
 
 失败一律抛 `HttpError`（带上状态码与服务端返回的前 300 字），因为渠道 API 的

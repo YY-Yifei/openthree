@@ -10,13 +10,13 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.4.0`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.4.0`，**已发布**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.4.0`，本次发布 `0.5.0`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.5.0`，**本轮发布**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
-| 元数据 | `twine check` ✓ 两个 PASSED（0.4.0 产物） |
+| 元数据 | `twine check` ✓ 两个 PASSED（0.5.0 产物） |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄）；`recursive-include docs *.md` 按**磁盘**收集而非 git，未跟踪的废案靠 `MANIFEST.in` 里显式 `exclude` 挡住 |
-| 测试 | 582 passed（仓库根，0.4.0 实跑） |
-| 依赖 | `openai>=1.0`、`PyYAML>=6.0`、`json_repair>=0.30`（频道层只用标准库，未新增依赖） |
+| 测试 | 593 passed（仓库根，0.5.0 实跑） |
+| 依赖 | `PyYAML>=6.0`、`json_repair>=0.30` —— **`openai` 已移除**：LLM 传输由 `openthree/llm.py` 用标准库 `http.client` 实现，于是 `pydantic` / `pydantic-core`（Rust）/ `httpx` / `anyio` 都不再进入依赖树；频道层同样只用标准库 |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
 > 所以务必先走 TestPyPI 演练一遍。
@@ -141,7 +141,7 @@ pip install -i https://test.pypi.org/simple/ \
 openthree --inspect     # 应打印工作区/工具/上下文信息，无异常
 ```
 
-> `--extra-index-url` 指向正式 PyPI 是为了让 `openai`/`PyYAML` 等依赖能从正式源装到
+> `--extra-index-url` 指向正式 PyPI 是为了让 `PyYAML`/`json_repair` 等依赖能从正式源装到
 > （TestPyPI 上不一定有）。
 
 ---
@@ -323,7 +323,7 @@ PyPI 上的版本不能删除，只能 *yank*（标记为“不建议使用”�
 - 全新 venv 装 **sdist**（走 PEP 517 重新构建）→ 成功
 - 解包 sdist 后在其内跑 `pytest` → **309 passed**
 - sdist 清单 **62 项**：含 `tests/conftest.py`、`self_test.py`、`docs/`、`scripts/`；**不含任何 `.openthree/`，也扫不到 `api_key` / `sk-` 形迹**
-- 依赖安装需联网（`openai`/`PyYAML`/`json_repair`）；断网时会失败，与包本身无关
+- 依赖安装需联网（`PyYAML`/`json_repair`）；断网时会失败，与包本身无关
 
 ### 0.1.3 实跑补充（2026-10-15）
 
@@ -472,6 +472,51 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
 > 线上 sdist 内附的本文是**上传前**的快照，其「现状速览」与本段仍写着「待上传」——
 > 构建早于上传的必然结果，`0.4.0` 不可覆盖，故不回填，以仓库内本文为准。
 
+
+### 0.5.0 实跑记录（2026-11-04）
+
+本版内容：**LLM 传输层自实现，摘掉 `openai` SDK** —— 依赖树里的
+`openai → pydantic → pydantic-core` 整条移除（`pydantic-core` 是 Rust 扩展，
+没有 iOS / a-Shell 可用的轮子，而 iOS 上没有可用的 Rust 编译链），
+主依赖只剩 `PyYAML` 与 `json_repair`。
+
+- `openthree/llm.py` 新增 `post_chat()`：用标准库 `http.client` 发一次
+  `/chat/completions`。选它而不是 `urllib` 是为了保住**超时分离** ——
+  先按 `connect_timeout`（5s）建连，连上后把 socket 超时换成 `timeout`（600s），
+  于是「主机连不上」秒失败、「模型想得久」仍能等满。
+- 新增 `TransportError(status=…)`：非 2xx 带状态码与正文；`_error_brief()`
+  从 `error.message` 取出 provider 的原话（只看状态码无法排查）。
+- `_retryable()` 改为**按状态码裁决**：408/409/429/5xx 与 `status=0`
+  （DNS/连接/超时，根本没走到 HTTP）重试；其它 4xx 立刻返回 ——
+  重试一个鉴权失败只是把同一个错误再发一遍。
+- **代理**（`_proxy_for()`）：旧实现底层是 httpx，`trust_env=True`，会读
+  `HTTP_PROXY` / `HTTPS_PROXY` / `no_proxy`；`http.client` 完全不读。不补这一步，
+  企业网 / 代理环境会从「能连」变成「连不上」而看不出原因。现在 HTTPS 目标走
+  CONNECT 隧道、HTTP 目标走绝对 URI，`no_proxy` 照旧生效，且代理下超时分离同样成立。
+- 删掉 `_ensure_client()`、`model_dump()` 分支与 `max_retries` 字段。最后那个只为
+  钉住 SDK 自身的重试层级而存在；没有 SDK 就没有第二层，留着只是多一条要维护的路径。
+- 测试数 582 → **593**：新增真本地 HTTP 服务端端到端往返；401 不重试 / 429 重试；
+  400 正文带 "timeout" 字样也不重试；代理解析、`no_proxy`、CONNECT 隧道的白盒断言。
+  设计取舍与自评审见 `docs/llm-transport-self-review.md`。
+
+验收（仓库根实跑）：
+
+- `pyproject.toml` / `openthree/__init__.py:__version__` / `import openthree` 三处均为 `0.5.0` ✓
+- 全量 pytest → **593 passed / 0 failed**（86.78s）✓
+- `python -m build` → `openthree-0.5.0-py3-none-any.whl` + `.tar.gz`（先清空
+  `dist/` 与 `openthree.egg-info`；体积见文末「上传后核对」表）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist 94 项：**无** `.openthree/`、`config.yaml`、`api_key`、`identity.json`、
+  `limits.json`、`memory.jsonl`；与 `git ls-files` 比对**未跟踪 0 项** ✓
+- sdist 的 `PKG-INFO` 里 `Requires-Dist` 只剩 `PyYAML>=6.0`、`json_repair>=0.30`
+  与 dev extra 的 `pytest>=7`，**无 `openai` / `pydantic` / `httpx`** ✓
+- 干净 venv（只装 `PyYAML` + `json_repair` + openthree）里用真实 `LLM.chat()`
+  打到本地 mock 端点：tool_calls / `reasoning_content` 回传 / usage / `Bearer` 头
+  全部正确，且 `sys.modules` 中**无** `openai` / `httpx` / `pydantic` ✓
+
+**升级提示**：本版不改变对外行为与配置项 —— 只把 LLM 传输从 SDK 换成标准库。
+唯一可见差异是失去 httpx 的连接复用，每次 `chat()` 多一次 TCP(+TLS) 握手
+（本机 ~10ms，移动网络 ~100–300ms），相对模型生成时间可忽略。
 
 ### 上传后核对（按版本）
 

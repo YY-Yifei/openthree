@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 
+import openthree.llm as llm_mod
 from openthree.agent import _estimate_chars
 from openthree.llm import (REASONING_FIELDS, REASONING_PLACEHOLDER_FIELD, LLM,
                            LLMConfig, _clean_effort, _redact, extract_reasoning,
@@ -31,37 +32,33 @@ from openthree.llm import (REASONING_FIELDS, REASONING_PLACEHOLDER_FIELD, LLM,
                            resolve_reasoning_placeholder)
 
 
-class _Resp:
-    def __init__(self, message=None, finish_reason="stop"):
-        self._message = message or {"role": "assistant", "content": "ok"}
-        self._fr = finish_reason
-
-    def model_dump(self):
-        return {
-            "choices": [{"message": self._message, "finish_reason": self._fr}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-        }
+def _resp(message=None, finish_reason="stop") -> dict:
+    """一份最小可用的 chat/completion 响应（transport 直接交回 dict）。"""
+    return {
+        "choices": [{"message": message or {"role": "assistant", "content": "ok"},
+                     "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
 
 
-def _llm_with(client, **cfg) -> LLM:
-    llm = LLM(LLMConfig(api_key="k", base_url="u", retries=0, **cfg))
-    llm._client = client
-    return llm
+def _llm_with(**cfg) -> LLM:
+    return LLM(LLMConfig(api_key="k", base_url="http://test/v1", retries=0, **cfg))
 
 
-def _capturing_client(resp=None):
-    """假 client：把每次 create 收到的 payload 记下来，供断言『真的发出去了什么』。"""
+def _capture(monkeypatch, resp=None) -> dict:
+    """假 transport：把每次要发出去的 payload 记下来。
+
+    断言落在**请求体**上（而不是 history 上）—— 要防的故障是「第二步 400」，
+    所以必须看得见真的发出去的是什么。
+    """
     state = {"payloads": []}
 
-    class Completions:
-        def create(self, **payload):
-            state["payloads"].append(payload)
-            return resp or _Resp()
+    def fake_post_chat(base_url, api_key, payload, **kwargs):
+        state["payloads"].append(payload)
+        return resp or _resp()
 
-    class Client:
-        chat = type("C", (), {"completions": Completions()})()
-
-    return Client(), state
+    monkeypatch.setattr(llm_mod, "post_chat", fake_post_chat)
+    return state
 
 
 # ---------------------------------------------------------------- 归一化
@@ -77,43 +74,43 @@ def test_clean_effort_normalizes_and_treats_blank_as_unset():
 
 
 # ---------------------------------------------------------------- 发出去的请求体
-def test_chat_sends_per_call_reasoning_effort():
-    client, state = _capturing_client()
-    _llm_with(client).chat([{"role": "user", "content": "hi"}], reasoning_effort="low")
+def test_chat_sends_per_call_reasoning_effort(monkeypatch):
+    state = _capture(monkeypatch)
+    _llm_with().chat([{"role": "user", "content": "hi"}], reasoning_effort="low")
     assert state["payloads"][0]["reasoning_effort"] == "low"
 
 
-def test_chat_omits_key_when_nothing_set():
+def test_chat_omits_key_when_nothing_set(monkeypatch):
     """没设置就不发这个键 —— 发 null 会被严格校验的 provider 400。"""
-    client, state = _capturing_client()
-    _llm_with(client).chat([{"role": "user", "content": "hi"}])
+    state = _capture(monkeypatch)
+    _llm_with().chat([{"role": "user", "content": "hi"}])
     assert "reasoning_effort" not in state["payloads"][0]
 
 
-def test_config_field_used_when_call_does_not_override():
-    client, state = _capturing_client()
-    _llm_with(client, reasoning_effort="medium").chat([{"role": "user", "content": "hi"}])
+def test_config_field_used_when_call_does_not_override(monkeypatch):
+    state = _capture(monkeypatch)
+    _llm_with(reasoning_effort="medium").chat([{"role": "user", "content": "hi"}])
     assert state["payloads"][0]["reasoning_effort"] == "medium"
 
 
-def test_explicit_call_wins_over_config_field():
-    client, state = _capturing_client()
-    _llm_with(client, reasoning_effort="medium").chat(
+def test_explicit_call_wins_over_config_field(monkeypatch):
+    state = _capture(monkeypatch)
+    _llm_with(reasoning_effort="medium").chat(
         [{"role": "user", "content": "hi"}], reasoning_effort="high")
     assert state["payloads"][0]["reasoning_effort"] == "high"
 
 
-def test_explicit_call_wins_over_config_extra():
+def test_explicit_call_wins_over_config_extra(monkeypatch):
     """extra 是透传口，显式参数必须压过它 —— 否则命令行给的值被配置文件吃掉。"""
-    client, state = _capturing_client()
-    _llm_with(client, extra={"reasoning_effort": "minimal"}).chat(
+    state = _capture(monkeypatch)
+    _llm_with(extra={"reasoning_effort": "minimal"}).chat(
         [{"role": "user", "content": "hi"}], reasoning_effort="low")
     assert state["payloads"][0]["reasoning_effort"] == "low"
 
 
-def test_extra_still_works_when_no_field_set():
-    client, state = _capturing_client()
-    _llm_with(client, extra={"reasoning_effort": "minimal"}).chat(
+def test_extra_still_works_when_no_field_set(monkeypatch):
+    state = _capture(monkeypatch)
+    _llm_with(extra={"reasoning_effort": "minimal"}).chat(
         [{"role": "user", "content": "hi"}])
     assert state["payloads"][0]["reasoning_effort"] == "minimal"
 

@@ -1,7 +1,12 @@
 """LLM 客户端：极薄的一层。
 
-不引入框架。openai SDK 已是事实标准，也兼容一切 OpenAI 协议的服务
-（DeepSeek / GLM / Kimi / vLLM / Ollama / ...）。
+不引入框架，也不引入第三方 SDK：OpenAI 协议的一次调用无非「POST 一个 JSON、
+读回一个 JSON」，由本文件的 `post_chat()` 用标准库完成，于是遵循该协议的一切
+服务（DeepSeek / GLM / Kimi / vLLM / Ollama / ...）都能直接接。
+
+不依赖 openai SDK 是有代价换来的：SDK 会把 pydantic 拖进来，而 pydantic 的
+`pydantic-core` 是 Rust 扩展 —— 在没有编译器的环境（iOS 的 a-Shell 等）里装不上。
+而这个客户端需要的全部能力就是一次 POST，没必要为此付出那个代价。
 
 配置分层（后者覆盖前者）：
     1. 环境变量                OPENAI_API_KEY / OPENAI_BASE_URL / OPENTHREE_MODEL
@@ -12,10 +17,17 @@
 """
 from __future__ import annotations
 
+import base64
+import gzip
+import http.client
+import json
 import os
 import random
 import re
+import ssl
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -60,13 +72,11 @@ class LLMConfig:
     timeout: float = 600.0
     # connect 阶段单独设一个短超时：read=600s 是合理的（等模型生成），
     # 但「连不上主机」跟「模型想得久」是两回事——不分开就会把 connect 也
-    # 抬到 600s，一次重试要干等 10 分钟。见 LLM._ensure_client。
+    # 抬到 600s，一次重试要干等 10 分钟。见 post_chat()。
     connect_timeout: float = 5.0
+    # 重试只在 openthree 这一层发生（本文件就是全部传输层，下面没有别的东西
+    # 会偷偷再重试一次），所以它给出的是全量：retries=3 ⇒ 最多 4 次真实 HTTP 调用。
     retries: int = 3
-    # openai SDK 自带的传输层重试。默认 0：重试只在 openthree 这一层发生，
-    # 次数才可预期（retries=3 就是最多 4 次调用）。若交给 SDK 兜底，
-    # 两层会相乘：真实 HTTP 次数 = (retries+1) × (sdk_max_retries+1)。
-    max_retries: int = 0
     extra: Dict[str, Any] = field(default_factory=dict)
     source: str = "env"
 
@@ -297,10 +307,212 @@ def load_config(project_dir: Optional[Path] = None, model_override: Optional[str
         timeout=float(merged.get("timeout", 600) or 600),
         connect_timeout=float(merged.get("connect_timeout", 5) or 5),
         retries=int(merged.get("retries", 3) or 0),
-        max_retries=int(merged.get("max_retries", 0) or 0),
         extra=dict(merged.get("extra") or {}),
     )
     return cfg
+
+
+# ------------------------------------------------------------------ 传输层
+# OpenAI 协议的一次调用 = POST 一个 JSON、读回一个 JSON。这里用标准库自己发，
+# 只提两个要求：connect 与 read 的超时要能分开，且失败时要带得出状态码
+# —— 上层 `_retryable()` 靠它区分「抖动，重试」与「4xx，别浪费次数」。
+USER_AGENT = "openthree/1.0 (+https://github.com/YY-Yifei/openthree)"
+_CHAT_PATH = "/chat/completions"
+
+# 可选：OpenSSL 找不到系统 CA 证书时（iOS / 精简容器里很常见）借 certifi 那份。
+# 它是纯 Python 包、不需要编译，所以只做「装了就用」，不列为主依赖。
+try:  # pragma: no cover - 取决于环境里有没有 certifi
+    import certifi as _certifi
+
+    _CA_FILE: Optional[str] = _certifi.where()
+except Exception:  # noqa: BLE001
+    _CA_FILE = None
+
+
+# 建好的 SSL 上下文缓存。SSLContext 一旦创建就可以安全地被多处复用来建连接，
+# 而 `create_default_context()` 每次都要读一遍整份 CA bundle —— 一次重试就要重复
+# 几次，在手机上尤其不值。
+_SSL_CONTEXT: Optional["ssl.SSLContext"] = None
+
+
+def _ssl_context() -> "ssl.SSLContext":
+    """带 CA 的 SSL 上下文：优先 certifi（iOS 常见），退回系统默认。"""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
+    ctx = None
+    if _CA_FILE:
+        try:
+            ctx = ssl.create_default_context(cafile=_CA_FILE)
+        except Exception:  # noqa: BLE001  # pragma: no cover
+            ctx = None
+    _SSL_CONTEXT = ctx or ssl.create_default_context()
+    return _SSL_CONTEXT
+
+
+class TransportError(RuntimeError):
+    """一次 HTTP 调用失败。
+
+    `status` = 0 表示**根本没走到 HTTP**（DNS / 连接 / 超时），这类失败值得重试；
+    非 0 就是服务端真回了那个状态码，4xx 是调用方的问题，重试只是把它重复一遍。
+    """
+
+    def __init__(self, message: str, *, status: int = 0, body: str = "") -> None:
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
+
+def _body_text(raw: bytes, encoding: str) -> str:
+    """按 content-encoding 解压正文（只处理 gzip；解不开就按原样读）。"""
+    if encoding == "gzip" and raw:
+        try:
+            raw = gzip.decompress(raw)
+        except OSError:
+            pass
+    return raw.decode("utf-8", "replace")
+
+
+def _error_brief(text: str) -> str:
+    """把错误正文压成一句：优先 OpenAI 风格的 error.message，否则截前 300 字。"""
+    fallback = text.strip()[:300] or "(空响应)"
+    try:
+        doc = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return fallback
+    if not isinstance(doc, dict):
+        return fallback
+    err = doc.get("error")
+    if isinstance(err, dict):
+        for key in ("message", "type", "code"):
+            val = err.get(key)
+            if val:
+                return str(val)[:300]
+    if isinstance(err, str) and err:
+        return err[:300]
+    for key in ("message", "msg", "detail"):
+        val = doc.get(key)
+        if isinstance(val, str) and val:
+            return val[:300]
+    return fallback
+
+
+def _proxy_for(scheme: str, host: str) -> Optional[Tuple[str, int, Optional[str]]]:
+    """这个目标该走哪个代理？返回 `(主机, 端口, 认证头)`，直连则返回 None。
+
+    读的是 `urllib.request.getproxies()` 那一套来源（环境变量 + 各平台系统设置），
+    并在命中 `no_proxy` 时放行直连 —— 那正是 httpx 的 `trust_env=True` 做的事。
+    换掉 SDK 不该顺带把代理能力弄丢：在有代理的机器上，那等于「从能连变成连不上」，
+    而且用户看不出为什么。
+    """
+    try:
+        if urllib.request.proxy_bypass(host):
+            return None
+        proxies = urllib.request.getproxies()
+    except Exception:  # noqa: BLE001  # pragma: no cover - 平台差异
+        return None
+    raw = proxies.get(scheme) or proxies.get("all")
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "http://" + raw
+    parts = urllib.parse.urlsplit(raw)
+    if not parts.hostname:
+        return None
+    auth = None
+    if parts.username:
+        cred = f"{parts.username}:{parts.password or ''}"
+        auth = "Basic " + base64.b64encode(cred.encode("utf-8")).decode("ascii")
+    port = parts.port or (443 if parts.scheme == "https" else 8080)
+    return (parts.hostname, port, auth)
+
+
+def post_chat(base_url: str, api_key: str, payload: Dict[str, Any], *,
+              timeout: float = 600.0,
+              connect_timeout: float = 5.0) -> Dict[str, Any]:
+    """向 OpenAI 兼容端点发一次 `/chat/completions`，返回解析后的 JSON。
+
+    为什么用 `http.client` 而不是 `urllib.request.urlopen`：后者只有一个
+    timeout，会同时管 connect 与 read。这里先把 TCP（+TLS）连上，这一步受
+    `connect_timeout` 约束；连上之后把 socket 换成 `timeout` —— 于是「连不上
+    主机」5 秒就失败，「模型想得久」仍能等满。这正是「一次重试不该干等十分钟」
+    所依赖的那条分离。
+
+    代理（`HTTPS_PROXY` / `HTTP_PROXY` / `no_proxy`）同样生效：HTTPS 目标走
+    CONNECT 隧道，HTTP 目标走绝对 URI —— 都在 `http.client` 里，所以上面那条
+    超时分离在有代理时也成立。
+
+    失败一律抛 `TransportError`（带 status 与正文）：正文里通常有 provider 的
+    说法，光看状态码没法排查。
+    """
+    url = base_url.rstrip("/") + _CHAT_PATH
+    parts = urllib.parse.urlsplit(url)
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise TransportError(
+            f"base_url 协议无法识别：{scheme or '(空)'}（只认 http / https）：{base_url}")
+    host = parts.hostname or ""
+    if not host:
+        raise TransportError(f"base_url 里没有主机名：{base_url}")
+    port = parts.port or (443 if scheme == "https" else 80)
+    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {api_key}",
+        "accept": "application/json",
+        "accept-encoding": "gzip",
+        "user-agent": USER_AGENT,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    proxy = _proxy_for(scheme, host)
+    request_path = path
+    if scheme == "https":
+        p_host, p_port, p_auth = proxy if proxy else (host, port, None)
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+            p_host, p_port, timeout=connect_timeout, context=_ssl_context())
+        if proxy:
+            # CONNECT 隧道：先连代理，再让它把字节转发给目标主机。
+            conn.set_tunnel(host, port,
+                            headers={"Proxy-Authorization": p_auth} if p_auth else None)
+    else:
+        p_host, p_port, p_auth = proxy if proxy else (host, port, None)
+        conn = http.client.HTTPConnection(p_host, p_port, timeout=connect_timeout)
+        if proxy:
+            # 明文目标经代理：请求行要用绝对 URI，认证头挂在请求上。
+            request_path = urllib.parse.urlunsplit(
+                ("http", f"{host}:{port}", path, "", ""))
+            if p_auth:
+                headers["proxy-authorization"] = p_auth
+
+    try:
+        conn.connect()  # 建连（+ CONNECT + TLS 握手）：只受 connect_timeout 管
+        if conn.sock is not None:
+            conn.sock.settimeout(timeout)  # 连上之后：等模型的那个 timeout
+        conn.request("POST", request_path, body=body, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        raw = resp.read()
+        encoding = (resp.getheader("content-encoding") or "").lower()
+    except TimeoutError as exc:
+        raise TransportError(
+            f"超时（connect {connect_timeout:g}s / read {timeout:g}s）：{exc}") from exc
+    except (OSError, http.client.HTTPException) as exc:
+        raise TransportError(f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        conn.close()
+
+    text = _body_text(raw, encoding)
+    if not (200 <= status < 300):
+        raise TransportError(f"HTTP {status}: {_error_brief(text)}",
+                             status=status, body=text)
+    if not text.strip():
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise TransportError(f"响应不是 JSON：{text[:300]}", status=status, body=text) from exc
 
 
 class LLM:
@@ -308,34 +520,6 @@ class LLM:
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
-        self._client = None
-
-    def _ensure_client(self):
-        if self._client is not None:
-            return self._client
-        try:
-            from openai import OpenAI
-        except ImportError as exc:  # pragma: no cover
-            raise RuntimeError(
-                "缺少 openai 依赖，请执行： pip install openai"
-            ) from exc
-        kwargs: Dict[str, Any] = {"api_key": self.config.api_key}
-        # 关键的分离：只给一个 float 超时，httpx 会把它同时当作 read / write /
-        # pool / **connect** 的超时——于是「连不上主机」也要等整整 600s。
-        # 显式构造 httpx.Timeout：connect 用短超时快速失败，其余沿用 timeout。
-        try:
-            import httpx
-            kwargs["timeout"] = httpx.Timeout(
-                self.config.timeout, connect=self.config.connect_timeout)
-        except Exception:  # noqa: BLE001  # pragma: no cover
-            # httpx 缺席（罕见）时退回 float
-            kwargs["timeout"] = self.config.timeout
-        # 显式钉死 SDK 自带重试：默认 0，让重试只发生在 openthree 这一层。
-        kwargs["max_retries"] = max(0, int(self.config.max_retries or 0))
-        if self.config.base_url:
-            kwargs["base_url"] = self.config.base_url
-        self._client = OpenAI(**kwargs)
-        return self._client
 
     def chat(self, messages: List[Dict[str, Any]],
              tools: Optional[List[Dict[str, Any]]] = None,
@@ -357,7 +541,6 @@ class LLM:
         显式值必须能压过 `extra` 里那份（否则人类在命令行给的值会被配置文件
         里顺手写的透传值悄悄吃掉）。
         """
-        client = self._ensure_client()
         eff_max_tokens = (self.config.max_tokens if max_tokens is None
                           else int(max_tokens))
         eff_temperature = (self.config.temperature if temperature is None
@@ -383,11 +566,13 @@ class LLM:
         started = time.time()
         attempts = max(0, self.config.retries) + 1
         used = 0
-        resp = None
+        data: Dict[str, Any] = {}
         for attempt in range(attempts):
             used = attempt + 1
             try:
-                resp = client.chat.completions.create(**payload)
+                data = post_chat(self.config.base_url, self.config.api_key, payload,
+                                 timeout=self.config.timeout,
+                                 connect_timeout=self.config.connect_timeout)
                 break
             except Exception as exc:  # noqa: BLE001
                 if attempt == attempts - 1 or not _retryable(exc):
@@ -404,11 +589,6 @@ class LLM:
                     }
                 time.sleep(_backoff(attempt))
         elapsed = (time.time() - started) * 1000
-
-        try:
-            data = resp.model_dump()
-        except Exception:  # pragma: no cover
-            data = {"repr": repr(resp)}
 
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
@@ -444,12 +624,21 @@ _RETRYABLE_MARKERS = (
     "internalserver", "servererror", "serviceunavailable", "apiconnection",
     "temporarily",
 )
+# 值得重试的状态码：408 请求超时 / 409 冲突 / 429 限流 / 5xx 服务端。
+_RETRYABLE_STATUS_SET = frozenset({408, 409, 429, 500, 502, 503, 504})
 _RETRYABLE_STATUS = re.compile(
     r"(?<!\d)(408|409|429|500|502|503|504)(?!\d)")
 
 
 def _retryable(exc: BaseException) -> bool:
-    """网络抖动 / 限流 / 5xx 才重试；参数错误、鉴权失败等立刻返回。"""
+    """网络抖动 / 限流 / 5xx 才重试；参数错误、鉴权失败等立刻返回。
+
+    有状态码时**只看状态码**：正文里出现 "timeout" 的 400 仍然是 400（重试只是
+    把同一个错误再发一遍、再等一遍）；反过来，状态码为 0 的 `TransportError`
+    表示根本没走到 HTTP（DNS / 连接 / 超时），那正是重试存在的理由。
+    """
+    if isinstance(exc, TransportError):
+        return exc.status == 0 or exc.status in _RETRYABLE_STATUS_SET
     name = type(exc).__name__.lower()
     text = f"{name} {exc}".lower()
     if any(m in text for m in _RETRYABLE_MARKERS):
