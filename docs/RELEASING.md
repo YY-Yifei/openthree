@@ -10,8 +10,8 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.4.0`，本次发布 `0.5.0`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.5.0`，**本轮发布**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.5.0`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.5.0`，**已发布**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
 | 元数据 | `twine check` ✓ 两个 PASSED（0.5.0 产物） |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄）；`recursive-include docs *.md` 按**磁盘**收集而非 git，未跟踪的废案靠 `MANIFEST.in` 里显式 `exclude` 挡住 |
@@ -503,8 +503,8 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
 
 - `pyproject.toml` / `openthree/__init__.py:__version__` / `import openthree` 三处均为 `0.5.0` ✓
 - 全量 pytest → **593 passed / 0 failed**（86.78s）✓
-- `python -m build` → `openthree-0.5.0-py3-none-any.whl` + `.tar.gz`（先清空
-  `dist/` 与 `openthree.egg-info`；体积见文末「上传后核对」表）✓
+- `python -m build` → `openthree-0.5.0-py3-none-any.whl`（266,134 B）+
+  `.tar.gz`（514,019 B）（先清空 `dist/` 与 `openthree.egg-info`）✓
 - `python -m twine check dist/*` → **两个 PASSED** ✓
 - sdist 94 项：**无** `.openthree/`、`config.yaml`、`api_key`、`identity.json`、
   `limits.json`、`memory.jsonl`；与 `git ls-files` 比对**未跟踪 0 项** ✓
@@ -513,6 +513,11 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
 - 干净 venv（只装 `PyYAML` + `json_repair` + openthree）里用真实 `LLM.chat()`
   打到本地 mock 端点：tool_calls / `reasoning_content` 回传 / usage / `Bearer` 头
   全部正确，且 `sys.modules` 中**无** `openai` / `httpx` / `pydantic` ✓
+
+- **上传**：`twine upload --non-interactive --disable-progress-bar` 一次成功 →
+  <https://pypi.org/project/openthree/0.5.0/> ✓
+- **双向核验**：`/pypi/openthree/0.5.0/json` 的 `info.version` 为 `0.5.0`；两个文件的
+  `size` 与 `digests.sha256` 与本地 `dist/` **全串一致**，`yanked` 均为 `False` ✓
 
 **升级提示**：本版不改变对外行为与配置项 —— 只把 LLM 传输从 SDK 换成标准库。
 唯一可见差异是失去 httpx 的连接复用，每次 `chat()` 多一次 TCP(+TLS) 握手
@@ -534,6 +539,8 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.3.0 | `openthree-0.3.0.tar.gz` | 462,404 | `f5f108538c73dcec44ab99467126c06c03566e7b50bd89047e16e201ce4e504c` |
 | 0.4.0 | `openthree-0.4.0-py3-none-any.whl` | 262,992 | `eeb0d778d337e561c3e48d3ce6a956f18007bc4904c9c987a0242c35b19d67cb` |
 | 0.4.0 | `openthree-0.4.0.tar.gz` | 501,009 | `73509dbec6bdbc67200ab2ff15f9327d12ffc63c13d0bcb7a6da469fd7d53401` |
+| 0.5.0 | `openthree-0.5.0-py3-none-any.whl` | 266,134 | `bd8a99e94306ec9febee70f3e4b64f39a11c42e65181995c1f28c75bc0ed639f` |
+| 0.5.0 | `openthree-0.5.0.tar.gz` | 514,019 | `0988c46573410d1cd6c1884bc9dfbdeac57413f33059043dcd564b3849c27db3` |
 
 
 
