@@ -27,7 +27,7 @@ pip install openthree           # 从 PyPI 安装
 # 方式 1：环境变量
 export OPENAI_API_KEY=sk-xxx
 export OPENAI_BASE_URL=https://api.deepseek.com
-export OPENTHREE_MODEL=deepseek-v4.1-flash
+export OPENTHREE_MODEL=deepseek-flash
 ```
 
 ```yaml
@@ -35,7 +35,7 @@ export OPENTHREE_MODEL=deepseek-v4.1-flash
 llm:
   api_key: sk-xxx
   base_url: https://api.deepseek.com
-  model: deepseek-v4.1-flash
+  model: deepseek-flash
   max_tokens: 32768
   reasoning_effort: high          # 可选：minimal/low/medium/high；不写 = 请求里不带该字段
   reasoning_content_replay: auto  # 可选：auto/always/never —— 推理模式下 reasoning 的回传策略
@@ -134,11 +134,11 @@ def screenshot(url: str) -> ImageResult:
   工作区 <你的项目>\.openthree
 
 36 个工具（内置 33 / 自造 3）
-ReAct 循环开始（每轮 ≤ 200 步 × 最多 10 轮，模型 deepseek-v4.1-flash）
+ReAct 循环开始（每轮 ≤ 200 步 × 最多 10 轮，模型 deepseek-flash）
        每 15s 打一次心跳，长任务不会看起来卡死
 
 [step 3/200]
-  · 思考中（deepseek-v4.1-flash）…
+  · 思考中（deepseek-flash）…
   · … 等待模型返回，已等待 30s          ← 心跳：证明它还活着，不是卡死了
   · LLM 返回 (31.4s · in=20653 out=412)
     说：内置工具里没有斐波那契，我造一个 function 给自己用。

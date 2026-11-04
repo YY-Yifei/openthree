@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover
 from .multimodal import sanitize_for_log
 
 
-DEFAULT_MODEL = "deepseek-v4.1-flash"
+DEFAULT_MODEL = "deepseek-flash"
 
 # 模型上下文窗口的默认值（单位 token）。
 # 默认按 1M 上下文对待 —— 上下文预算由此推导，见 agent.resolve_context_budget。
