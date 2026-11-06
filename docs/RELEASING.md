@@ -567,6 +567,17 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
 完全一致（零字节、零痕迹）。要用 `decide` 才有新增网络出口，README「安全边界」
 已列明它发往哪里。
 
+- **上传**：`twine upload --non-interactive --disable-progress-bar` 一次成功 →
+  <https://pypi.org/project/openthree/0.6.0/> ✓
+- **双向核验**：`/pypi/openthree/0.6.0/json` 的 `info.version` 为 `0.6.0`；两个文件的
+  `size` 与 `digests.sha256` 与本地 `dist/` **全串一致**，`yanked` 均为 `False` ✓
+- **安装版验收**：干净 venv（`_live/venv060`）从 `https://pypi.org/simple/` 装 `0.6.0`，
+  在仓库之外的**中性 cwd** 跑：`import openthree` → `0.6.0` 且 `__file__` 指向
+  site-packages、`python -m openthree --version` → `openthree 0.6.0`、`--inspect` →
+  37 工具；同一探针配好三个 `JEV_*` 再跑 → **38 工具且 `decide` 已注册**，
+  不配则 37 且没有 `decide` ✓
+
+
 ### 上传后核对（按版本）
 
 sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/json` 的
@@ -585,6 +596,8 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.4.0 | `openthree-0.4.0.tar.gz` | 501,009 | `73509dbec6bdbc67200ab2ff15f9327d12ffc63c13d0bcb7a6da469fd7d53401` |
 | 0.5.0 | `openthree-0.5.0-py3-none-any.whl` | 266,134 | `bd8a99e94306ec9febee70f3e4b64f39a11c42e65181995c1f28c75bc0ed639f` |
 | 0.5.0 | `openthree-0.5.0.tar.gz` | 514,019 | `0988c46573410d1cd6c1884bc9dfbdeac57413f33059043dcd564b3849c27db3` |
+| 0.6.0 | `openthree-0.6.0-py3-none-any.whl` | 276,790 | `7cf8c045a6c235a3993572777cafd3159305a97c4fb5b7c4d03ba8310ab73df4` |
+| 0.6.0 | `openthree-0.6.0.tar.gz` | 565,114 | `cb4a1b6c6f66943097bb0ae77e729ed925605ee14ebe348f1434bcbb1097df24` |
 
 
 
