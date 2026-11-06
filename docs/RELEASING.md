@@ -10,12 +10,12 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.6.0`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.6.0`，**已发布**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.6.1`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.6.1`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
-| 元数据 | `twine check` ✓ 两个 PASSED（0.6.0 产物） |
+| 元数据 | `twine check` ✓ 两个 PASSED（0.6.1 产物） |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄）；`recursive-include docs *.md` 按**磁盘**收集而非 git，未跟踪的废案靠 `MANIFEST.in` 里显式 `exclude` 挡住 |
-| 测试 | 650 passed（仓库根，0.6.0 实跑） |
+| 测试 | 655 passed（仓库根，0.6.1 实跑） |
 | 依赖 | `PyYAML>=6.0`、`json_repair>=0.30` —— **`openai` 已移除**：LLM 传输由 `openthree/llm.py` 用标准库 `http.client` 实现，于是 `pydantic` / `pydantic-core`（Rust）/ `httpx` / `anyio` 都不再进入依赖树；频道层同样只用标准库 |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
@@ -576,6 +576,44 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
   site-packages、`python -m openthree --version` → `openthree 0.6.0`、`--inspect` →
   37 工具；同一探针配好三个 `JEV_*` 再跑 → **38 工具且 `decide` 已注册**，
   不配则 37 且没有 `decide` ✓
+
+### 0.6.1 实跑记录（2026-11-06）
+
+本版内容：**运行期回声带墙上时间** —— 终端每一行（含心跳）前加 `[HH:MM:SS]`。
+长任务跑几十轮时，相对秒数（`1.2s`）说的是「多久」，墙上时间说的是「哪一刻」，
+与 `.openthree/logs/` 里的时间戳能直接对上。
+
+- **一处实现**：`progress.stamp()` / `progress.stamped()` 是唯一定义，
+  `Progress._say()` 与 `Runtime.say()` 两个打印出口都走它。
+- **只给连续回声加**：banner / `--inspect` / 最终答案正文 / 错误这类一次性输出**不加戳**，
+  它们不是「运行中的连续回声」；`cli.py` 里那些 `print(` 一处没动。
+- **多行块共用一个戳**：`stamped()` 对整块取一次时钟，空行原样保留 ——
+  逐行取时钟会让同一块里差几毫秒，也会把空行变成「只有时间的空行」。
+  `Runtime.say` 的 17 处调用点逐个核过，全是单行消息，所以不会把最终答案正文逐行盖戳。
+- **`step` 前那个空分隔行不带戳**，否则日志里多一行纯时间戳噪音。
+- **结构化产出不变**：`logs/*.jsonl` 的时间戳一直由记录器自己写，终端戳只属于人眼。
+- 测试数 650 → **655**（`tests/test_progress.py` +4、`tests/test_cli_progress.py` +1）：
+  逐行带戳 / 心跳带戳 / 空分隔行不带戳 / 多行共用一戳且保留空行 /
+  `rt.run()` 的每一行非空输出都带戳。
+
+验收（仓库根实跑）：
+
+- `pyproject.toml` / `openthree/__init__.py:__version__` / `import openthree` 三处均为 `0.6.1` ✓
+- 全量 pytest → **655 passed / 0 failed**（70.14s）✓
+- `python -m build` → `openthree-0.6.1-py3-none-any.whl` + `.tar.gz`
+  （先清空 `dist/` 与 `openthree.egg-info`；体积与 sha256 见文末「上传后核对」表）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist **98 项**，越界路径 0 项（无 `.openthree/`、`config.yaml`、`api_key`、
+  `identity.json`、`limits.json`、`memory.jsonl`）；与 `git ls-files` 比对未跟踪 0 项 ✓
+- 没有下游按行首特征解析终端输出：`startswith("[step` 全仓 0 命中；
+  `git diff -w --stat` 与 `git diff --stat` 逐行相同（没被 CRLF 搅出假 diff）✓
+
+**升级提示**：本版只改终端输出的观感，**无行为与配置变更** —— 程序读的是
+`.openthree/logs/*.jsonl`，那里一个字段没动。若有脚本按行首匹配终端输出，
+需要允许可选的 `[HH:MM:SS] ` 前缀。
+
+> 本文进 sdist 的那份是**构建时快照**：上传后的核对结果（按版本记的体积、sha256、
+> 安装版验收）写在下一节，它不进包 —— 构建早于上传是必然的。
 
 
 ### 上传后核对（按版本）

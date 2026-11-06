@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import time
 
 from openthree.agent import Agent
 from openthree.kernel import KERNEL
 from openthree.llm import LLMConfig
-from openthree.progress import NullProgress, Progress, _short_args
+from openthree.progress import NullProgress, Progress, _short_args, stamped
 from openthree.recorder import Recorder
 
 
@@ -61,6 +62,49 @@ def test_progress_shows_attempts_only_when_retried():
     Progress(stream=buf2, heartbeat=0).llm_done(1200.0, {"prompt_tokens": 10})
     assert "次尝试" not in buf2.getvalue()
 
+
+def test_every_echo_line_carries_a_wallclock_stamp():
+    """终端的每一行都有 `[HH:MM:SS]` —— 长任务跑几十分钟时靠它对齐时间线。"""
+    buf = io.StringIO()
+    p = Progress(stream=buf, heartbeat=0)
+    p.step(2, 200)
+    p.llm_start("stub-model")
+    p.thought("想事情")
+    p.tool_start("read_file", {"path": "a.txt"})
+    p.tool_done("read_file", 30.0, 42)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    assert lines
+    for ln in lines:
+        assert re.match(r"^\[\d{2}:\d{2}:\d{2}\] ", ln), ln
+
+
+def test_heartbeat_lines_carry_a_stamp():
+    buf = io.StringIO()
+    p = Progress(stream=buf, heartbeat=0.05)
+    p.llm_start("m")
+    time.sleep(0.2)
+    p.close()
+    beats = [ln for ln in buf.getvalue().splitlines() if "已等待" in ln]
+    assert beats
+    assert all(re.match(r"^\[\d{2}:\d{2}:\d{2}\] ", ln) for ln in beats), beats
+
+
+def test_blank_separator_line_is_not_stamped():
+    """`step` 前那一个空行是分隔，盖上时间戳只会得到一行「只有时间的空行」。"""
+    buf = io.StringIO()
+    Progress(stream=buf, heartbeat=0).step(1, 5)
+    lines = buf.getvalue().splitlines()
+    assert lines[0] == ""
+    assert re.match(r"^\[\d{2}:\d{2}:\d{2}\] \[step 1/5\]$", lines[1]), lines
+
+
+def test_stamped_shares_one_stamp_across_lines():
+    """一行里的多行块是同一瞬间打出来的 —— 共用一个时间戳，空行原样保留。"""
+    out = stamped("a\n\nb", when=0.0)
+    assert out.splitlines()[1] == ""
+    first, last = out.splitlines()[0], out.splitlines()[2]
+    assert first.startswith("[") and first.split(" ")[0] == last.split(" ")[0]
+    assert first.endswith(" a") and last.endswith(" b")
 
 
 def test_short_args_hides_big_blobs():

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from openthree.runtime import Runtime
@@ -63,3 +64,16 @@ def test_heartbeat_zero_disables_heartbeat(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "[step 1/200]" in out            # 进度照旧
     assert "已等待" not in out               # 但心跳被关掉了
+
+
+def test_every_terminal_line_carries_a_wallclock_stamp(tmp_path, capsys):
+    """运行期的每一行都有 `[HH:MM:SS]` —— `Runtime.say` 与 `Progress` 同一条口径。"""
+    rt = _make(tmp_path, heartbeat=0)
+    rt.run("干点活")
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines
+    for ln in lines:
+        assert re.match(r"^\[\d{2}:\d{2}:\d{2}\] ", ln), ln
+    assert re.search(r"^\[\d{2}:\d{2}:\d{2}\] \[step 1/200\]$", out, re.M)
+    assert re.search(r"^\[\d{2}:\d{2}:\d{2}\] 第 1 轮完成", out, re.M)

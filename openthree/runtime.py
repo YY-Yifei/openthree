@@ -34,7 +34,7 @@ from .kernel import KERNEL
 from .llm import (LLM, LLMConfig, REASONING_PLACEHOLDER_FIELD, is_always_replay,
                   is_known_replay_mode, is_never_replay, load_config,
                   parse_token_count, resolve_reasoning_placeholder)
-from .progress import Progress
+from .progress import Progress, stamped
 from .recorder import Recorder
 from .registry import Registry
 from .report import write_report
@@ -123,8 +123,9 @@ class Runtime:
 
     # ---------------------------------------------------------------- 对外
     def say(self, msg: str) -> None:
+        # 与 Progress 同一条时间戳口径（`progress.stamped`）：终端的每一行都能回看时刻。
         if not self.quiet:
-            print(msg, flush=True)
+            print(stamped(msg), flush=True)
 
     # ---------------------------------------------------------------- 身份
     def _seed_identity(self) -> None:

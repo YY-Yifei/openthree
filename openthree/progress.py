@@ -5,18 +5,23 @@
     * 这是**纯展示层**，不含任何决策逻辑，不参与 ReAct，不影响回答质量。
     * Agent 只调用注入进来的 progress 对象，它并不认识「终端 / print」。
     * 不传 progress 时，Agent 走 NullProgress，行为完全一致。
+    * 每一行前面带 `[HH:MM:SS]` 墙上时间，由 `stamp()` / `stamped()` 这一处产生。
 
 为什么需要它：一次 LLM 调用可能几十秒到几分钟，一次 run_shell 可能几十秒，
 而 openthree 在开跑前说过三句话之后就彻底沉默了 —— 用户无法区分
 「模型正在思考」和「进程已经卡死」。这里补上那个回声。
 
-    [step 3/200]
-      · 思考中（deepseek-flash）…
-      · … 等待模型返回，已等待 30s        ← 心跳，长等待时周期性出现
-      · LLM 返回 (12.3s · in=20653 out=412)
-        说：内置工具里没有斐波那契，我造一个 function 给自己用。
-      · 调用 write_function(name=fib, code=(118 字符))
-      · ↳ write_function 完成 (0.0s · 输出 107 字符)
+时间戳解决的是另一个问题：「这一行是什么时候打的」。长任务跑几十分钟时，
+墙上时间比相对秒数更有用 —— 能把终端上的一行对上日志、报告与对话档案里的时间线。
+固定 10 字符宽，所以时间戳那一列天然对齐。
+
+    [14:12:03] [step 3/200]
+    [14:12:03]   · 思考中（deepseek-flash）…
+    [14:12:33]   · … 等待模型返回，已等待 30s        ← 心跳，长等待时周期性出现
+    [14:12:41]   · LLM 返回 (12.3s · in=20653 out=412)
+    [14:12:41]     说：内置工具里没有斐波那契，我造一个 function 给自己用。
+    [14:12:41]   · 调用 write_function(name=fib, code=(118 字符))
+    [14:12:42]   · ↳ write_function 完成 (0.0s · 输出 107 字符)
 """
 from __future__ import annotations
 
@@ -24,6 +29,40 @@ import sys
 import threading
 import time
 from typing import Any, Dict, Optional
+
+#: 时间戳格式。固定 10 字符宽（`[HH:MM:SS]`），所以终端上时间戳那一列自然对齐。
+STAMP_FORMAT = "[%H:%M:%S]"
+
+
+def stamp(when: Optional[float] = None) -> str:
+    """一面墙上时间的短前缀。
+
+    Args:
+        when: 秒级时间戳（`time.time()` 的口径）；None = 现在。
+
+    Returns:
+        `[HH:MM:SS]`，恰好 10 个字符。
+    """
+    return time.strftime(STAMP_FORMAT, time.localtime(when))
+
+
+def stamped(text: str, when: Optional[float] = None) -> str:
+    """给一段（可能多行的）文本逐行加时间戳。
+
+    空行原样保留 —— 它们是分隔（`step` 前那一行），盖上时间戳只会得到
+    一行「只有时间的空行」。多行共用同一个时间戳：它们本来就是同一瞬间
+    打出来的一整块。
+
+    Args:
+        text: 要打印的文本，可有换行。
+        when: 秒级时间戳；None = 现在。
+
+    Returns:
+        非空行都以 `[HH:MM:SS] ` 开头；空行原样保留。
+    """
+    prefix = stamp(when)
+    lines = str(text).splitlines() or [""]
+    return "\n".join(f"{prefix} {ln}" if ln.strip() else ln for ln in lines)
 
 
 class NullProgress:
@@ -75,7 +114,7 @@ class Progress:
             return
         with self._lock:
             try:
-                print(text, file=self.stream, flush=True)
+                print(stamped(text), file=self.stream, flush=True)
             except Exception:  # noqa: BLE001
                 pass
 
