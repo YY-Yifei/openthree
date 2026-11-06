@@ -39,6 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
+from .decide import optional_builtins
 from .kernel import KERNEL
 from .multimodal import ImageResult
 from .registry import MAX_ATTACHED_PROMPT_CHARS, PROMPT_ATTR
@@ -2922,6 +2923,21 @@ BUILTIN_FUNCTIONS: Dict[str, Any] = {
     "finish": finish,
     "get_time": get_time,
 }
+
+
+def installed_builtins() -> Dict[str, Any]:
+    """本次进程真正注册的内置工具 = 常驻集 + 条件集。
+
+    `BUILTIN_FUNCTIONS` 是**常驻集**（无条件注册），`optional_builtins()` 是
+    **条件集**（依赖环境变量的工具，如 decide）。判据只有这一处 —— 于是
+    「没配置就不存在」是机制的结论，而不是某段文案的说法。
+
+    要在**注册期**调它一次（`Runtime.__init__` / `cli_tool.setup_offline_kernel`）：
+    工具集是注册期产物，会话中途增减会让 system 前缀每步都变。
+    """
+    out = dict(BUILTIN_FUNCTIONS)
+    out.update(optional_builtins())
+    return out
 
 
 def __main__(argv=None) -> int:

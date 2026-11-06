@@ -1,6 +1,7 @@
 """pytest 共享夹具：不联网、不依赖真实模型。"""
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -11,7 +12,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from openthree.agent import Agent  # noqa: E402
-from openthree.builtins import BUILTIN_FUNCTIONS  # noqa: E402
+from openthree.builtins import installed_builtins  # noqa: E402
+from openthree.decide import ENV_API_KEY, ENV_BASE_URL, ENV_MODEL  # noqa: E402
 from openthree.kernel import KERNEL  # noqa: E402
 from openthree.llm import LLM, LLMConfig  # noqa: E402
 from openthree.prompt import build_messages, build_static_block  # noqa: E402
@@ -48,10 +50,55 @@ def ws(tmp_path: Path) -> Workspace:
     return Workspace(tmp_path).init()
 
 
+_JEV_KEYS = (ENV_BASE_URL, ENV_API_KEY, ENV_MODEL)
+
+
+@pytest.fixture(autouse=True)
+def _no_jev_env(monkeypatch):
+    """默认在「JEV 未配置」的环境里跑：门控的默认路径就是「不注册」。
+
+    不这么做，测试结果会随开发机上有没有 `JEV_*` 而变 —— 那是最难查的一类
+    flaky。要测「配好就启用」的用例自己 monkeypatch.setenv 即可。
+    变量名取自 `decide` 的常量，不在这里另抄一份字面量：改名时这里会跟着变，
+    而不是静默变成空操作、把 flaky 又放回来。
+    """
+    for key in _JEV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_decide_registration(monkeypatch):
+    """注册期快照要复位：`installed_builtins()` 冻结过就不再重判，测试之间会互相污染。
+
+    一个测试在「配好了」的环境里走过注册期，下一个测试拿到的 `installed_builtins()`
+    里仍然有 `decide` —— 那些断言「没配就不注册」的用例会随执行顺序变红或变绿。
+    """
+    from openthree import decide as _decide
+
+    # 不给 `raising=False`：属性一旦改名，这里要**当场炸**，而不是静默新建一个
+    # 同名属性、把复位变成空操作 —— 那正是本夹具要防的那类污染。
+    monkeypatch.setattr(_decide, "_registered", None)
+    monkeypatch.setattr(_decide, "_snapshot", None)
+
+
+@pytest.fixture
+def jev_free_env() -> dict:
+    """给**子进程**用的环境：同样不含任何 `JEV_*`。
+
+    上面那个夹具只清得动本进程的 `os.environ`；子进程继承的是真实环境，于是
+    「没配就不启用」这类子进程断言，在配了 `JEV_*` 的开发机上会翻车。要用子进程
+    测门控就传 `env=jev_free_env`（或它的副本）。
+    """
+    env = dict(os.environ)
+    for key in _JEV_KEYS:
+        env.pop(key, None)
+    return env
+
+
 @pytest.fixture
 def registry(ws: Workspace) -> Registry:
     reg = Registry(ws)
-    for name, fn in BUILTIN_FUNCTIONS.items():
+    for name, fn in installed_builtins().items():
         reg.register_builtin(name, fn)
     reg.freeze_builtins()
     reg.reload()

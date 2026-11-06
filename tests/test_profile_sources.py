@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from openthree import cli
-from openthree.builtins import (BUILTIN_FUNCTIONS, list_functions,
+from openthree.builtins import (installed_builtins, list_functions,
                                 write_function)
 from openthree.kernel import KERNEL
 from openthree.llm import load_config
@@ -60,7 +60,7 @@ def make_kernel(proj, monkeypatch):
     def _make(profiles=()):
         ws = Workspace(root, profiles=tuple(profiles)).init()
         reg = Registry(ws)
-        for name, fn in BUILTIN_FUNCTIONS.items():
+        for name, fn in installed_builtins().items():
             reg.register_builtin(name, fn)
         reg.freeze_builtins()
         reg.reload()

@@ -96,7 +96,7 @@ def setup_offline_kernel(project_dir: Optional[str] = None) -> Any:
     只在项目目录**已有** ``.openthree/`` 时调用 ``init()``：
     否则``read_file`` 这类只读命令会在人随便一个目录里凭空建出工作区。
     """
-    from .builtins import BUILTIN_FUNCTIONS
+    from .builtins import installed_builtins
     from .kernel import KERNEL
     from .registry import Registry
     from .workspace import Workspace
@@ -107,7 +107,7 @@ def setup_offline_kernel(project_dir: Optional[str] = None) -> Any:
         ws.init()                      # 幂等：已存在的内容不覆盖
 
     reg = Registry(ws)
-    for name, func in BUILTIN_FUNCTIONS.items():
+    for name, func in installed_builtins().items():
         reg.register_builtin(name, func)
 
     KERNEL.workspace = ws

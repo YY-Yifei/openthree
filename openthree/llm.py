@@ -427,15 +427,20 @@ def _proxy_for(scheme: str, host: str) -> Optional[Tuple[str, int, Optional[str]
     return (parts.hostname, port, auth)
 
 
-def post_chat(base_url: str, api_key: str, payload: Dict[str, Any], *,
+def post_json(url: str, api_key: str, payload: Dict[str, Any], *,
               timeout: float = 600.0,
               connect_timeout: float = 5.0) -> Dict[str, Any]:
-    """向 OpenAI 兼容端点发一次 `/chat/completions`，返回解析后的 JSON。
+    """向任意 JSON 端点 POST 一次，返回解析后的 JSON。
+
+    **URL 原样使用**：不拼接、不补尾斜杠、不推断路径 —— 端点是调用方的事。
+    同一条传输路径既服务 OpenAI 兼容的 `/chat/completions`，也服务别的 JSON
+    接口（见 `decide.py`）；把「路径从哪来」变成参数，就不必复制第二份代理、
+    TLS、超时与错误处理。
 
     为什么用 `http.client` 而不是 `urllib.request.urlopen`：后者只有一个
     timeout，会同时管 connect 与 read。这里先把 TCP（+TLS）连上，这一步受
     `connect_timeout` 约束；连上之后把 socket 换成 `timeout` —— 于是「连不上
-    主机」5 秒就失败，「模型想得久」仍能等满。这正是「一次重试不该干等十分钟」
+    主机」5 秒就失败，「服务端想得久」仍能等满。这正是「一次重试不该干等十分钟」
     所依赖的那条分离。
 
     代理（`HTTPS_PROXY` / `HTTP_PROXY` / `no_proxy`）同样生效：HTTPS 目标走
@@ -445,15 +450,14 @@ def post_chat(base_url: str, api_key: str, payload: Dict[str, Any], *,
     失败一律抛 `TransportError`（带 status 与正文）：正文里通常有 provider 的
     说法，光看状态码没法排查。
     """
-    url = base_url.rstrip("/") + _CHAT_PATH
     parts = urllib.parse.urlsplit(url)
     scheme = (parts.scheme or "").lower()
     if scheme not in ("http", "https"):
         raise TransportError(
-            f"base_url 协议无法识别：{scheme or '(空)'}（只认 http / https）：{base_url}")
+            f"URL 协议无法识别：{scheme or '(空)'}（只认 http / https）：{url}")
     host = parts.hostname or ""
     if not host:
-        raise TransportError(f"base_url 里没有主机名：{base_url}")
+        raise TransportError(f"URL 里没有主机名：{url}")
     port = parts.port or (443 if scheme == "https" else 80)
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
 
@@ -513,6 +517,18 @@ def post_chat(base_url: str, api_key: str, payload: Dict[str, Any], *,
         return json.loads(text)
     except json.JSONDecodeError as exc:
         raise TransportError(f"响应不是 JSON：{text[:300]}", status=status, body=text) from exc
+
+
+def post_chat(base_url: str, api_key: str, payload: Dict[str, Any], *,
+              timeout: float = 600.0,
+              connect_timeout: float = 5.0) -> Dict[str, Any]:
+    """向 OpenAI 兼容端点发一次 `/chat/completions`，返回解析后的 JSON。
+
+    只是 `post_json` 的一层薄包装：`base_url` 补上协议约定的路径，其余行为
+    （头、代理、gzip、超时、错误）逐字节沿用。失败抛 `TransportError`。
+    """
+    return post_json(base_url.rstrip("/") + _CHAT_PATH, api_key, payload,
+                     timeout=timeout, connect_timeout=connect_timeout)
 
 
 class LLM:

@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from .agent import Agent, resolve_context_budget
-from .builtins import BUILTIN_FUNCTIONS
+from .builtins import installed_builtins
 from .kernel import KERNEL
 from .llm import (LLM, LLMConfig, REASONING_PLACEHOLDER_FIELD, is_always_replay,
                   is_known_replay_mode, is_never_replay, load_config,
@@ -102,7 +102,7 @@ class Runtime:
         self.context_budget_source = ("显式 --context-budget" if budget_arg is not None
                                       else f"按窗口 {_fmt_tokens(self.context_window_tokens)} 推导")
         self.registry = Registry(self.ws)
-        for name, fn in BUILTIN_FUNCTIONS.items():
+        for name, fn in installed_builtins().items():
             self.registry.register_builtin(name, fn)
         self.registry.freeze_builtins()
         self.registry.reload()

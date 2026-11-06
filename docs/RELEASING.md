@@ -10,12 +10,12 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.5.0`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.5.0`，**已发布**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.6.0`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.6.0`，**已发布**（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
-| 元数据 | `twine check` ✓ 两个 PASSED（0.5.0 产物） |
+| 元数据 | `twine check` ✓ 两个 PASSED（0.6.0 产物） |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄）；`recursive-include docs *.md` 按**磁盘**收集而非 git，未跟踪的废案靠 `MANIFEST.in` 里显式 `exclude` 挡住 |
-| 测试 | 593 passed（仓库根，0.5.0 实跑） |
+| 测试 | 650 passed（仓库根，0.6.0 实跑） |
 | 依赖 | `PyYAML>=6.0`、`json_repair>=0.30` —— **`openai` 已移除**：LLM 传输由 `openthree/llm.py` 用标准库 `http.client` 实现，于是 `pydantic` / `pydantic-core`（Rust）/ `httpx` / `anyio` 都不再进入依赖树；频道层同样只用标准库 |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
@@ -522,6 +522,50 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
 **升级提示**：本版不改变对外行为与配置项 —— 只把 LLM 传输从 SDK 换成标准库。
 唯一可见差异是失去 httpx 的连接复用，每次 `chat()` 多一次 TCP(+TLS) 握手
 （本机 ~10ms，移动网络 ~100–300ms），相对模型生成时间可忽略。
+
+### 0.6.0 实跑记录（2026-11-06）
+
+本版内容：**内置工具 `decide`（可选）** —— 把「拿不准的判定」交给一个独立的决策模型
+（JEV），取回一个分布（`choice` 多选一 / `noul` 0–1 连续值 / `score` 各等级期望值）。
+内核只搬运、只如实转达：不设阈值、不四舍五入、不解释概率、不转发 `usage`。
+
+- **默认不存在**：`JEV_BASE_URL` / `JEV_API_KEY` / `JEV_MODEL` 三个环境变量齐全且
+  base 是 http(s) 绝对地址才注册。判据只有一处 —— `builtins.installed_builtins()`
+  = 常驻集 `BUILTIN_FUNCTIONS` + 条件集 `decide.optional_builtins()`，
+  `Runtime.__init__` 与 `cli_tool.setup_offline_kernel` 两个注册期调用点都走它。
+  未配置时它不在工具清单、不在请求的 `tools` 数组、system 里**零字节**，也没有
+  「为什么不在」的诊断工具 —— 没注册就没痕迹。
+- **配置只从环境变量读**，不读 `config.yaml`、没有默认端点、没有默认模型：
+  默认端点等于替你决定数据发给谁。改环境变量要重启进程（注册期判定一次，
+  会话中途增减工具会让 system 前缀每步都变）。
+- **传输层复用**：`llm.post_json()` / `llm.post_chat()` 拆出「路径从哪来」这一层参数，
+  代理 / TLS / 超时分离 / 错误摘要 / 重试判据（`_retryable` / `_backoff`）仍是**一份**。
+  在 `openthree/decide.py` 里复制一遍这些逻辑，401 会被重试、429 会被吞，而两处都自称对。
+- **安全边界写进 README**：配好 `JEV_*` 之后 `decide` 会把 `state` 与 `questions`
+  发往 `JEV_BASE_URL` 指向的第三方端点 —— 那不在 openthree 的安全边界内。
+- **内核种子未动**：`openthree/workspace.py` 一个字节没改，`decide` 进模型视野靠的是
+  `Registry.digest()` 从注册表长出，不是往提示词里写句子。
+- 测试数 593 → **650**（新增 `tests/test_decide.py` 57 条，全部不打真网：
+  假 JEV 端点走 `http.server`，门控/归一/错误分型/零痕迹逐条钉住）。
+  设计取舍与自评审见 `docs/decide-tool-proposal.md` 与
+  `docs/decide-tool-proposal-self-review.md`。
+
+验收（仓库根实跑）：
+
+- `pyproject.toml` / `openthree/__init__.py:__version__` / `import openthree` 三处均为 `0.6.0` ✓
+- 全量 pytest → **650 passed / 0 failed**（67.09s）✓
+- `python -m build` → `openthree-0.6.0-py3-none-any.whl` + `.tar.gz`
+  （先清空 `dist/` 与 `openthree.egg-info`；体积与 sha256 见文末「上传后核对」表）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist 无 `.openthree/`、`config.yaml`、`api_key`、`identity.json`、`limits.json`、
+  `memory.jsonl`；与 `git ls-files` 比对未跟踪 0 项（`docs/memory-chroma-proposal.md`
+  仍由 `MANIFEST.in` 的显式 `exclude` 挡住，不进包）✓
+- 门控探针（`.openthree/tmp/probe_review_pack.py`）：未配置 → 37 工具，
+  `digest()` 与 `schemas()` 都无 `decide`；配置三个变量后 → 38 工具，两处都有 ✓
+
+**升级提示**：本版对已装用户**行为不变** —— 不配 `JEV_*` 时工具集与 `0.5.0`
+完全一致（零字节、零痕迹）。要用 `decide` 才有新增网络出口，README「安全边界」
+已列明它发往哪里。
 
 ### 上传后核对（按版本）
 

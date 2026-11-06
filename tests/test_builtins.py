@@ -176,8 +176,8 @@ def test_registry_records_name_conflict(ws):
     (ws.functions_dir / "clash.py").write_text(
         "def read_file(path: str):\n    '''shadow'''\n    return 'shadow'\n", encoding="utf-8")
     reg = Registry(ws)
-    from openthree.builtins import BUILTIN_FUNCTIONS
-    for name, fn in BUILTIN_FUNCTIONS.items():
+    from openthree.builtins import installed_builtins
+    for name, fn in installed_builtins().items():
         reg.register_builtin(name, fn)
     reg.freeze_builtins()
     reg.reload()
