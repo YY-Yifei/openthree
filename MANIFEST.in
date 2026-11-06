@@ -13,9 +13,9 @@ recursive-include tests *.py
 recursive-include scripts *.py *.sh
 recursive-include docs *.md
 
-# sdist 按**磁盘**收集，不看 git —— 未跟踪的本地草稿会跟着进发行包。
-# 以下文件在磁盘上存在但不属于本项目（已废弃 / 仅供本地留档）：
-exclude docs/memory-chroma-proposal.md
+# sdist 按**磁盘**收集，不看 git —— 未跟踪的本地草稿会跟着进发行包，
+# 所以「哪份文档进包」是逐份决定的：不该发布的文件，要么在此 `exclude`，
+# 要么直接从磁盘上删掉（两条路选一条，别留「磁盘有、包里没有」的影子）。
 
 # 安全网：.openthree/ 里可能含 api_key（config.yaml），绝不入发行包
 prune .openthree

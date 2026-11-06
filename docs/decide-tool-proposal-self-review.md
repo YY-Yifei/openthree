@@ -453,6 +453,9 @@ CLI 里（`python -m openthree.decide decide_status`），`builtins` 的 CLI 规
 `MANIFEST.in` 里那条 exclude（跟着 sdist 发布）／删掉。它现在「git 看不见、MANIFEST 专门排除」，
 合规但缺一个真源。我的倾向：**本次不提交**（与 decide 无关），下一件事开始时再定。
 
+> 已定（2026-11-06，人类裁定「移除」）：文件已从磁盘删除，`MANIFEST.in` 那条 `exclude` 一并
+> 撤掉——这条路由上面三条路里的第三条。留下的可复用调研事实在记忆里，不在本仓库。
+
 ### 11.7 验收（两条都能复跑）
 
 - `python -m pytest tests -q` → 全绿（exit=0，`tests/` 全部通过，其中 `test_decide.py` 57 条）。
