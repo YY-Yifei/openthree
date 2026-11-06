@@ -615,6 +615,21 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
 > 本文进 sdist 的那份是**构建时快照**：上传后的核对结果（按版本记的体积、sha256、
 > 安装版验收）写在下一节，它不进包 —— 构建早于上传是必然的。
 
+- **上传**：`twine upload --non-interactive --disable-progress-bar` 一次成功 →
+  <https://pypi.org/project/openthree/0.6.1/> ✓（凭据来自 `~/.pypirc`，无交互）
+- **双向核验**：`/pypi/openthree/0.6.1/json` 的 `info.version` 为 `0.6.1`；两个文件的
+  `size` 与 `digests.sha256` 与本地 `dist/` **全串一致**，`yanked` 均为 `False` ✓
+- **安装版验收**：干净 venv（`_live/venv061`）从 `https://pypi.org/simple/` 装 `0.6.1`，
+  在仓库之外的**中性 cwd**（`D:\projects`）跑：`import openthree` → `0.6.1` 且
+  `__file__` 指向 site-packages、`python -m openthree --version` → `openthree 0.6.1`、
+  `--inspect` → 38 工具；`stamp()` → `[HH:MM:SS]`、`stamped("a\n\nb")` 两行共用一戳
+  且空行原样保留 ✓
+- **索引延迟一例**：上传后立刻 `pip install openthree==0.6.1` 报
+  `No matching distribution found`（`from versions: … 0.6.0`），显式
+  `--index-url https://pypi.org/simple/` 也一样 —— 是 PyPI 索引 / CDN 还没刷新，
+  不是走镜像；等 JSON API 就绪后重装一次通过。附一条命令坑：`pip … | python -c …`
+  的退出码取管道末条，pip 的失败会被后面的 `&&` 吞掉，验收安装必须让 pip 自己说话。
+
 
 ### 上传后核对（按版本）
 
@@ -636,6 +651,8 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.5.0 | `openthree-0.5.0.tar.gz` | 514,019 | `0988c46573410d1cd6c1884bc9dfbdeac57413f33059043dcd564b3849c27db3` |
 | 0.6.0 | `openthree-0.6.0-py3-none-any.whl` | 276,790 | `7cf8c045a6c235a3993572777cafd3159305a97c4fb5b7c4d03ba8310ab73df4` |
 | 0.6.0 | `openthree-0.6.0.tar.gz` | 565,114 | `cb4a1b6c6f66943097bb0ae77e729ed925605ee14ebe348f1434bcbb1097df24` |
+| 0.6.1 | `openthree-0.6.1-py3-none-any.whl` | 277,771 | `34af8afff05bdf2a980724adac19ad3c733c175cd90f62e0b07c18ba8a67a2ba` |
+| 0.6.1 | `openthree-0.6.1.tar.gz` | 568,416 | `662b48a6d11d04d104df2709a03c053463928c0cee4e8da31fe996dcdf662a15` |
 
 
 
