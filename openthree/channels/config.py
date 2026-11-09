@@ -96,6 +96,36 @@ _SPECS: Dict[str, ChannelSpec] = {
                   hint="允许的发送者 staffId，逗号分隔；留空 = 不限制"),
         ),
     ),
+    # A2A：把 openthree 挂到 A2A 网络上，别的智能体来派任务。
+    # 一条 required 都没有 —— 所以 `is_ready()` 立刻为真，向导逐项回车就能生成
+    # 一条可用配置。默认值只在 `a2a.py` 的模块常量里写一份，这里的 hint 只是
+    # 说明「默认是什么」（config 不 import 具体频道实现，见文件头）。
+    "a2a": ChannelSpec(
+        type="a2a",
+        label="A2A（别的智能体来派任务）",
+        summary="起一个 A2A 服务端并注册到 registry（默认本机 OACP）；任务进同一个会话",
+        target="openthree.channels.a2a:A2aChannel",
+        fields=(
+            Field("registry", "registry",
+                  hint="registry 基址，默认 http://127.0.0.1:8000（本机 OACP）；"
+                       "也读环境变量 OPENTHREE_A2A_REGISTRY"),
+            Field("host", "host",
+                  hint="监听地址，默认 127.0.0.1；改成 0.0.0.0 则谁都能连（没有鉴权）"),
+            Field("port", "port",
+                  hint="监听端口。留空 = 自动挑（上次用过的优先，然后 9000-9999）；"
+                       "写死 = 只用这一个，被占直接报错 —— "
+                       "这也是让 registry 里的身份跨重启不变的唯一手段"),
+            Field("advertise", "advertise",
+                  hint="卡片里登记的地址基址，默认由 host/port 推导；"
+                       "跨机器注册时必填（registry 抓的是它自己眼里能到的地址）"),
+            Field("no_register", "no_register",
+                  hint="true = 不向 registry 注册，只当普通 A2A 服务端"),
+            Field("block_wait", "block_wait",
+                  hint="message/send 最多等几秒把答案直接带回响应，默认 45"
+                       "（缺省就等；调用方显式 blocking:false 才立刻回 ack；"
+                       "要小于对面客户端的超时，OACP 默认 60）"),
+        ),
+    ),
 }
 
 # 人类嘴里的写法与配置里的规范名不一定一致：`--type 钉钉` / `dingding` 都该认。
@@ -107,6 +137,9 @@ _ALIASES: Dict[str, str] = {
     "weixin": "wechat",
     "weixinbot": "wechat",
     "微信": "wechat",
+    # A2A / ADP：同一件事在协议文档里的两个名字，人嘴里会混着说
+    "adp": "a2a",
+    "agent2agent": "a2a",
 }
 
 

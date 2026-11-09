@@ -632,7 +632,7 @@ recall_memory(query="pytest")     # → 把写下的经验读回来
 设计上这是补上「能力可生长」闭环里断掉的一环：**写下的经验，只有被读回才有价值。**
 记忆与检索都不含任何硬编码智能——它们只是给模型的手，怎么用由模型决定。
 
-## 频道：把 openthree 接到微信 / 钉钉
+## 频道：把 openthree 接到微信 / 钉钉 / A2A
 
 `-i` 等的是**人敲字**，频道等的是**人发消息**。两者在智能体看来是同一件事：
 频道收到一句话就调一次 `Runtime.run()`，把 `doc["answer"]` 回到原会话 ——
@@ -654,21 +654,114 @@ openthree channel add --type dingtalk --name ding \
     --set client_id=你的AppKey --set client_secret=你的AppSecret
 ```
 
-### 两个渠道
+### 三个渠道
 
 | 类型 | 收消息 | 发消息 | 要准备什么 |
 | --- | --- | --- | --- |
 | `wechat` | iLink Bot 长轮询（`ilink/bot/getupdates`） | `ilink/bot/sendmessage` | 不用公网地址；首次启动把二维码**直接打在控制台**上，扫码即登录，token 落到 `.openthree/channels/<频道名>.json` |
 | `dingtalk` | 机器人 Stream 模式（WebSocket） | 官方下发的 `sessionWebhook` | 钉钉开放平台自建应用的 AppKey / AppSecret；同样不用公网地址 |
+| `a2a` | 本进程起的 A2A 服务端（JSON-RPC `POST /a2a`） | 写进对方那个 task 的 `artifacts` | 不用公网地址；`openthree -A2A` 一条命令，默认注册到本机 OACP |
 
-两者都只用标准库（`urllib` + 一个百余行的 WebSocket 客户端），**不新增任何依赖**；
-`type` 认别名：`dingding` / `钉钉` → `dingtalk`，`wx` / `微信` → `wechat`。
+三者都只用标准库（`urllib` + 一个百余行的 WebSocket 客户端 + `http.server`），
+**不新增任何依赖**；`type` 认别名：`dingding` / `钉钉` → `dingtalk`，
+`wx` / `微信` → `wechat`，`adp` / `agent2agent` → `a2a`。
 
 登录二维码不走「给你一个文件路径」那条路：`openthree/channels/_qr.py` 把服务端返回的
 PNG 解成模块矩阵，用半块字符（`█ ▀ ▄`）画在控制台上，手机对着终端就能扫。
 字符集按输出流编码自己退让 —— GBK 控制台有 `█` 却没有 `▀`、`▄`，就退成每行一个模块行；
 连方块字符都不认（`ascii`）时退成 `##`。PNG 仍旧落在
 `.openthree/channels/<频道名>-qrcode.png`，事后重扫 / 转发都用得上。
+
+### A2A：让别的智能体来派任务
+
+第三类频道的另一端不是人，是另一个智能体（或 OACP 面板）：
+
+```bash
+openthree -A2A                     # 起服务 + 注册到本机 OACP（http://127.0.0.1:8000）
+openthree -A2A --a2a-registry http://10.0.0.5:8000
+openthree -A2A --a2a-port 9000     # 钉死端口（理由见下「端口与身份」）
+openthree -A2A --a2a-no-register   # 只当服务端，不注册（调试 / 手写注册）
+openthree -A2A -i                  # 控制台与 A2A 并存（共用一个会话）
+```
+
+它做两件事：① 自己跑一个 A2A 服务端（`POST /a2a`，卡片在
+`/.well-known/agent-card.json`）；② 把**卡片地址**登记到 registry —— 交的是地址、
+不是卡片正文，registry 自己来抓。别的智能体提交的任务走 `Runtime.run()`，答案写进
+那个 task 的 `artifacts[].parts[].text`。
+
+**为什么必须自己起服务**：A2A 的 registry 从不发 A2A 请求，也没有任何角色替我们代理
+流量。只写一个 function 是收不到任务的（function 的生命周期是**一步**，而服务要活过
+整个进程），所以它是频道，不是工具。
+
+任务模型：`message/send` **要么把答案等回来，要么把答案送回去** —— 判据是「这个调用方
+拿得到答案吗」。**登记了回调地址**（内联 `configuration.pushNotificationConfig` 或事后
+`tasks/pushNotificationConfig/set`）→ 按 A2A 规范立刻回 `working`，答案稍后由我们 POST
+到那个地址；**没登记** → 最多等 `--a2a-block-wait` 秒（默认 45），等到了直接回
+`completed` + artifact，超过窗口回 `working`，任务继续跑，客户端可以 `tasks/get` 来取。
+显式写了 `configuration.blocking` 的一律照办。
+
+**为什么没登记时要等**（A2A 规范里 `blocking` 缺省是 `false`，这里故意不照它）：
+有的客户端收到 `working` 之后**再也不会问** —— OACP 面板的「刷新」只重读它自己的
+账本，`GetTask` 只在用户点按钮时才发一次。对这类调用方，答案不进这次响应就等于没有
+（实测：任务 5 秒跑完，面板上却永远「执行中」）。窗口必须**小于**对面客户端的超时
+（OACP 默认 60），否则会把一个一定能返回的 `working` 拖成对方眼里的连接超时。
+
+#### 回调：不用谁去刷新，结论自己送过去
+
+卡片宣告 `capabilities.pushNotifications: true`，于是支持它的客户端（比如 OACP）会把
+一个 `{url, token}` 递过来。任务到终态时我们**把整个 Task 对象 POST 到那个 url**，
+带 `X-A2A-Notification-Token`；body 就是 `tasks/get` 返回的同一份东西。这是 A2A 自己的
+push-notification 流程，不是我们发明的约定。
+
+- 两个入口都收：`message/send` 里内联，或 `tasks/pushNotificationConfig/set`
+  （1.x 叫 `CreateTaskPushNotificationConfig`）；另收 `get` / `delete`。
+- 只在**终态**发（`completed` / `failed` / `canceled`，含「服务退出」与「任务表挤出」）：
+  `working` 那一刻调用方手上已经有了，再推一遍只是多一次往返。
+- 投递在**另一条线程**上：接收端挂了也不会拖慢 `message/send` 的响应。单线程 FIFO，
+  同一个任务先后的结论按顺序送达。
+- 失败重试 4 次（退避 0.5/1/2 秒），只对 `5xx` / `429` / 连不上重试 —— 其余 `4xx` 是
+  对方明确拒收，重放没有意义。**不跟随重定向**（地址是对方给的，再让它链式改一次，
+  我们就成了替它打内网的跳板），响应正文最多读 4 KiB。
+- 地址必须是 `http(s)` 绝对地址，否则 `-32602` 当场拒 —— 静默收下一个永远送不到的
+  地址，等于承诺了「结果会送到」，而对方只会看到任务一直「执行中」。
+- token 只走请求头，**不进 Task 对象**：`tasks/get` 里搜不到它；日志里也不复述
+  （一次性 token 常常就是 URL 的一段）。
+
+两件要认的事：**地址是调用方给的**，它可以把我们指到任何 `http(s)` 地址 —— 内网部署
+下这就是它的用途，面向公网时请把它当成一条你需要知情的通道；**送不到就没有第二次
+机会**，重试用完仍失败时结论只在 `tasks/get` 里（日志会留一条「拒收 / 连不上」）。
+
+#### 端口与身份：自动挑，还是钉死
+
+- **不给 `--a2a-port`**：先试上次用过的端口，再按 9000→9999 依次 **bind**（不是
+  「先探测再绑定」—— 探测与绑定之间那条缝是必然的，多一个探测函数只是多一条缝）。
+- **给了 `--a2a-port`**：**就听这一个**，被占直接报错退出，绝不偷偷漂到下一个。
+  `channels.yaml` 里的 `port` 与它地位相同（都是「人写的值」）。
+
+钉死端口的真正理由是**身份**：registry 的 agent id 由卡片地址派生
+（`a_ + sha256(url)[:16]`），地址一变就是另一条记录。所以自动模式在正常重启时会复用
+上次端口（尽量不漂）、真漂了会把旧的连不上的那条删掉；**想让 id 长期不变的唯一手段
+是显式指定端口**。
+
+代价要认：端口变了就有可能在面板里看到**两条同名记录**。旧的删不掉时（401：token
+不是首注册者的）只能人工清理，新的那条才是活的。
+
+#### 三条要知道的限制（是设计，不是待办）
+
+1. **共享会话**：A2A 任务与你的控制台、钉钉共用同一个进程内会话 —— 远端可以用一句
+   提示让模型复述**本会话里最近的对话**，反之亦然。这是「频道与 `-i` 是同一件事」的
+   直接结果；默认只听 `127.0.0.1` 只是把面压小，**不等于隔离**。
+2. **串行**：所有任务与控制台共用一把锁，N 个任务排队，队尾会等很久（期间状态一直是
+   `working`）。
+3. **`tasks/cancel` 只是「不再等」**：ReAct 每一步都在等模型返回，没有中断点 ——
+   模型仍会把这一步跑完，结果只进日志、不进那个 task。
+
+另外：没有流式（`message/stream` 回 `-32601`）；任务表只在内存（重启后 `tasks/get`
+是 `-32001`）；没有鉴权（谁能连上谁能用；`--a2a-host 0.0.0.0` 时启动会打印警告，
+真需要鉴权请套反向代理）。
+
+**注册过 ≠ 可信**：卡片不做签名，registry 里没有任何东西能证明「这个 openthree 是
+我的」，能依赖的只有「那个地址是我自己填的」。
 
 ### 配置长什么样
 
@@ -689,6 +782,13 @@ channels:
       client_id: "..."
       client_secret: "..."
       require_mention: "true"     # 群聊里只回应 @ 了机器人的消息
+  - name: a2a
+    type: a2a
+    enabled: true
+    options:
+      registry: http://127.0.0.1:8000
+      # port 留空 = 自动挑（上次用过的优先，然后 9000-9999）；
+      # 写死 = 只听这一个，被占直接报错 —— 也是让 registry 里的 id 不变的办法
 ```
 
 启动时自动加载（`--no-channels` 关掉，`--only wx,ding` 只挑几个）。每个频道一条

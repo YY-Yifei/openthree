@@ -36,8 +36,8 @@ class InboundMessage:
     def label(self) -> str:
         """给人看的一行来源标注（会被拼进喂给智能体的那段文本）。"""
         who = self.user_name or self.user_id or "未知用户"
-        where = {"wechat": "微信", "dingtalk": "钉钉"}.get(self.channel_type,
-                                                          self.channel_type or "频道")
+        where = {"wechat": "微信", "dingtalk": "钉钉", "a2a": "A2A"}.get(
+            self.channel_type, self.channel_type or "频道")
         tag = self.channel or where
         return f"{where}[{tag}] {who}" if self.channel else f"{where} {who}"
 

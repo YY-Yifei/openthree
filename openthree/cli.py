@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -182,7 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="从对话档案 transcript.jsonl 续读最近 N 轮作为会话起点；"
                         "默认 0 = 不读盘，从零开始")
     p.add_argument("-d", "--daemon", action="store_true",
-                   help="后台常驻：**不再等控制台输入**，只等频道（微信 / 钉钉）消息，"
+                   help="后台常驻：**不再等控制台输入**，只等频道（微信 / 钉钉 / A2A）消息，"
                         "收到就当作一次用户输入跑 ReAct、把答案回到原会话。"
                         "频道来自 .openthree/channels.yaml（用 `openthree channel add` 生成）。"
                         "与任务参数互斥；Ctrl-C 退出")
@@ -190,6 +191,38 @@ def build_parser() -> argparse.ArgumentParser:
                    help="不自动加载频道（交互模式默认会加载 .openthree/channels.yaml 里启用的频道）")
     p.add_argument("--only", default=None, metavar="NAME[,NAME]",
                    help="只启动指定名字的频道（配合 -d / -i；默认全部启用项）")
+    # --- A2A 频道：`-A2A` 是**开关**，地址是另一个参数 ---
+    # 为什么不写成 `-A2A <url>`：主解析器里 `task` 是 `nargs="*"`，让它吃地址时
+    # `openthree -A2A 分析这个仓库` 会把**任务文本**当成 registry 地址收走 ——
+    # 用户看到的只是「任务凭空消失」。开关归开关、地址归地址，这条歧义就不存在。
+    p.add_argument("-A2A", "--a2a", action="store_true", dest="a2a",
+                   help="额外起一个 A2A 频道：本进程既是 A2A 服务端（POST /a2a，"
+                        "卡片在 /.well-known/agent-card.json），又把自己注册到 registry"
+                        "（默认本机 OACP http://127.0.0.1:8000）。别的智能体提交的任务"
+                        "会像频道消息一样进同一个会话。**只对本进程生效**（不写 "
+                        "channels.yaml）；终端下等价于「交互模式 + A2A」，非终端等价于 -d")
+    p.add_argument("--a2a-registry", default=None, metavar="URL",
+                   help="A2A registry 基址，默认 http://127.0.0.1:8000；"
+                        "也读环境变量 OPENTHREE_A2A_REGISTRY")
+    p.add_argument("--a2a-host", default=None, metavar="ADDR",
+                   help="A2A 监听地址，默认 127.0.0.1（只听本机）。"
+                        "改成 0.0.0.0 则任何能连到这台机器的人都能让它执行任务（没有鉴权）")
+    p.add_argument("--a2a-port", type=int, default=None, metavar="PORT",
+                   help="A2A 监听端口。**给了就用这一个**：被占直接报错退出，不会自动换一个"
+                        "（这也是让 registry 里的 agent id 跨重启不变的唯一手段）；"
+                        "不给则先复用上次用过的端口，再不行从 9000-9999 里依次试")
+    p.add_argument("--a2a-advertise", default=None, metavar="URL",
+                   help="卡片里登记的地址基址，默认由 host/port 推导。"
+                        "跨机器注册时必填 —— registry 抓的是「它自己眼里的地址」，"
+                        "卡片写 127.0.0.1 而它在别处时必然抓不到")
+    p.add_argument("--a2a-no-register", action="store_true",
+                   help="不向 registry 注册，只当普通 A2A 服务端（调试 / 手写注册）")
+    p.add_argument("--a2a-block-wait", type=float, default=None, metavar="SEC",
+                   help="message/send 最多等几秒，把答案直接放进这个响应里（默认 45）。"
+                        "缺省就等：不轮询的客户端（OACP 面板）否则永远只看到 working；"
+                        "调用方显式 blocking:false 时立刻回 ack。"
+                        "必须**小于**对面客户端的超时（OACP 默认 60），"
+                        "否则会把一个一定能返回的 working 拖成对方眼里的连接超时")
     p.add_argument("-u", "--upgrade", action="store_true",
                    help="升级模式：扫描当前项目的 .openthree/ 相对**本机已装内核**的漂移"
                         "（缺 / 旧 / 不合规），打印清单，然后进入交互会话 —— 由模型逐条给"
@@ -251,6 +284,31 @@ def main(argv=None) -> int:
         print("[错误] -u 与 --init 互斥：--init 只铺工作区，-u 要读工作区。", file=sys.stderr)
         return 2
 
+    # --- A2A 频道（`-A2A`）的冲突校验 ---
+    # 它开的是一个**常驻服务**：既不是一次性任务，也不能和「做完某件事就退出」的那几个
+    # 开关共存。放在这里（起 Runtime 之前、`-u --check` 之前）有两个理由：这些冲突一个
+    # 都不需要工作区，而 `Runtime.__init__` 会 `ws.init()` 写盘；并且 `-u --check` 会更早
+    # 返回，放在它后面就等于写了个永远走不到的分支。
+    if not args.a2a and (args.a2a_registry is not None or args.a2a_host is not None
+                         or args.a2a_port is not None or args.a2a_advertise is not None
+                         or args.a2a_block_wait is not None or args.a2a_no_register):
+        print("[错误] 给了 --a2a-* 参数却没有 -A2A —— 它们只喂给 A2A 频道，"
+              "不加 -A2A 等于没写。", file=sys.stderr)
+        return 2
+    if args.a2a:
+        if " ".join(args.task).strip() or _collect_images(args):
+            print("[错误] -A2A 不接受任务 / 图片参数 —— 它开的是一个常驻服务，"
+                  "任务由别的智能体提交进来。要跑一次性任务就去掉 -A2A。", file=sys.stderr)
+            return 2
+        if args.init or args.report or args.inspect or args.functions or args.upgrade:
+            print("[错误] -A2A 与 --init / --report / --inspect / --functions / -u 互斥。",
+                  file=sys.stderr)
+            return 2
+        if args.no_channels:
+            print("[错误] -A2A 与 --no-channels 互斥 —— --no-channels 会把 A2A 频道也关掉。",
+                  file=sys.stderr)
+            return 2
+
     # -u --check：只扫描、只打印、退出。**不调模型、不写任何文件** ——
     # 所以它必须走在 Runtime 构造之前：Runtime.__init__ 会 ws.init() 落盘。
     if args.upgrade and args.check:
@@ -290,6 +348,8 @@ def main(argv=None) -> int:
         profiles=profiles,
     )
 
+    # --- A2A 频道（`-A2A`）的前置校验（已上移到 Runtime 之前，见上） ---
+
     if args.init:
         print(f"[ok] 工作区已就绪 {rt.ws.dir}")
         print(rt.self_inspect())
@@ -307,6 +367,13 @@ def main(argv=None) -> int:
     if args.functions:
         print(rt.registry.digest())
         return 0
+
+    # `-A2A` 在终端里 = 交互模式 + A2A 频道；**不走交互**时 = `-d`（非终端 / 管道 /
+    # CI / `--no-interactive` / `--auto` / `--resume`），否则它会掉进「单次任务」那条
+    # 路 —— 服务压根没起来，用户只看到「没有任务」。判据与主流程共用
+    # `_wants_interactive()`，两处不会漂。
+    if args.a2a and not args.daemon and not _wants_interactive(args):
+        args.daemon = True
 
     # --- 后台常驻：只等频道输入 ---
     # 它和「跑一个任务」是两种东西：任务有终点，频道没有。所以先拦住任何任务参数，
@@ -357,14 +424,11 @@ def main(argv=None) -> int:
     # 不带参数 = 进交互模式（-i 是默认模式）。前提是有人在键盘边：stdin 不是终端
     # （管道 / CI / 脚本）时 REPL 会立刻 EOF、什么也不做就退出，所以那种情况走单次。
     # 显式 -i 不受此限；--no-interactive 强制走单次。
-    if (args.interactive
-            or (not args.no_interactive
-                and not task and not images
-                and args.auto <= 0 and args.resume <= 0
-                and _stdin_is_tty())):
+    if _wants_interactive(args):
         return _interactive(rt, task, args.append, images, auto=args.auto,
                             resume=args.resume, only=args.only,
-                            no_channels=args.no_channels, quiet=args.quiet)
+                            no_channels=args.no_channels, quiet=args.quiet,
+                            channels_extra=_a2a_extra(args) if args.a2a else None)
 
     if not task and not rt.ws.has_task() and not images:
         _print_banner(rt)
@@ -514,7 +578,8 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
                  first_images: Optional[list] = None, auto: int = 0,
                  resume: int = 0, upgrade: bool = False,
                  dry_run: bool = False, only: Optional[str] = None,
-                 no_channels: bool = False, quiet: bool = False) -> int:
+                 no_channels: bool = False, quiet: bool = False,
+                 channels_extra: Optional[list] = None) -> int:
     _force_utf8()
     _print_banner(rt)
     # 交互模式 = 一个进程内会话：逐轮累积、跨轮可见，退出即忘。
@@ -528,13 +593,29 @@ def _interactive(rt: Runtime, first_task: str, append: bool,
 
         bridge = AgentBridge(rt, echo=not quiet)
         try:
-            channels_mgr = load_manager(rt.ws, bridge, only=_split_channel_names(only))
+            channels_mgr = load_manager(rt.ws, bridge, only=_split_channel_names(only),
+                                        extra=channels_extra or ())
+            for note in channels_mgr.notes:
+                print(f"[频道] {note}", flush=True)
         except Exception as exc:  # noqa: BLE001 - 频道配坏了不该挡住控制台
+            if channels_extra:        # `-A2A`：这不是「忽略」两个字能交代过去的
+                print(f"[错误] 读取频道配置失败：{exc}", file=sys.stderr)
+                rt.end_session()
+                return 2
             print(f"[频道] 配置读取失败（忽略）：{exc}")
+        if channels_mgr is not None and channels_extra and not _a2a_started(channels_mgr):
+            print(_a2a_not_started(channels_mgr), file=sys.stderr)
+            rt.end_session()
+            return 2
         if channels_mgr is not None and channels_mgr.statuses:
             channels_mgr.start()
             print(f"[频道] 已启动 {len(channels_mgr.statuses)} 个："
                   f"{', '.join(channels_mgr.active)}（消息进来就像一行用户输入）")
+            # 装配上了 ≠ 起来了：A2A 的 socket 在频道线程里才 bind，端口被占是
+            # start() 之后才知道的。不报这一句，用户会以为服务在跑（REPL 还在）。
+            a2a_error = _a2a_error(channels_mgr)
+            if a2a_error:
+                print(f"[错误] A2A 频道没起来：{a2a_error}", file=sys.stderr)
         elif channels_mgr is not None and channels_mgr.skipped:
             print("[频道] 未启动：\n" + "\n".join(f"  - {s}" for s in channels_mgr.skipped))
 
@@ -675,6 +756,98 @@ def _split_channel_names(raw) -> Optional[list[str]]:
     return names or None
 
 
+# 频道类型名，也是 `-A2A` 注入时用的默认频道名。
+_A2A_NAME = "a2a"
+
+
+def _a2a_extra(args) -> list:
+    """把 `-A2A` 那一组参数收成一条频道配置（**只在本进程内存里**，不落盘）。
+
+    没给的键**不写进 options**：空值等于「用实现里的默认」（`Channel.option(key,
+    default)`），默认值只住在 `channels/a2a.py` 的模块常量里一份。
+    """
+    from .channels.config import ChannelConfig
+
+    opts: dict[str, str] = {}
+    if args.a2a_registry:
+        opts["registry"] = str(args.a2a_registry)
+    if args.a2a_host:
+        opts["host"] = str(args.a2a_host)
+    if args.a2a_port is not None:
+        opts["port"] = str(args.a2a_port)
+    if args.a2a_advertise:
+        opts["advertise"] = str(args.a2a_advertise)
+    if args.a2a_no_register:
+        opts["no_register"] = "true"
+    if args.a2a_block_wait is not None:
+        opts["block_wait"] = str(args.a2a_block_wait)
+    return [ChannelConfig(name=_A2A_NAME, type=_A2A_NAME, options=opts)]
+
+
+def _a2a_started(mgr) -> bool:
+    """A2A 频道是否真的装进了 manager —— 按**频道类型**判，不按名字猜。
+
+    名字是会被改的：`channels.yaml` 里那条 `type: a2a` 的频道可能叫 `bot`，
+    而 `apply_extra()` 撞名时会把注入的 `a2a` 改成 `a2a-2`。按字面名判会出现两种
+    相反的错：该起的时候报错、该报错的时候静默不起。
+    """
+    return any(st.config.type == _A2A_NAME for st in mgr.statuses)
+
+
+def _a2a_not_started(mgr) -> str:
+    return ("[错误] -A2A 要求 A2A 频道起来，但它没有启动：\n"
+            + mgr.skip_summary()
+            + f"\n（`--only` 按**频道名**过滤；用 `openthree channel list` 看它的名字。）")
+
+
+def _a2a_error(mgr, *, wait: float = 2.0) -> str:
+    """A2A 频道**启动之后**的错误（空串 = 没出事）。
+
+    与 `_a2a_started` 分工不同：那个判「有没有装进 manager」，两个调用点都在
+    `mgr.start()` **之前**；这个判「装进去之后真的起来了没有」。
+
+    **必须等**：`start()` 只是起了线程，`A2aChannel.run()` 里的 bind 在线程里才发生
+    —— 刚 `start()` 完就查 `Status.error`，那一刻它几乎一定是空的，于是「端口被占」
+    也会被报成「已启动」。等的是「有错」或「端口已绑定」这两个事实之一，不是固定睡眠：
+    成功时几毫秒就返回，失败也在异常落到 `Status.error` 时立刻返回。
+
+    **没有 A2A 频道时立刻返回**：调用点 `start()` 之后无条件调它，而绝大多数会话只有
+    钉钉 / 微信 —— 那种情况下这里没有任何东西可等，空转两秒等于让每个普通频道启动都
+    白白慢两秒。
+    """
+    a2a = [st for st in mgr.statuses if st.config.type == _A2A_NAME]
+    if not a2a:
+        return ""
+    deadline = time.monotonic() + max(0.0, wait)
+    while True:
+        for st in a2a:
+            if st.error:
+                return st.error
+            channel = st.channel
+            if channel is not None and getattr(channel, "port", 0):
+                return ""          # 已经 bind 上了
+        if time.monotonic() >= deadline:
+            return ""
+        time.sleep(0.05)
+
+
+def _wants_interactive(args) -> bool:
+    """这次会不会进交互模式？
+
+    同一个判据有两处读它：主流程的默认分支，以及 `-A2A`（**不走交互就必须走 `-d`**，
+    否则服务根本没起来）。抽出来是为了两边不会漂 —— 它曾经漂过：`-A2A --auto 3`
+    在终端里既不进交互也不进 `-d`，掉进「单次任务」那条路，`-A2A` 被静默忽略。
+    """
+    return bool(
+        args.interactive
+        or (not args.no_interactive
+            and not " ".join(args.task).strip()
+            and not _collect_images(args)
+            and args.auto <= 0 and args.resume <= 0
+            and _stdin_is_tty())
+    )
+
+
 def _daemon(rt: Runtime, args) -> int:
     """后台常驻：启动频道，只等它们把消息送进来。
 
@@ -685,10 +858,16 @@ def _daemon(rt: Runtime, args) -> int:
     from .channels import AgentBridge, load_manager
 
     bridge = AgentBridge(rt, echo=not args.quiet)
+    extra = _a2a_extra(args) if args.a2a else ()
     try:
-        mgr = load_manager(rt.ws, bridge, only=_split_channel_names(args.only))
+        mgr = load_manager(rt.ws, bridge, only=_split_channel_names(args.only), extra=extra)
     except Exception as exc:  # noqa: BLE001 - 配置坏了要给出可操作的提示
         print(f"[错误] 读取频道配置失败：{exc}", file=sys.stderr)
+        return 2
+    for note in mgr.notes:
+        print(f"[频道] {note}", flush=True)
+    if extra and not _a2a_started(mgr):
+        print(_a2a_not_started(mgr), file=sys.stderr)
         return 2
 
     if not mgr.statuses:
@@ -700,19 +879,29 @@ def _daemon(rt: Runtime, args) -> int:
 
     _print_banner(rt)
     rt.begin_session()
+    code = 0
     try:
         mgr.start()
         print(f"[频道] 已启动 {len(mgr.statuses)} 个：{', '.join(mgr.active)}")
         print("[频道] 后台运行中 —— 不再读控制台输入，Ctrl-C 退出。\n", flush=True)
+        a2a_error = _a2a_error(mgr)
+        if a2a_error:
+            print(f"[频道] A2A 没起来：{a2a_error}", file=sys.stderr)
+            # 只有它一个频道时没有别的可等，直接按失败退出（脚本要能判出来）。
+            # 与别的频道并存时继续等它们，但错误已经说到 stderr 上了。
+            if len(mgr.statuses) == 1:
+                return 1
         error = mgr.wait()
         if error:
+            # 非零：端口被占 / 频道起不来，脚本与 CI 要能判出来
             print(f"[频道] 有频道异常退出：{error}", file=sys.stderr)
+            code = 1
     except KeyboardInterrupt:
         print("\n[频道] 收到中断，正在退出…")
     finally:
         mgr.stop()
         rt.end_session()
-    return 0
+    return code
 
 
 def _split_image_arg(raw: str) -> list:

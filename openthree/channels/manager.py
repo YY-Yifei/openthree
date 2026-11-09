@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Sequence
 
 from .base import Channel
 from .config import ChannelConfig, ChannelsConfig, config_path, spec_for
@@ -81,6 +81,9 @@ class ChannelManager:
         self.only = [n for n in (only or []) if n]
         self.statuses: List[Status] = []
         self.skipped: List[str] = []
+        # 装配期要说给用户听的话（例如「命令行换掉了配置里的频道」）——
+        # 由命令行打印，manager 自己不 print。
+        self.notes: List[str] = []
 
     # --- 装配 ---------------------------------------------------------
     def build(self) -> "ChannelManager":
@@ -89,6 +92,10 @@ class ChannelManager:
         self.skipped = []
         for cfg in self.config.channels:
             if self.only and cfg.name not in self.only:
+                # 不静默跳过：`--only` 与「命令行明确要求某个频道」是可能冲突的，
+                # 而冲突时最糟的结果是「服务看起来起来了，其实那个频道没起」。
+                # 记进 skipped，调用方（cli 的 -A2A）据此报错。
+                self.skipped.append(f"{cfg.name}：被 --only 排除")
                 continue
             if not cfg.enabled:
                 self.skipped.append(f"{cfg.name}：已停用（enabled: false）")
@@ -181,18 +188,64 @@ class ChannelManager:
     # --- 便捷构造 -----------------------------------------------------
     @classmethod
     def from_workspace(cls, ws: Any, bridge: Any, *, only: Optional[List[str]] = None,
-                       echo: bool = True) -> "ChannelManager":
-        """读工作区里的 `channels.yaml` 并装配（不启动）。"""
+                       echo: bool = True,
+                       extra: Sequence[ChannelConfig] = ()) -> "ChannelManager":
+        """读工作区里的 `channels.yaml` 并装配（不启动）。
+
+        `extra` 是**本进程的**注入（`openthree -A2A` 就是这么来的）：它只改内存里的
+        这份配置，一个字节都不落盘。同一进程里两个 a2a 频道会各自抢一个端口、各自
+        把自己注册成一条记录 —— 同一份任务入口被注册成两条，比报错更难查 ——
+        所以注入项**替换**同类型的条目，而不是追加。
+        """
         cfg = ChannelsConfig.load(config_path(ws.dir))
+        notes = apply_extra(cfg, extra)
         mgr = cls(cfg, bridge=bridge, workspace_dir=ws.dir, echo=echo, only=only)
+        mgr.notes = notes
         mgr.build()
         return mgr
 
 
+def apply_extra(cfg: ChannelsConfig,
+                extra: Sequence[ChannelConfig]) -> List[str]:
+    """把注入的频道并进配置，返回要说给用户听的话（不落盘）。
+
+    替换的是**条目**，字段级则是「命令行给了的覆盖、没给的沿用配置」：配置文件是
+    持久真源，它写过的 `registry` / `host` 不该因为这次 `-A2A` 没重复说一遍就消失；
+    而 `-A2A` 说过的值必须是这次的值。
+    """
+    notes: List[str] = []
+    for item in extra:
+        same = [c for c in cfg.channels if c.type == item.type]
+        if same:
+            existing = same[0]
+            merged = dict(existing.options)
+            merged.update(item.options)
+            cfg.add(ChannelConfig(name=existing.name, type=item.type, enabled=True,
+                                  options=merged), replace=True)
+            if len(same) > 1:
+                # 同一类型两个频道会各占一个端口、各注册一条记录 —— 那正是
+                # `from_workspace` 要去掉的失败形态。只替换第一个，剩下的照样启动，
+                # 等于「注入了 A2A，同时又多起了一个 A2A」。
+                for dup in same[1:]:
+                    cfg.remove(dup.name)
+                notes.append(f"配置里有 {len(same)} 个 {item.type} 频道，"
+                             f"只保留 {existing.name!r} 一个")
+            notes.append(f"命令行替换了配置里的频道 {existing.name!r}（{item.type}），未落盘")
+            continue
+        name = item.name
+        if cfg.get(name) is not None:      # 同名但不同类型：别顶掉别人的频道
+            name = cfg.unique_name(name)
+            notes.append(f"频道名 {item.name!r} 已被占用，本次注入改用 {name!r}")
+        cfg.add(ChannelConfig(name=name, type=item.type, enabled=True,
+                              options=dict(item.options)))
+    return notes
+
+
 def load_manager(ws: Any, bridge: Any, *, only: Optional[List[str]] = None,
-                 echo: bool = True) -> ChannelManager:
+                 echo: bool = True,
+                 extra: Sequence[ChannelConfig] = ()) -> ChannelManager:
     """`ChannelManager.from_workspace` 的函数式别名（cli 里读起来短一点）。"""
-    return ChannelManager.from_workspace(ws, bridge, only=only, echo=echo)
+    return ChannelManager.from_workspace(ws, bridge, only=only, echo=echo, extra=extra)
 
 
 def has_configured_channels(ws: Any) -> bool:
@@ -211,5 +264,5 @@ def describe_config(ws: Any) -> str:  # pragma: no cover - 仅调试用
 
 __all__ = [
     "ChannelManager", "ChannelManagerError", "Status", "instantiate",
-    "load_manager", "has_configured_channels", "describe_config",
+    "load_manager", "has_configured_channels", "describe_config", "apply_extra",
 ]

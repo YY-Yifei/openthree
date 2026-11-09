@@ -23,9 +23,15 @@ from .base import InboundMessage
 # 一条消息在队列里可以等多久（秒）；超时说明智能体被别的活占住了
 DEFAULT_QUEUE_TIMEOUT = 3600.0
 
+# bridge 自己塞给用户的话（**不是**模型的结论）统一以这个前缀开头。
+# 它是一条**文案**约定（让人一眼看出这不是答案），不是判定依据：频道层判的是
+# 桥留下的带外标记 `msg.raw["notice"]`（见 `_reply_quietly`）—— 前缀能被模型
+# 原样说出来，标记不能。
+NOTICE_PREFIX = "[openthree] "
+
 # 收工时还排在队列里的消息，会被回这样一句 —— 不是静默丢弃：
 # 发消息的人该知道「要重发」，而不是盯着对话框等一个永远不来的回答。
-SHUTDOWN_NOTICE = "[openthree] 正在退出，这条消息没有处理，请稍后重发。"
+SHUTDOWN_NOTICE = NOTICE_PREFIX + "正在退出，这条消息没有处理，请稍后重发。"
 
 
 def compose_input(msg: InboundMessage) -> str:
@@ -139,7 +145,7 @@ class AgentBridge:
             except Exception as exc:  # noqa: BLE001 - 发送失败不该杀死工作线程
                 print(f"[频道] 回复发送失败（{msg.label()}）：{exc}", flush=True)
         except Exception as exc:  # noqa: BLE001 - 智能体出错也只影响这一条
-            self._reply_quietly(msg, reply, f"[openthree] 这条消息没跑通：{exc}")
+            self._reply_quietly(msg, reply, f"{NOTICE_PREFIX}这条消息没跑通：{exc}")
         finally:
             with self._pending_lock:
                 self._pending = max(0, self._pending - 1)
@@ -167,7 +173,17 @@ class AgentBridge:
     @staticmethod
     def _reply_quietly(msg: InboundMessage,
                        reply: Callable[[InboundMessage, str], None], text: str) -> None:
-        """回一句就走 —— 发不出去也不能挡住收工。"""
+        """回一句就走 —— 发不出去也不能挡住收工。
+
+        这句话**不是模型的结论**，所以在消息上留一个带外标记（`raw["notice"]`）：
+        频道层据此把它记成「没跑成」，而不是一次"成功"的空回答。光看文本前缀不够
+        —— 模型完全可能把 `[openthree] ` 当作答案的开头（比如它正在解释这个前缀）。
+        """
+        try:
+            if isinstance(msg.raw, dict):
+                msg.raw["notice"] = text
+        except Exception:  # noqa: BLE001 - 标记写不上也不该挡住回复
+            pass
         try:
             reply(msg, text)
         except Exception:  # noqa: BLE001
