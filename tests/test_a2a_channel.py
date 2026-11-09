@@ -35,8 +35,9 @@ from urllib.parse import urlsplit
 import pytest
 
 from openthree.channels import a2a as a2a_mod
-from openthree.channels.a2a import (CARD_PATH, MAX_BODY_BYTES, RPC_PATH, A2aChannel,
-                                    A2aError, build_card, message_text)
+from openthree.channels.a2a import (CARD_PATH, DEFAULT_CARD_DESCRIPTION, MAX_BODY_BYTES,
+                                    RPC_PATH, A2aChannel, A2aError, build_card,
+                                    message_text)
 from openthree.channels.base import InboundMessage
 from openthree.channels.bridge import NOTICE_PREFIX, SHUTDOWN_NOTICE, AgentBridge
 from openthree.channels.config import ChannelConfig, ChannelsConfig
@@ -162,6 +163,30 @@ def test_card_name_follows_identity_json(tmp_path):
     # 每次 GET 现读：改名之后下一次探测就看到新的名字
     (ws_dir / "identity.json").write_text(json.dumps({"name": "新名字"}), encoding="utf-8")
     assert ch.card()["name"] == "新名字"
+
+
+def test_card_description_follows_motto(tmp_path):
+    """description 是智能体对自己的定义：写了格言就用格言，没写才说内核能干什么。
+
+    与名字同一条读取路径，所以「改格言」与「改名」一样，下一次 GET 就生效，
+    不需要重启频道；格言被清掉时回退固定说明，卡片上永远不出现空 description。
+    """
+    ws_dir = tmp_path / ".openthree"
+    ws_dir.mkdir(parents=True)
+    ch = _channel(tmp_path)
+    ch._load_options()
+    ch.card_url = "http://127.0.0.1:9000/a2a"
+    assert ch.card()["description"] == DEFAULT_CARD_DESCRIPTION
+    (ws_dir / "identity.json").write_text(
+        json.dumps({"name": "O3", "motto": "openthree 开发者"}), encoding="utf-8")
+    assert ch.card()["description"] == "openthree 开发者"
+    (ws_dir / "identity.json").write_text(
+        json.dumps({"name": "O3", "motto": "第二句格言"}), encoding="utf-8")
+    assert ch.card()["description"] == "第二句格言"
+    # `set_identity("O3")` 不带 motto 会把格言清成 null —— 这时卡片要说回兜底文案
+    (ws_dir / "identity.json").write_text(
+        json.dumps({"name": "O3", "motto": None}), encoding="utf-8")
+    assert ch.card()["description"] == DEFAULT_CARD_DESCRIPTION
 
 
 def test_inbound_label_says_a2a():

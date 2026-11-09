@@ -64,6 +64,11 @@ CARD_PATH = "/.well-known/agent-card.json"
 RPC_PATH = "/a2a"
 PROTOCOL_VERSION = "0.3.0"
 USER_AGENT = f"openthree-a2a/{__version__}"
+# 卡片 description 的兜底。写了格言（`set_identity(name, motto=…)`）就用格言 ——
+# 那是智能体对自己的定义；没写就说内核能干什么。两种都不是空话，卡片上永远
+# 不该出现空 description（registry 与人类面板都靠它认人）。
+DEFAULT_CARD_DESCRIPTION = (
+    "openthree 内核上的智能体：接一条自然语言任务，跑完把结论写进 artifact。")
 
 MAX_BODY_BYTES = 1 << 20        # 1 MiB：入站请求的硬闸
 SOCKET_TIMEOUT = 15.0           # 单连接读写超时（别让一个哑连接占着线程）
@@ -380,7 +385,8 @@ def message_text(message: Any) -> str:
     return "\n\n".join(c.strip() for c in chunks if c.strip())
 
 
-def build_card(*, name: str, url: str, version: str = __version__) -> Dict[str, Any]:
+def build_card(*, name: str, url: str, version: str = __version__,
+               motto: str = "") -> Dict[str, Any]:
     """构造 AgentCard。
 
     两拨人要同时喂饱：ADP 严格校验要 `supportedInterfaces` 非空、`capabilities`
@@ -397,10 +403,14 @@ def build_card(*, name: str, url: str, version: str = __version__) -> Dict[str, 
     接口**（"你能让它干什么"），不是实现里的工具清单 —— 把自造 functions 塞进去
     等于把本机提示词与工具名广播到 registry，还会随每次 `write_function` 抖一次
     `cardHash`。
+
+    `description` 取自智能体自己的**格言**（`identity.json` 的 `motto`）：那是它
+    对自己的定义，比一句通用的内核说明更像「这个 agent 是谁」。没写格言时回退
+    `DEFAULT_CARD_DESCRIPTION` —— 卡片是公开物，不该出现空 description。
     """
     return {
         "name": name or "openthree",
-        "description": "openthree 内核上的智能体：接一条自然语言任务，跑完把结论写进 artifact。",
+        "description": (motto or "").strip() or DEFAULT_CARD_DESCRIPTION,
         "version": version,
         "protocolVersion": PROTOCOL_VERSION,
         "url": url,
@@ -868,19 +878,36 @@ class A2aChannel(Channel):
         return urlunsplit((parts.scheme, netloc, parts.path.rstrip("/"), "", ""))
 
     # --- 卡片 ---------------------------------------------------------
-    def display_name(self) -> str:
-        """读 `identity.json` 里的名字（每次现读）—— 智能体自己改名后，下一次
-        registry 探测就会看到 `cardHash` 变化，这正是 ADP 的 `changedAt` 为之准备的。"""
+    def _identity_field(self, key: str) -> str:
+        """读 `identity.json` 里的一个字段（每次现读）。
+
+        名字与格言共用这一条路径：两者都进卡片，读法分叉就会让「改名立刻生效、
+        改格言要等重启」这类不一致长出来。文件缺失 / 损坏 / 字段类型不对一律
+        回退空串，由调用方决定兜底。
+        """
         root = Path(self.workspace_dir) if self.workspace_dir else Path(".openthree")
         try:
             doc = json.loads((root / "identity.json").read_text(encoding="utf-8"))
-            name = _as_text(_as_dict(doc).get("name"))
-        except Exception:  # noqa: BLE001 - 没名字 / 文件坏了都只是「还没起名」
-            name = ""
-        return name or "openthree"
+            return _as_text(_as_dict(doc).get(key))
+        except Exception:  # noqa: BLE001 - 没写 / 文件坏了都只是「还没起名」
+            return ""
+
+    def display_name(self) -> str:
+        """读 `identity.json` 里的名字（每次现读）—— 智能体自己改名后，下一次
+        registry 探测就会看到 `cardHash` 变化，这正是 ADP 的 `changedAt` 为之准备的。"""
+        return self._identity_field("name") or "openthree"
+
+    def display_motto(self) -> str:
+        """读 `identity.json` 里的格言（每次现读）—— 它就是卡片的 `description`。
+
+        没写格言时返回空串，兜底交给 `build_card`（回落到 `DEFAULT_CARD_DESCRIPTION`）：
+        「谁定的」只该有一处真源，这里不重复那份文案。
+        """
+        return self._identity_field("motto")
 
     def card(self) -> Dict[str, Any]:
-        return build_card(name=self.display_name(), url=self.card_url)
+        return build_card(name=self.display_name(), motto=self.display_motto(),
+                          url=self.card_url)
 
     # --- 生命周期 -----------------------------------------------------
     def run(self) -> None:

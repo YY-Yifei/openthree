@@ -109,14 +109,14 @@ A2A 完全落在这条判据之内：
 ```json
 {
   "name": "<工作区 identity.json 里的名字，没有则 openthree>",
-  "description": "openthree 内核上的智能体：接一条自然语言任务，跑完给结论。",
+  "description": "<工作区 identity.json 里的格言 motto；没写则回退成固定说明>",
   "version": "<openthree.__version__>",
   "protocolVersion": "0.3.0",
   "url": "http://127.0.0.1:9000/a2a",
   "supportedInterfaces": [
     {"url": "http://127.0.0.1:9000/a2a", "protocolBinding": "JSONRPC", "protocolVersion": "0.3.0"}
   ],
-  "capabilities": {"streaming": false, "pushNotifications": false},
+  "capabilities": {"streaming": false, "pushNotifications": true},
   "defaultInputModes": ["text/plain"],
   "defaultOutputModes": ["text/plain"],
   "skills": [
@@ -136,9 +136,12 @@ A2A 完全落在这条判据之内：
    （`client.py:33-36`、`293-316`）：0.3 发 `message/send` + `role:"user"` +
    `parts:[{"kind":"text"}]`。选 0.3 而不是 1.x，是因为 1.x 的 proto 形状
    在野环境里更少、且我们的响应一律回 0.3 形状（见 §3.4）。
-3. **`name` 每次 GET 现读 `identity.json`。** 智能体用 `set_identity` 改名后，
-   下一轮 registry 探测就会看到 `cardHash` 变化（ADP 的 `changedAt` / `prevHash`
-   正是为这种漂移准备的）。一次小文件读，换「它被别人看见的名字就是它自己的名字」。
+3. **`name` 与 `description` 每次 GET 现读 `identity.json`。** 名字取 `name`，
+   `description` 取 `motto`（格言）—— 那是智能体对自己的定义；没写格言时回退
+   固定说明（`DEFAULT_CARD_DESCRIPTION`），卡片上不出现空 description。两者共用
+   一条读取路径，所以改格言与改名一样，下一轮 registry 探测就会看到 `cardHash`
+   变化（ADP 的 `changedAt` / `prevHash` 正是为这种漂移准备的）。一次小文件读，
+   换「它被别人看见的名字就是它自己的名字」。
 4. **`skills` 写死一条，是有意的。** 卡片暴露的是**对外的接口**（"你能让它干什么"），
    不是**实现里的工具清单**。把自造 functions 的清单塞进卡片，等于把本机的
    提示词与工具名广播到公网 registry，还会随每次 `write_function` 抖一次 `cardHash`。
