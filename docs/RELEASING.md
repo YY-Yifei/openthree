@@ -10,12 +10,12 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.6.1`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.6.1`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.7.0`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.7.0`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
-| 元数据 | `twine check` ✓ 两个 PASSED（0.6.1 产物） |
+| 元数据 | `twine check` ✓ 两个 PASSED（0.7.0 产物） |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄）；`recursive-include docs *.md` 按**磁盘**收集而非 git，未跟踪的废案靠 `MANIFEST.in` 里显式 `exclude` 挡住 |
-| 测试 | 655 passed（仓库根，0.6.1 实跑） |
+| 测试 | 755 passed（仓库根，0.7.0 实跑） |
 | 依赖 | `PyYAML>=6.0`、`json_repair>=0.30` —— **`openai` 已移除**：LLM 传输由 `openthree/llm.py` 用标准库 `http.client` 实现，于是 `pydantic` / `pydantic-core`（Rust）/ `httpx` / `anyio` 都不再进入依赖树；频道层同样只用标准库 |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
@@ -631,6 +631,40 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
   的退出码取管道末条，pip 的失败会被后面的 `&&` 吞掉，验收安装必须让 pip 自己说话。
 
 
+### 0.7.0 实跑记录（2026-11-09）
+
+本版内容：**A2A 频道**（服务端 + registry 注册 + 执行结果回调）与**卡片 description 取智能体格言**。
+
+- 频道层只用标准库（`_http.py` / `_ws.py` / `_qr.py` 等），依赖树与 0.6.1 一致。
+- AgentCard 的 `name` 与 `description` 共用 `A2aChannel._identity_field`，每次 GET 现读
+  `identity.json`：`name` 取名字，`description` 取格言 `motto`；没写格言时回落
+  `DEFAULT_CARD_DESCRIPTION`，卡片上不出现空 description。
+- 测试数 655 → **755**（新增 `tests/test_a2a_channel.py` 与一条格言用例）。
+
+验收（仓库根实跑）：
+
+- `pyproject.toml` / `openthree/__init__.py:__version__` / `import openthree` 三处均为 `0.7.0` ✓
+- 全量 pytest → **755 passed / 0 failed**（120.46s）✓
+- `python -m build` → `openthree-0.7.0-py3-none-any.whl`（316,340 B） +
+  `openthree-0.7.0.tar.gz`（682,887 B）（先清空 `dist/` 与 `openthree.egg-info`）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist **109 项**，越界路径 0 项（无 `.openthree/`、`config.yaml`、`api_key`、
+  `identity.json`、`limits.json`、`memory.jsonl`）；102 个文件与 `git ls-files` 比对
+  未跟踪 0 项 ✓
+
+**升级提示**：A2A 是**新增频道，默认不启用**（要显式配 `channels.a2a`），既有默认行为无变化。
+
+- **上传**：`twine upload --non-interactive --disable-progress-bar` 一次成功 →
+  <https://pypi.org/project/openthree/0.7.0/> ✓（凭据来自 `~/.pypirc`，无交互）
+- **双向核验**：`/pypi/openthree/0.7.0/json` 的 `info.version` 为 `0.7.0`；两个文件的
+  `size` 与 `digests.sha256` 与本地 `dist/` **全串一致**，`yanked` 均为 `False`；
+  索引侧 `latest` = `0.7.0` ✓
+- **安装版验收**：干净 venv（`_live/venv070`）从 `https://pypi.org/simple/` 装 `0.7.0`，
+  在仓库之外的**中性 cwd**（`D:\projects`）跑：`import openthree` → `0.7.0` 且
+  `__file__` 指向 site-packages、`python -m openthree --version` → `openthree 0.7.0`、
+  `--inspect` → 38 工具；`build_card` 无格言 → `DEFAULT_CARD_DESCRIPTION`、带格言 → 格言，
+  `A2aChannel` 现读出 `identity.json` 里的 `motto` 并进 `card()["description"]` ✓
+
 ### 上传后核对（按版本）
 
 sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/json` 的
@@ -653,6 +687,8 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.6.0 | `openthree-0.6.0.tar.gz` | 565,114 | `cb4a1b6c6f66943097bb0ae77e729ed925605ee14ebe348f1434bcbb1097df24` |
 | 0.6.1 | `openthree-0.6.1-py3-none-any.whl` | 277,771 | `34af8afff05bdf2a980724adac19ad3c733c175cd90f62e0b07c18ba8a67a2ba` |
 | 0.6.1 | `openthree-0.6.1.tar.gz` | 568,416 | `662b48a6d11d04d104df2709a03c053463928c0cee4e8da31fe996dcdf662a15` |
+| 0.7.0 | `openthree-0.7.0-py3-none-any.whl` | 316,340 | `e792614ebed6b884088cb39f9dbffd1d5490fa668d7c19f15ea5bc593a0d1c6a` |
+| 0.7.0 | `openthree-0.7.0.tar.gz` | 682,887 | `86adb92ba3ec0b72d58a2b4825a58c85062c52e59538ba24feab2e37668a7074` |
 
 
 
