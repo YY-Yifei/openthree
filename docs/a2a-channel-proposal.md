@@ -232,18 +232,27 @@ A2A 完全落在这条判据之内：
 「OACP 想用哪套方言都通」以及 `client.py:38-39` 那套自动重试永远不会踩空。
 回调那三个方法同理：0.3 的斜杠名与 1.x 的驼峰名都收，**语义只有一套**。
 
+**收图扩展了 part 的解析，artifact 的输出形状没变**：`message_parts()` 把三套线形状
+（0.3 `kind:"file"` / 老 proto-JSON `type:"FilePart"` / 1.x 无判别符的 `raw`）统一翻成
+`{bytes, uri, mime, name}`，图片落 `.openthree/assets/` 后交给 `Runtime.run(images=…)`；
+回复仍然只是 `artifacts[].parts[].text` 里的一段文本（**出站不回图**：面板只读 text，
+回 file part 会让它一片空白）。细节见 `docs/a2a-image-input-proposal.md`。
+
+
 | 码 | 何时 | 备注 |
 |---|---|---|
 | `-32700` | 不是合法 JSON | |
 | `-32600` | 不是合法 JSON-RPC（含批量数组：v1 不支持） | |
 | `-32601` | 未知方法（含 `message/stream`） | OACP 会据此换方言重试，所以别乱用 |
-| `-32602` | `params.message` 不是对象 / 没有文本 / 回调地址不是 http(s) 绝对地址 / 缺 `pushNotificationConfig` | 坏地址当场拒，见 §3.6 |
+| `-32602` | `params.message` 不是对象 / 既没有文本也没有可接收的图片 / 回调地址不是 http(s) 绝对地址 / 缺 `pushNotificationConfig` | 坏地址当场拒，见 §3.6 |
 | `-32001` | task 不存在（A2A 标准 `TaskNotFoundError`）；`get` 时也用于「这个 task 没有登记回调地址」（消息里说清是配置没有） | 与 `echo_agent.py:363` 一致 |
 | `-32002` | task 已终态，不可取消（`TaskNotCancelableError`） | |
 | `-32004` | 不支持的 operation（`UnsupportedOperationError`） | 如 `tasks/resubscribe`、回调 `list` |
 
-HTTP 层：`Content-Length > 1 MiB` → 413（流式读、别先读进内存）；坏 JSON 仍是
-200 + JSON-RPC error（更符合客户端期望，`client.py:184-220` 两种都处理）。
+HTTP 层：`Content-Length > 8 MiB` → 413（先看长度再读，别先读进内存；8 MiB
+是因为图片以 base64 传，膨胀 4/3 —— 1 MiB 连一张 700 KB 的原图都装不下）；坏 JSON
+仍是 200 + JSON-RPC error（更符合客户端期望，`client.py:184-220` 两种都处理）。
+单张图另有上限（默认 10 MiB，`OPENTHREE_MAX_IMAGE_BYTES`），两道闸取小的那个。
 
 ### 3.6 回调（push notifications）—— 我们主动把结论送回去
 

@@ -23,7 +23,12 @@ URL。想「让面板替我们收任务」是不成立的。
   * 没有流式（`message/stream` / `tasks/resubscribe` 一律拒）；
   * 任务共享本进程的会话（与钉钉一样），远端能通过提示读到最近的对话；
   * 任务表只在内存，进程重启后 `tasks/get` 是 `-32001`；
-  * `tasks/cancel` 只是「不再等」，模型仍会把这一步跑完。
+  * `tasks/cancel` 只是「不再等」，模型仍会把这一步跑完；
+  * **图片只收 base64**（`kind:"file"` 的 `bytes` / 1.x 的 `raw`）：URI 引用一律
+    不下载 —— 一个无鉴权端点 + 服务端主动取任意 URL 等于把内网暴露给任何能发
+    消息的人。收下的图落 `.openthree/assets/`（sha1 去重、只增不减）；
+  * **base64 不进任务历史**：`tasks/get` 会原样回吐整条 task，历史里只留一行
+    `[图片 N: image/png]` 占位（见 `save_inbound_image` 与 `_rpc_send`）。
 
 实现说明（不是接口）：本文件是频道实现，不做命令行入口；`openthree -A2A` 由
 `openthree/cli.py` 接线，`openthree channel add --type a2a` 由 `channels/cli.py`
@@ -31,6 +36,7 @@ URL。想「让面板替我们收任务」是不成立的。
 """
 from __future__ import annotations
 
+import base64
 import collections
 import errno
 import json
@@ -46,10 +52,12 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from .. import __version__
+from ..multimodal import (ImageError, TMP_MARK, asset_dest, guess_mime, max_image_bytes,
+                          save_image_bytes, sniff_mime)
 from .base import Channel, InboundMessage
 
 # --- 默认值（默认值只住在这一处；`config._SPECS` 的 Field 只写 hint） --------
@@ -70,8 +78,27 @@ USER_AGENT = f"openthree-a2a/{__version__}"
 DEFAULT_CARD_DESCRIPTION = (
     "openthree 内核上的智能体：接一条自然语言任务，跑完把结论写进 artifact。")
 
-MAX_BODY_BYTES = 1 << 20        # 1 MiB：入站请求的硬闸
+# 卡片声明的输入类型。`defaultInputModes` 必须**等于**端点真能收的集合
+# （`A2aChannel.input_modes()` 按 `allow_images` 决定是否带上图片那几种）：
+# 声明了却收不了，严格客户端会按卡片发图然后拿到一句拒绝。
+TEXT_INPUT_MODE = "text/plain"
+IMAGE_INPUT_MODES = ("image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp")
+
+MAX_BODY_BYTES = 8 << 20        # 8 MiB：入站请求的硬闸（一张常见截图 base64 后膨胀 4/3，
+                                # 1 MiB 连一张 700 KB 的原图都装不下）。
+                                # **有效上界是请求体，不是单张图上限**：base64 之后 ≈6 MiB
+                                # 的原图就到顶了，所以把 `OPENTHREE_MAX_IMAGE_BYTES` 调到
+                                # 6 MiB 以上不会多收任何图 —— 要收更大的图得改这个常量。
 SOCKET_TIMEOUT = 15.0           # 单连接读写超时（别让一个哑连接占着线程）
+# 一条消息最多收几张图。8 MiB 请求体里塞得下几万张「合法」小图（每张只需几十字节的
+# 真 magic bytes），而每张都会永久落 `assets/` 并进模型的 content —— 不设上限就是
+# 一条无需鉴权的请求放大成几百 MB 磁盘 + 一个几千 image part 的模型请求。
+MAX_IMAGES_PER_MESSAGE = 8
+# `assets/` 的总字节预算。这个目录只增不减（模型改任务时会重读图片文件，删旧文件
+# 等于抽掉 history 脚下的真源），而收图是个**无鉴权**入口：不设上限，任何能连上端口
+# 的人每次请求都能稳定塞进 ~8 MiB（内容改一个字节就绕开 sha1 去重）。CLI `--image`
+# 不查它 —— 那写的是本地可信用户自己的文件。
+ASSETS_BUDGET_BYTES = 512 << 20
 TASK_LIMIT = 200                # 任务表最多留最近多少条（只在内存）
 REGISTER_INTERVAL = 60.0        # 心跳间隔
 REGISTER_BACKOFF = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0)
@@ -298,6 +325,39 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _uri_label(uri: str) -> str:
+    """人能看的「这个 URI 是什么」：`scheme://host/…` / `data:…` / `相对地址`。
+
+    与 `_redact` 守同一条约定（**不带 userinfo、不带 path**）：这条 note 会进
+    `history_text` → `tasks/get` → 模型下一轮的上下文，`https://user:pw@host/x` 里的
+    凭据不该跟着走。`netloc` 的长度由对端决定，所以结果再截断 —— 一个几 MB 的 host
+    会把这条 note 本身变成本功能正要避免的那种历史。
+
+    不直接复用 `_redact` 的理由只有一处：它没有 netloc 时硬回「回调地址」，那对一条
+    `data:` 或相对路径的图片引用是句错话。
+    """
+    if not uri:
+        return "空地址"
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        # 例：`http://[::1`（netloc 里有 `[` 没有配对的 `]`）会让 urlsplit 抛 ValueError。
+        # `save_inbound_image` 承诺不抛异常：一条畸形地址不该把整条消息变成 -32603。
+        return "无法解析的地址"
+    if parts.netloc:
+        host = parts.netloc.rpartition("@")[2][:96]      # 去掉 user:pass@，再截断
+        # 控制字符要滤掉：这条 note 会进终端回显（桥会打印 `msg.text[:200]`）、
+        # `tasks/get` 与模型上下文 —— 一个 `\x1b]0;…` 就是一次终端注入。
+        host = "".join(c if c.isprintable() else "?" for c in host)
+        # scheme 的长度同样由对端决定（`urlsplit` 会一直取到第一个 `:`），必须一起截断
+        scheme = parts.scheme[:16]
+        # scheme-relative（`//host/path`）没有 scheme，拼成 `://host` 就是一句坏话
+        return f"{scheme}://{host}/…" if scheme else f"//{host}/…"
+    if parts.scheme:
+        return f"{parts.scheme[:16]}:…"
+    return "相对地址"
+
+
 def _redact(url: str) -> str:
     """人能看的地址：只留 `scheme://host/…`。
 
@@ -355,15 +415,60 @@ def http_call(opener: urllib.request.OpenerDirector, method: str, url: str,
         raise _TransportError(f"{method.upper()} {_redact(url)} 失败：{reason}") from exc
 
 
-def message_text(message: Any) -> str:
-    """从一条 A2A message 里取出文本。
+# 三套代号里图片字节的字段拼写：0.3 的 `bytes`、老 proto-JSON 的 `fileWithBytes`、
+# 1.x `oneof content` 的 `raw`。URI 那侧同理（`uri` / `fileWithUri` / `url`）。
+_BYTES_KEYS = ("bytes", "fileWithBytes", "raw")
+_URI_KEYS = ("uri", "fileWithUri", "url")
+# `mimeType`（0.3）与 `mediaType`（1.x）；Python 侧的 snake_case 也一并认。
+_MIME_KEYS = ("mimeType", "mime_type", "mediaType", "media_type")
+_NAME_KEYS = ("name", "filename", "fileName", "file_name")
 
-    三套形状都得认：0.3 的 `parts[{"kind":"text","text":…}]`、1.x 的
-    `parts[{"type":"TextPart","text":…}]`、以及老客户端直接给 `{"text": …}`。
+
+def _first_str(container: Dict[str, Any], keys: Tuple[str, ...]) -> str:
+    for key in keys:
+        value = container.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _file_part(part: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """认成文件 part 就返回 `{bytes, uri, mime, name}`，否则 `None`。
+
+    只看**字段存在性**：判别符在两代协议里名字与取值都不同（0.3 的
+    `kind: "file"`、老 proto-JSON 的 `type: "FilePart"`、1.x 压根没有）。
+    """
+    body = part.get("file")
+    if not isinstance(body, dict):
+        body = part
+    b64 = _first_str(body, _BYTES_KEYS)
+    uri = "" if b64 else _first_str(body, _URI_KEYS)
+    if not b64 and not uri:
+        return None
+    return {
+        "bytes": b64,
+        "uri": uri,
+        "mime": _first_str(body, _MIME_KEYS).lower(),
+        "name": _first_str(body, _NAME_KEYS),
+    }
+
+
+def message_parts(message: Any) -> Tuple[str, List[Dict[str, str]]]:
+    """把一条 A2A message 拆成 `(文本, 候选文件列表)`。
+
+    三套形状都得认：0.3 的 `parts[{"kind":"text"|"file",…}]`、老 proto-JSON 的
+    `parts[{"type":"TextPart"|"FilePart",…}]`、1.x 的 `{"text":…}` / `{"raw":…}` /
+    `{"url":…}`（**没有**判别符，只能靠字段存在性）；以及老客户端直接给
+    `{"text": …}`。
+
+    文件一律以 `{bytes, uri, mime, name}` 交出，**不在这里判断要不要收** ——
+    「URI 不下载」「类型只认 magic bytes」是频道层的判据（`save_inbound_image`），
+    这一层只把三套线形状翻译成一份统一的中间形状。
     """
     if not isinstance(message, dict):
-        return ""
+        return "", []
     chunks: List[str] = []
+    files: List[Dict[str, str]] = []
     parts = message.get("parts")
     if isinstance(parts, list):
         for part in parts:
@@ -373,20 +478,28 @@ def message_text(message: Any) -> str:
             if not isinstance(part, dict):
                 continue
             text = part.get("text")
-            if not isinstance(text, str):
-                continue
             kind = str(part.get("kind") or part.get("type") or "").lower()
-            if not kind or "text" in kind:
+            if isinstance(text, str) and (not kind or "text" in kind):
                 chunks.append(text)
+                continue
+            found = _file_part(part)
+            if found is not None:
+                files.append(found)
     if not chunks:
         direct = message.get("text")
         if isinstance(direct, str):
             chunks.append(direct)
-    return "\n\n".join(c.strip() for c in chunks if c.strip())
+    return "\n\n".join(c.strip() for c in chunks if c.strip()), files
+
+
+def message_text(message: Any) -> str:
+    """从一条 A2A message 里取出文本（图片 part 一律跳过 —— 它们走 `message_parts`）。"""
+    return message_parts(message)[0]
 
 
 def build_card(*, name: str, url: str, version: str = __version__,
-               motto: str = "") -> Dict[str, Any]:
+               motto: str = "",
+               input_modes: Sequence[str] = (TEXT_INPUT_MODE,)) -> Dict[str, Any]:
     """构造 AgentCard。
 
     两拨人要同时喂饱：ADP 严格校验要 `supportedInterfaces` 非空、`capabilities`
@@ -407,7 +520,14 @@ def build_card(*, name: str, url: str, version: str = __version__,
     `description` 取自智能体自己的**格言**（`identity.json` 的 `motto`）：那是它
     对自己的定义，比一句通用的内核说明更像「这个 agent 是谁」。没写格言时回退
     `DEFAULT_CARD_DESCRIPTION` —— 卡片是公开物，不该出现空 description。
+
+    `input_modes` 是 `defaultInputModes`。**判据：卡片不撒谎** —— 声明了
+    `image/*` 就必须真能收（`A2aChannel.input_modes()` 按 `allow_images` 决定）。
+    它是 MIME 能力，不承诺任意大小：两道闸（8 MiB 请求 / 单张图上限）仍在。
+    `defaultOutputModes` 恒为 `text/plain`：回图不做（面板只从
+    `artifacts[].parts[].text` 取文本，回 file part 会让它一片空白）。
     """
+    modes = [m for m in input_modes if m] or [TEXT_INPUT_MODE]
     return {
         "name": name or "openthree",
         "description": (motto or "").strip() or DEFAULT_CARD_DESCRIPTION,
@@ -418,8 +538,8 @@ def build_card(*, name: str, url: str, version: str = __version__,
             {"url": url, "protocolBinding": "JSONRPC", "protocolVersion": PROTOCOL_VERSION},
         ],
         "capabilities": {"streaming": False, "pushNotifications": True},
-        "defaultInputModes": ["text/plain"],
-        "defaultOutputModes": ["text/plain"],
+        "defaultInputModes": modes,
+        "defaultOutputModes": [TEXT_INPUT_MODE],
         "skills": [
             {
                 "id": "openthree.task",
@@ -685,6 +805,10 @@ class A2aChannel(Channel):
         # 回调投递：一条 FIFO 工作线程 + 一个无界队列。线程**按需启动**（第一次有
         # 任务登记了回调地址时才起），因为 handle_rpc 在没有 run() 的测试里也会被调。
         self._push_lock = threading.Lock()
+        # 收图预算的「查用量 + 写盘」必须互斥：`ThreadingHTTPServer` 每条连接一个线程，
+        # 两边分开就是 check-then-act —— N 个并发请求读到同一个用量、全部通过检查、
+        # 再各写几 MB，唯一那条上限就被绕过去了。
+        self._assets_lock = threading.Lock()
         self._pusher: Optional[threading.Thread] = None
         self._push_stopped = False
         self._push_q: "queue.Queue[Any]" = queue.Queue()
@@ -734,6 +858,16 @@ class A2aChannel(Channel):
     def mode(self) -> str:
         """`explicit`（人给了端口）或 `auto`（没给，按候选序列挑）。"""
         return "explicit" if self.explicit_port is not None else "auto"
+
+    @property
+    def allow_images(self) -> bool:
+        """收不收图片（`allow_images`，默认收）。
+
+        **每次现读 options**、不进 `_load_options()` 的属性：卡片是每次 GET 现构造
+        的，请求也是每次现判的 —— 两处必须看同一个值，且 `handle_rpc()` 在没有
+        `run()` 的测试里也会被调（`_load_options` 那时还没跑）。
+        """
+        return self.option_bool("allow_images", True)
 
     # --- 状态落盘 -----------------------------------------------------
     def state_path(self) -> Path:
@@ -905,9 +1039,17 @@ class A2aChannel(Channel):
         """
         return self._identity_field("motto")
 
+    def input_modes(self) -> List[str]:
+        """卡片声明的输入类型 —— **必须等于端点真能收的集合**（卡片不撒谎）。
+
+        `allow_images=true` 时收 png / jpeg / gif / webp / bmp（只按 magic bytes 认，
+        不认对端声明的类型），关掉就只有文本。
+        """
+        return [TEXT_INPUT_MODE, *IMAGE_INPUT_MODES] if self.allow_images else [TEXT_INPUT_MODE]
+
     def card(self) -> Dict[str, Any]:
         return build_card(name=self.display_name(), motto=self.display_motto(),
-                          url=self.card_url)
+                          url=self.card_url, input_modes=self.input_modes())
 
     # --- 生命周期 -----------------------------------------------------
     def run(self) -> None:
@@ -998,6 +1140,118 @@ class A2aChannel(Channel):
                 self._notice("警告：strict 模式的 registry 只收 https 卡片地址 —— "
                              "远程注册需要在前置 TLS 反向代理后用 --a2a-advertise https://…")
 
+    # --- 入站图片 -----------------------------------------------------
+    def assets_dir(self) -> Path:
+        """落盘目录：`.openthree/assets/` —— 与 CLI `--image` 同一个目录、同一条
+        命名规则（`save_image_bytes`）。同一张图因此只落一次盘：
+        `Workspace.stage_images()` 看到同名同内容时直接跳过。
+        """
+        root = Path(self.workspace_dir) if self.workspace_dir else Path(".openthree")
+        return root / "assets"
+
+    def _assets_usage(self) -> int:
+        """`assets/` 现在占了多少字节（目录不存在 / 读不动都算 0）。
+
+        每次收图现扫一遍：收图是低频操作（一条消息最多 8 张），而缓存会与 CLI
+        `--image` 的写入不同步 —— 一个对不上的数字比一个慢一点的数字更糟。
+        """
+        root = self.assets_dir()
+        if not root.exists():
+            return 0
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            # 目录在 exists() 与 iterdir() 之间被删、或没有读权限：如实当 0。
+            # 这里不是给运维报警的地方 —— 抛出去会把一条本来能跑的文本消息变成 -32603。
+            return 0
+        total = 0
+        for path in entries:
+            try:
+                # 跳过原子写的碎片（`<digest>.<ext>.tmp-xxxx`）：它只在写盘中途存在，
+                # 崩溃留下的残留不该永久吃掉对端的上传预算 —— 那是碎片，不是一张图。
+                if path.is_file() and TMP_MARK not in path.name:
+                    total += path.stat().st_size
+            except OSError:
+                pass
+        return total
+
+    def _save_within_budget(self, data: bytes) -> Tuple[str, str]:
+        """在锁里检查预算并落盘，返回 `(路径, 未接收的原因)`。
+
+        两件事必须闭在一起：**预算检查是 check-then-act**（读用量 → 写盘），
+        而收图跑在每条连接自己的线程上 —— 拆开的话 N 个并发请求读到同一个用量、
+        全部通过检查、再各写几 MB，唯一那条上限就被绕过去了。
+
+        去重命中的内容不该再占一次预算：`asset_dest()` 只算名字不写盘，命名规则与
+        `save_image_bytes` 是同一条（同一张图在目录里只有一个文件）。
+        """
+        with self._assets_lock:
+            try:
+                dest = asset_dest(self.assets_dir(), data)
+            except ImageError as exc:
+                return "", f"1 张图片未接收（{exc}）"
+            if ASSETS_BUDGET_BYTES and not dest.exists():
+                used = self._assets_usage()
+                if used + len(data) > ASSETS_BUDGET_BYTES:
+                    return "", (f"1 张图片未接收（图片目录已用 {used} 字节，上限 "
+                                f"{ASSETS_BUDGET_BYTES}；要腾空间请手动清理 assets/）")
+            try:
+                return str(save_image_bytes(self.assets_dir(), data)), ""
+            except (ImageError, OSError) as exc:
+                # ImageError 覆盖「认不出 / 太大 / 写不进去」，OSError 是兜底：这个函数
+                # 承诺「不抛异常」，一条存不下来的图不该把整条消息变成 -32603。
+                #
+                # note 会进 `history_text` → `tasks/get` → 模型上下文，所以本机绝对路径
+                # （`图片写入失败 D:\…\assets: …`，常含用户名）不能跟着走：细节留日志，
+                # 对外只把目录换成 `<assets>` —— 与「历史里不存本地路径」同一条判据。
+                self.log.warning("a2a 图片落盘失败：%s", exc)
+                reason = str(exc).replace(str(self.assets_dir()), "<assets>")
+                return "", f"1 张图片未接收（{reason}）"
+
+    def save_inbound_image(self, file: Dict[str, str]) -> Tuple[str, str]:
+        """把一条入站 file part 存成本地图片，返回 `(路径, 未接收的原因)`。
+
+        成功时原因为空串；失败时路径为空串、原因是一句能读懂的话。**不抛异常** ——
+        一张图存不下来不该让整条消息 400，文本那部分仍然值得跑。
+
+        四条判据：
+          * **URI 不下载**：一个无鉴权端点 + 服务端主动取任意 URL，是本文件能引入的
+            最大的洞（SSRF 打内网 / 云 metadata / 重定向 / 无大小上限）。要发图请用
+            base64；链接可以写在文本里。
+          * **先估算再解码**：`len(b64) * 3/4` 与 `max_image_bytes()` 比一次，免得为
+            一个 50 MB 的 base64 先把它解进内存。
+          * **类型只认 magic bytes**：对端声明的 `mimeType` / `mediaType` 不参与类型
+            判定，也不参与命名（`save_image_bytes` 的后缀只由内容决定）—— 声明与实测
+            不一致只记一句日志。
+          * **不做 GC**：`Agent._sync_current_input()` 会在模型改任务时重读图片文件
+            重建 content，删旧文件等于抽掉 history 脚下的真源。`assets/` 只增不减，
+            这是既有事实（CLI `--image` 也一直这样），不是本功能的取舍。
+        """
+        uri = str(file.get("uri") or "")
+        b64 = str(file.get("bytes") or "")
+        if not b64:
+            return "", (f"1 张 URI 图片未接收（{_uri_label(uri)}："
+                        "本服务不下载远程图片，请改用 base64）")
+        limit = max_image_bytes()
+        estimate = len(b64) * 3 // 4
+        if limit and estimate > limit:
+            return "", f"1 张图片未接收（base64 估算 {estimate} 字节 > 上限 {limit}）"
+        try:
+            data = base64.b64decode(b64, validate=False)
+        except ValueError as exc:       # binascii.Error 是 ValueError 的子类
+            return "", f"1 张图片未接收（base64 解不开：{exc}）"
+        declared = str(file.get("mime") or "").strip().lower()
+        path, why = self._save_within_budget(data)
+        if not path:
+            return "", why
+        actual = sniff_mime(data) or ""
+        if declared and declared != actual:
+            # 内容说了算；声明只是对端的一句话，进日志不进判定。
+            # 截断 + 滤掉控制字符：长度由对端决定，换行还能用来伪造日志行。
+            shown = "".join(c if c.isprintable() else "?" for c in declared[:64])
+            self.log.warning("a2a 图片声明 %s，内容其实是 %s", shown, actual or "未知")
+        return str(path), ""
+
     # --- JSON-RPC -----------------------------------------------------
     def handle_rpc(self, raw: bytes, *, caller: str = "") -> Tuple[int, Dict[str, Any]]:
         """处理一次 JSON-RPC 调用，返回 `(HTTP 状态码, 响应体)`。
@@ -1050,9 +1304,41 @@ class A2aChannel(Channel):
         message = params.get("message")
         if not isinstance(message, dict):
             raise _RpcError(-32602, "params.message 必须是对象")
-        text = message_text(message)
-        if not text:
+        text, files = message_parts(message)
+        if not text and not files:
             raise _RpcError(-32602, "消息里没有文本（parts 里找不到 text）")
+        # 图片先落盘再交给桥：一条都不成也不让整条消息失败 —— 文本那部分照样值得跑，
+        # 而「为什么没收到这张图」会以一句话进模型的输入（notes 拼进 text）。
+        images: List[str] = []
+        notes: List[str] = []
+        if files:
+            if not self.allow_images:
+                notes.append(f"（{len(files)} 张图片未处理：本频道关掉了 allow_images）")
+            else:
+                # 条数上限在**落盘之前**：超出的既不写盘也不进 content，只留一句说明。
+                accepted = files[:MAX_IMAGES_PER_MESSAGE]
+                for item in accepted:
+                    path, why = self.save_inbound_image(item)
+                    if path:
+                        images.append(path)
+                    else:
+                        notes.append(f"（{why}）")
+                extra = len(files) - len(accepted)
+                if extra > 0:
+                    notes.append(f"（另有 {extra} 张图片未收：一条消息最多收 "
+                                 f"{MAX_IMAGES_PER_MESSAGE} 张）")
+        if not text and not images:
+            raise _RpcError(-32602, "".join(notes) or "消息里没有可接收的内容")
+        if notes:
+            text = "\n\n".join([text] + notes).strip()
+        # 历史里**不存 base64**：`_public()` 会深拷贝整条 task，`tasks/get` 原样回吐，
+        # 响应体没有上限 —— 一张几 MB 的图会让此后每次查询都背上它。也不存本地路径
+        # （那是本机的实现细节，且不是合法的 0.3 file part）。只留一行占位，让读历史
+        # 的人知道「这条消息带过一张图」。
+        # 占位里**不写对端给的 `name`**：那是不可信输入，会随 `tasks/get` 回吐、
+        # 也会经 `_follow_up_prefix` 进模型下一轮的上下文。
+        stamps = [f"[图片 {i}: {guess_mime(p)}]" for i, p in enumerate(images, 1)]
+        history_text = "\n\n".join([text] + stamps).strip()
         config = _as_dict(params.get("configuration"))
         # 内联回调地址在这里就取出来（只解析、只校验；写进 task 是在下面那把锁里）。
         # 与任务一起登记，是这个功能唯一不赛跑的位置：任务跑完可能比回包还早，
@@ -1093,7 +1379,7 @@ class A2aChannel(Channel):
                 # 历史里只存**原文**：前缀是给这次 run 用的。把带前缀的文本写回历史，
                 # 下一次的前缀就会把上一次的前缀再包一层 —— 逐轮翻倍，没有上界。
                 previous["history"].append(
-                    {"role": "user", "parts": [{"kind": "text", "text": text}]})
+                    {"role": "user", "parts": [{"kind": "text", "text": history_text}]})
                 # 回调地址跟着 **task** 走，不跟着这一轮走：follow up 常常不带配置
                 # （调用方只是在同一个任务里追问），而它的新结论一样要送出去。
                 if push is not None:
@@ -1103,7 +1389,8 @@ class A2aChannel(Channel):
             else:
                 task_id = task_id or ("t-" + uuid.uuid4().hex[:16])
                 context_id = context_id or ("c-" + uuid.uuid4().hex[:16])
-                task = self._tasks.new(task_id=task_id, context_id=context_id, text=text)
+                task = self._tasks.new(task_id=task_id, context_id=context_id,
+                                       text=history_text)
                 task["_run"] = run_id
                 if push is not None:
                     task["_push"] = push
@@ -1125,6 +1412,7 @@ class A2aChannel(Channel):
             kind="dm",
             msg_id=task["id"],
             reply_token=task["id"],        # send_text 靠它找回这个 task
+            images=images,                 # 桥把它原样交给 Runtime.run(images=…)
             raw={"task": task["id"], "context": context_id,
                  "blocking": blocking, "run": run_id},
         )

@@ -748,6 +748,42 @@ push-notification 流程，不是我们发明的约定。
 代价要认：端口变了就有可能在面板里看到**两条同名记录**。旧的删不掉时（401：token
 不是首注册者的）只能人工清理，新的那条才是活的。
 
+#### 收图：对方发的图片会被真的看见
+
+`message/send` 的 `parts` 里带图片，模型就能**看见它**（进多模态 `content`），
+不是当作一段被丢掉的 part。走的是与 CLI `--image` 完全同一条路：
+落盘 → `InboundMessage.images` → `Runtime.run(images=…)` → `build_content()`。
+
+三套线形状都收，判据是**字段存在性**而不是 `kind` / `type`（判别符在两代协议里
+名字都不同）：0.3 的 `{"kind":"file","file":{"bytes":…,"mimeType":…}}`、
+老 proto-JSON 的 `{"type":"FilePart","file":{"fileWithBytes":…}}`、1.x 的
+`{"raw":…,"mediaType":…}`。纯图消息（没有文本）照样建任务。
+
+两道闸 + 三条判据，另记一条现状：
+
+- **请求体 8 MiB**（base64 膨胀 4/3，1 MiB 连一张 700 KB 的原图都装不下）；
+  **单张图**另有上限，默认 10 MiB，用 `OPENTHREE_MAX_IMAGE_BYTES` 调 —— 两道闸取小的。
+- **一条消息最多 8 张**（`MAX_IMAGES_PER_MESSAGE`）：8 MiB 请求体里塞得下几万张
+  几十字节的「合法」小图（只要过得去 magic bytes），而每张都会永久落盘并进模型
+  的 content —— 没有这条上限，一条请求就能放大成几千个 image part。
+- **`assets/` 总量 512 MiB**（`ASSETS_BUDGET_BYTES`）：这个目录只增不减，而收图是
+  **无鉴权**入口 —— 没有这条，任何能连上端口的人每次请求都能稳定塞进约 8 MiB
+  （内容改一个字节就绕开 sha1 去重）。超了**只拒新图、不删旧图**：腾空间靠手动清理。
+- **URI 引用一律不下载**：一个无鉴权端点 + 服务端主动取任意 URL，等于把内网暴露给
+  任何能发消息的人。要发图请用 base64，链接可以写在文本里。
+- **类型只认 magic bytes**（png / jpeg / gif / webp / bmp）：对端声明的
+  `mimeType` 不参与类型判定，也不参与文件名 —— 落盘名只由内容哈希决定。
+- **base64 不进任务历史**：`tasks/get` 会原样回吐整条 task，历史里只留一行
+  `[图片 1: image/png]` 占位。
+- 现状：收下的图落 `.openthree/assets/`（sha1 去重）；**只增不减**：模型改任务时会重读
+  图片文件重建 content，删旧文件等于抽掉 history 脚下的真源。
+
+`allow_images: false`（`channels.yaml` 的选项）关掉收图：卡片回到只声明
+`text/plain`，图片 part 被忽略并说明一句（有文本时拼进给模型的输入；纯图消息
+直接回 `-32602` 并把原因写在错误里）—— 卡片的 `defaultInputModes`
+**永远等于**端点真能收的集合。
+
+
 #### 三条要知道的限制（是设计，不是待办）
 
 1. **共享会话**：A2A 任务与你的控制台、钉钉共用同一个进程内会话 —— 远端可以用一句

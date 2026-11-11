@@ -15,7 +15,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 @dataclass
@@ -31,6 +31,10 @@ class InboundMessage:
     kind: str = "dm"             # dm（单聊）/ group（群聊）
     msg_id: str = ""
     reply_token: str = ""        # wechat: context_token；dingtalk: sessionWebhook
+    # 随消息一起来的图片：本地绝对路径或 http(s) 链接，原样交给
+    # `Runtime.run(images=…)`（与 CLI `--image` 同一条路）。
+    # 有默认值 ⇒ 微信 / 钉钉 / 既有构造点零改动。
+    images: List[str] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def label(self) -> str:

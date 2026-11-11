@@ -22,12 +22,14 @@
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import socket
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -37,9 +39,10 @@ import pytest
 from openthree.channels import a2a as a2a_mod
 from openthree.channels.a2a import (CARD_PATH, DEFAULT_CARD_DESCRIPTION, MAX_BODY_BYTES,
                                     RPC_PATH, A2aChannel, A2aError, build_card,
-                                    message_text)
+                                    message_parts, message_text)
 from openthree.channels.base import InboundMessage
-from openthree.channels.bridge import NOTICE_PREFIX, SHUTDOWN_NOTICE, AgentBridge
+from openthree.channels.bridge import (NOTICE_PREFIX, SHUTDOWN_NOTICE, AgentBridge,
+                                       compose_input)
 from openthree.channels.config import ChannelConfig, ChannelsConfig
 from openthree.channels.manager import ChannelManager, apply_extra
 
@@ -1649,3 +1652,438 @@ def test_reuse_port_is_pinned_off(tmp_path):
         assert server.allow_reuse_port is False
     finally:
         server.server_close()
+
+
+# --- 收图：三套线形状、两道闸、一个落盘目录 ------------------------
+# 这几条保护的不变量（动收图之前先读一遍）：
+#
+# 1. **形状靠字段存在性认，不靠 `kind`/`type`**：0.3 有判别符、老 proto-JSON 是
+#    `type:"FilePart"`、1.x 压根没有。认错一代 = 对端发的图静默丢弃。
+# 2. **类型只认 magic bytes**：对端声明的 `mimeType` / `mediaType` 不参与判定，
+#    也不参与命名 —— 声明只是它的一句话。
+# 3. **命名规则只有一处**（`multimodal.save_image_bytes`）：CLI `--image` 与频道
+#    入站必须落到同一个文件名，否则同一张图会落两份。
+# 4. **base64 不进 task 历史**：`tasks/get` 会原样回吐，一张图 = 此后每次查询几十 MB。
+# 5. **URI 一律不下载**：零出站请求。
+
+def _png(size: int = 1) -> bytes:
+    """造一张真的 PNG（`size`×`size` 纯黑）。
+
+    不用外部夹具：这几条测的是「字节进来之后发生了什么」，图只要能过 magic bytes
+    且长度可控就够了 —— 但也没必要为此放一张假图。
+    """
+    import struct
+    import zlib
+
+    raw = b"".join(b"\x00" + b"\x00\x00\x00" * size for _ in range(size))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def _file_msg(parts: list, **extra) -> dict:
+    message = {"role": "user", "parts": parts}
+    message.update(extra)
+    return message
+
+
+def _img_channel(tmp_path: Path, **options: str) -> tuple[A2aChannel, list]:
+    """一个能看见「桥收到了什么」的端点（不开 HTTP，直接 handle_rpc）。
+
+    `block_wait` 必须**直接落到属性上**：它只在 `_load_options()` 里从 options 读
+    （`a2a.py:852`），而这个 helper 从不跑 `run()` —— 传在 `opts` 里不生效，每条
+    `message/send` 都会白等满默认的 45 秒（走两次 send 的用例要等 90 秒）。这与
+    `allow_images` 做成 property 的理由是同一个坑：**`_load_options` 那时还没跑**。
+    """
+    seen: list[InboundMessage] = []
+    opts = {"no_register": "true", "port": "0"}
+    opts.update(options)
+    ch = A2aChannel("a2a", opts, workspace_dir=tmp_path / ".openthree",
+                    on_message=seen.append)
+    ch.block_wait = float(opts.get("block_wait") or 0)
+    return ch, seen
+
+
+def _assets(tmp_path: Path) -> list[Path]:
+    root = tmp_path / ".openthree" / "assets"
+    return sorted(root.iterdir()) if root.exists() else []
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def test_a2a_03_file_with_bytes_becomes_a_real_local_image(tmp_path):
+    png = _png()
+    ch, seen = _img_channel(tmp_path)
+    _, resp = _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "这张图里是什么？"},
+        {"kind": "file", "file": {"bytes": _b64(png), "mimeType": "image/png",
+                                  "name": "shot.png"}},
+    ])})
+    assert "result" in resp, resp
+    assert len(seen) == 1
+    msg = seen[0]
+    assert "这张图里是什么" in msg.text
+    assert len(msg.images) == 1
+    path = Path(msg.images[0])
+    assert path.parent == tmp_path / ".openthree" / "assets"
+    assert path.read_bytes() == png                 # 一个字节都不差
+    assert path.suffix == ".png"                    # 后缀由内容定，不由声明
+    assert "shot.png" not in path.name              # 对端给的名字不参与命名
+
+
+def test_a2a_1x_raw_part_is_the_same_image_to_us(tmp_path):
+    """1.x 的 `oneof content` 没有判别符，图片是 `raw` + `mediaType`。"""
+    png = _png()
+    ch, seen = _img_channel(tmp_path)
+    _call(ch, "message/send", {"message": _file_msg([
+        {"raw": _b64(png), "mediaType": "image/png", "filename": "x.png"},
+    ])})
+    assert len(seen) == 1
+    assert len(seen[0].images) == 1
+    assert Path(seen[0].images[0]).read_bytes() == png
+
+
+def test_old_proto_json_file_part_is_accepted_too(tmp_path):
+    """更老的一代：`{"type":"FilePart","file":{"fileWithBytes":…}}`。"""
+    png = _png()
+    ch, seen = _img_channel(tmp_path)
+    _call(ch, "message/send", {"message": _file_msg([
+        {"type": "FilePart",
+         "file": {"fileWithBytes": _b64(png), "mimeType": "image/png"}},
+    ])})
+    assert len(seen[0].images) == 1
+
+
+def test_message_parts_keeps_text_and_files_apart():
+    """纯解析层：文本归文本、文件归文件，两边都不吞掉对方。"""
+    text, files = message_parts({"parts": [
+        {"kind": "text", "text": "看这个"},
+        {"kind": "file", "file": {"bytes": "AAAA", "mimeType": "image/png"}},
+        {"kind": "data", "data": {"k": 1}},
+    ]})
+    assert text == "看这个"
+    assert files == [{"bytes": "AAAA", "uri": "", "mime": "image/png", "name": ""}]
+
+
+def test_a_message_with_only_an_image_is_not_rejected(tmp_path):
+    """纯图消息曾经直接 `-32602` —— 图能收之后它必须照常建任务。"""
+    png = _png()
+    ch, seen = _img_channel(tmp_path)
+    _, resp = _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "file", "file": {"bytes": _b64(png), "mimeType": "image/png"}},
+    ])})
+    assert "error" not in resp, resp
+    assert resp["result"]["status"]["state"] == "working"    # ack：block_wait=0
+    assert len(seen[0].images) == 1
+    # 历史里必须有一句能读的话，而不是一条空 text part
+    assert "图片 1: image/png" in json.dumps(resp["result"]["history"], ensure_ascii=False)
+
+
+def test_a_file_that_is_not_really_an_image_is_refused_not_crashed(tmp_path):
+    """声明 image/png、内容是 HTML：拒掉这一张，但整条消息照跑（不是 500）。"""
+    ch, seen = _img_channel(tmp_path)
+    _, resp = _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "看图"},
+        {"kind": "file", "file": {"bytes": _b64(b"<html>not an image</html>"),
+                                  "mimeType": "image/png"}},
+    ])})
+    assert "result" in resp, resp
+    assert seen[0].images == []
+    assert "未接收" in seen[0].text
+    assert "看图" in seen[0].text          # 文本那部分照样交给模型
+    assert _assets(tmp_path) == []         # 认不出的内容一个字节都不落盘
+
+
+def test_an_image_over_the_per_image_limit_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENTHREE_MAX_IMAGE_BYTES", "40")   # 比任何真 PNG 都小
+    ch, seen = _img_channel(tmp_path)
+    _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "看图"},
+        {"kind": "file", "file": {"bytes": _b64(_png(2))}},
+    ])})
+    assert seen[0].images == []
+    assert "上限" in seen[0].text
+
+
+def test_uri_images_are_never_downloaded(tmp_path, monkeypatch):
+    """零出站请求：一个无鉴权端点 + 服务端主动取任意 URL 是本文件能引入的最大的洞。"""
+    calls = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: calls.append(a))
+    ch, seen = _img_channel(tmp_path)
+    _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "看这张图"},
+        {"kind": "file", "file": {"uri": "http://169.254.169.254/latest/meta-data/",
+                                  "mimeType": "image/png"}},
+    ])})
+    assert calls == []                     # 一次都没发出去
+    assert seen[0].images == []
+    assert "不下载" in seen[0].text
+
+
+def test_a_message_with_only_an_unusable_image_says_why(tmp_path):
+    """没有文本、唯一的图又收不下 —— 说清原因，别回一句空洞的 -32602。"""
+    ch, _ = _img_channel(tmp_path)
+    _, resp = _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "file", "file": {"uri": "https://example.com/x.png"}},
+    ])})
+    assert resp["error"]["code"] == -32602
+    assert "不下载" in resp["error"]["message"]
+
+
+def test_card_declares_only_the_modes_the_endpoint_really_accepts(tmp_path):
+    """卡片不撒谎：声明了 image/* 就必须真能收。"""
+    ch, _ = _img_channel(tmp_path)
+    modes = ch.card()["defaultInputModes"]
+    assert modes[0] == "text/plain"
+    assert set(modes[1:]) == {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"}
+    assert ch.card()["defaultOutputModes"] == ["text/plain"]    # 回图不做
+
+
+def test_allow_images_false_keeps_the_card_honest(tmp_path):
+    png = _png()
+    ch, seen = _img_channel(tmp_path, allow_images="false")
+    assert ch.card()["defaultInputModes"] == ["text/plain"]
+    _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "看图"},
+        {"kind": "file", "file": {"bytes": _b64(png)}},
+    ])})
+    assert seen[0].images == []
+    assert "allow_images" in seen[0].text
+    assert _assets(tmp_path) == []
+
+
+def test_bridge_hands_images_to_the_runtime():
+    """桥是唯一那道缝：`images` 必须原样到 `Runtime.run`，别的地方都看不见图。"""
+    class _Rec:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        def run(self, text, **kwargs):
+            self.calls.append((text, kwargs))
+            return {"answer": "ok"}
+
+    rt = _Rec()
+    bridge = AgentBridge(rt, echo=False)
+    assert bridge.ask("看这张", images=["D:/x/a.png"]) == "ok"
+    assert rt.calls[0][1]["images"] == ["D:/x/a.png"]
+    bridge.ask("没带图")
+    assert rt.calls[1][1]["images"] is None      # 空 = None，别把 [] 当成「有图」
+
+
+def test_compose_input_tells_the_model_that_images_came_with_it():
+    pure = InboundMessage(text="", channel="a2a", channel_type="a2a", images=["a.png"])
+    assert "1 张图片" in compose_input(pure)
+    both = InboundMessage(text="看这两张", channel="a2a", channel_type="a2a",
+                          images=["a.png", "b.png"])
+    composed = compose_input(both)
+    assert "看这两张" in composed and "2 张图片" in composed
+
+
+def test_task_history_holds_a_placeholder_not_the_base64(tmp_path):
+    """`tasks/get` 会原样回吐 history：base64 进去 = 此后每次查询几十 MB。"""
+    png = _png(4)
+    ch, _ = _img_channel(tmp_path)
+    _, resp = _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "看图"},
+        {"kind": "file", "file": {"bytes": _b64(png)}},
+    ])})
+    _, got = _call(ch, "tasks/get", {"id": resp["result"]["id"]})
+    blob = json.dumps(got, ensure_ascii=False)
+    assert _b64(png)[:16] not in blob
+    assert "图片 1: image/png" in blob
+    assert len(blob) < 4000
+
+
+def test_the_same_image_twice_lands_on_disk_once(tmp_path):
+    """sha1 去重 + 一条命名规则：同一张图发两次，`assets/` 里只有一个文件。"""
+    png = _png()
+    ch, seen = _img_channel(tmp_path)
+    part = {"kind": "file", "file": {"bytes": _b64(png)}}
+    for _ in range(2):
+        _call(ch, "message/send", {"message": _file_msg([dict(part)])})
+    assert len(seen) == 2
+    assert seen[0].images == seen[1].images
+    assert len(_assets(tmp_path)) == 1
+
+
+def test_cli_path_and_channel_path_share_one_naming_rule(tmp_path):
+    """命名规则只许有一处：CLI 落过的图，频道再收一次不该多出第二个文件。"""
+    from openthree.multimodal import save_asset
+
+    png = _png()
+    src = tmp_path / "from_cli.png"
+    src.write_bytes(png)
+    dest = save_asset(tmp_path / ".openthree" / "assets", src)
+    ch, seen = _img_channel(tmp_path)
+    _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "file", "file": {"bytes": _b64(png)}},
+    ])})
+    assert Path(seen[0].images[0]) == dest
+    assert len(_assets(tmp_path)) == 1
+
+
+def test_a_message_with_too_many_images_keeps_only_the_cap(tmp_path):
+    """8 MiB 请求体塞得下几万张 60 字节小图 —— 上限必须在**落盘之前**。
+
+    判据：被拒的那几张连 `assets/` 都不该留痕（否则「只收 N 张」只是一句文案）。
+    """
+    from openthree.channels.a2a import MAX_IMAGES_PER_MESSAGE
+
+    ch, seen = _img_channel(tmp_path)
+    parts = [{"kind": "text", "text": "一堆图"}]
+    for n in range(1, MAX_IMAGES_PER_MESSAGE + 4):
+        parts.append({"kind": "file", "file": {"bytes": _b64(_png(n))}})   # 内容互不相同
+    _, resp = _call(ch, "message/send", {"message": _file_msg(parts)})
+    assert "result" in resp, resp
+    assert len(seen[0].images) == MAX_IMAGES_PER_MESSAGE
+    assert len(_assets(tmp_path)) == MAX_IMAGES_PER_MESSAGE
+    assert "最多收" in seen[0].text
+
+
+def test_a_malformed_uri_does_not_take_the_message_down(tmp_path):
+    """`http://[::1` 会让 `urlsplit` 抛 ValueError —— 一条畸形地址不该变成 -32603。"""
+    ch, seen = _img_channel(tmp_path)
+    _, resp = _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "看图"},
+        {"kind": "file", "file": {"uri": "http://[::1"}},
+    ])})
+    assert "result" in resp, resp
+    assert seen[0].images == []
+    assert "无法解析" in seen[0].text
+
+
+def test_uri_label_drops_credentials_and_long_hosts():
+    """这条 note 会进 history 回给对端：凭据与超长 host 都不该跟着走。"""
+    assert a2a_mod._uri_label("https://user:pw@example.com:9000/x.png") == \
+        "https://example.com:9000/…"
+    assert len(a2a_mod._uri_label("http://" + "a" * 5000 + "/x.png")) < 120
+    assert a2a_mod._uri_label("data:image/png;base64,AAAA") == "data:…"
+    assert a2a_mod._uri_label("") == "空地址"
+    assert a2a_mod._uri_label("relative/path.png") == "相对地址"
+    # scheme-relative：没有 scheme，别拼成 `://host/…` 那句坏话
+    assert a2a_mod._uri_label("//host/x.png") == "//host/…"
+    # scheme 的长度同样由对端决定（urlsplit 会一直取到第一个 `:`）—— 两个分支都要截断
+    assert len(a2a_mod._uri_label("a" * 5000 + ":x")) < 40
+    assert len(a2a_mod._uri_label("a" * 5000 + "://host/x.png")) < 40
+    # 控制字符：这条 note 会进终端回显（桥打印 msg.text），`\x1b]0;…` 就是一次终端注入
+    assert "\x1b" not in a2a_mod._uri_label("http://evil\x1b]0;pwned\x07/x.png")
+
+
+def test_save_asset_keeps_a_local_file_with_a_weird_suffix(tmp_path):
+    """`save_asset` 走的是**本地可信**文件：怪后缀不该被那条严格规则拒掉。
+
+    严格后缀校验是为「对端给的字节」那条路设的。把 CLI 也卡住就是回归：
+    `stage_images()` 会退回原引用，而相对路径在回放时可能已经解析不到了。
+    """
+    from openthree.multimodal import save_asset
+
+    assets = tmp_path / ".openthree" / "assets"
+    weird = tmp_path / "shot.png~"
+    weird.write_bytes(b"not any known magic type at all")
+    dest = save_asset(assets, weird)
+    assert dest.parent == assets
+    assert dest.suffix == ".bin"                    # 兜底，不是拒收
+    assert dest.read_bytes() == weird.read_bytes()
+
+
+def test_the_assets_budget_stops_a_disk_fill(tmp_path, monkeypatch):
+    """`assets/` 只增不减 + 无鉴权 ⇒ 必须有一条总量上限，否则收图 = 磁盘填充入口。
+
+    判据：预算在**落盘之前**判；拒掉的那张一个字节都不写。
+    """
+    png = _png(4)
+    monkeypatch.setattr(a2a_mod, "ASSETS_BUDGET_BYTES", len(png) + 1)    # 只够放一张
+    ch, seen = _img_channel(tmp_path)
+    _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "第一张"},
+        {"kind": "file", "file": {"bytes": _b64(png)}},
+    ])})
+    assert len(seen[-1].images) == 1                # 挤进去了
+    _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "第二张"},
+        {"kind": "file", "file": {"bytes": _b64(_png(5))}},    # 内容不同：绕开 sha1
+    ])})
+    assert seen[-1].images == []
+    assert "上限" in seen[-1].text
+    assert len(_assets(tmp_path)) == 1              # 拒掉的一个字节都没写
+
+
+def test_a_deduped_image_is_not_charged_against_the_budget(tmp_path, monkeypatch):
+    """预算只挡**新占用**：目录里已经有的那张再发一次不会让目录长大，不该被拒。
+
+    判据：先用 `asset_dest()` 算名字判「是否已存在」，再决定要不要查预算 ——
+    反过来（先按 len(data) 计费）会让一张重发的图在接近上限时莫名其妙地失败。
+    """
+    png = _png(4)
+    ch, seen = _img_channel(tmp_path)
+    _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "第一次"},
+        {"kind": "file", "file": {"bytes": _b64(png)}},
+    ])})
+    assert len(seen[-1].images) == 1
+    used = sum(p.stat().st_size for p in _assets(tmp_path))
+    monkeypatch.setattr(a2a_mod, "ASSETS_BUDGET_BYTES", used)     # 正好用满
+    _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "同一张再来一次"},
+        {"kind": "file", "file": {"bytes": _b64(png)}},
+    ])})
+    assert len(seen[-1].images) == 1                              # 去重命中，不该被拒
+    assert len(_assets(tmp_path)) == 1
+
+
+def test_leftover_temp_files_do_not_eat_the_budget(tmp_path, monkeypatch):
+    """崩溃留下的 `<digest>.png.tmp-xxxx` 不占上传预算：它是碎片，不是一张图。
+
+    否则一次崩溃就永久吃掉一截预算，而运维在目录里看不出原因（那种文件没人清）。
+    """
+    assets = tmp_path / ".openthree" / "assets"
+    assets.mkdir(parents=True)
+    (assets / "deadbeef.png.tmp-1234abcd").write_bytes(b"x" * 4096)
+    monkeypatch.setattr(a2a_mod, "ASSETS_BUDGET_BYTES", 120)      # 比碎片本身还小
+    ch, seen = _img_channel(tmp_path)
+    _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "text", "text": "看图"},
+        {"kind": "file", "file": {"bytes": _b64(_png(2))}},
+    ])})
+    assert len(seen[-1].images) == 1        # 4096 字节的碎片没有被算进预算
+
+
+def test_declared_mime_never_decides_the_type(tmp_path):
+    """对端声明 image/jpeg、内容是 png：后缀按内容走，声明只进日志。"""
+    png = _png()
+    ch, seen = _img_channel(tmp_path)
+    _call(ch, "message/send", {"message": _file_msg([
+        {"kind": "file", "file": {"bytes": _b64(png), "mimeType": "image/jpeg"}},
+    ])})
+    assert Path(seen[0].images[0]).suffix == ".png"
+
+
+def test_concurrent_writes_of_the_same_image_never_leave_a_half_file(tmp_path):
+    """收图是并发入口（每条连接一个线程）：写盘必须原子，读到的一半也是错的。"""
+    from openthree.multimodal import save_image_bytes, sniff_mime
+
+    png = _png(8)
+    assets = tmp_path / ".openthree" / "assets"
+    results: list[Path] = []
+
+    def worker() -> None:
+        results.append(save_image_bytes(assets, png))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+
+    assert len(results) == 8
+    assert len({str(p) for p in results}) == 1        # 同一个名字
+    assert results[0].read_bytes() == png              # 内容完整，不是半张
+    assert sniff_mime(results[0].read_bytes()) == "image/png"
+    assert [p.name for p in assets.iterdir() if ".tmp-" in p.name] == []

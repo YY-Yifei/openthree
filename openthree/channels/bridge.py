@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import queue
 import threading
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from .base import InboundMessage
 
@@ -35,8 +35,16 @@ SHUTDOWN_NOTICE = NOTICE_PREFIX + "正在退出，这条消息没有处理，请
 
 
 def compose_input(msg: InboundMessage) -> str:
-    """把频道消息拼成喂给智能体的一段文本（来源标注 + 原文）。"""
+    """把频道消息拼成喂给智能体的一段文本（来源标注 + 原文 + 图片说明）。
+
+    图片本身走 `Runtime.run(images=…)` 进 content；这里只补一句「附带了几张」——
+    否则一条纯图消息喂过去就是一句「请直接回复：」加一片空白。
+    """
     text = str(msg.text or "").strip()
+    images = [i for i in (msg.images or []) if i]
+    if images:
+        n = len(images)
+        text = f"{text}\n\n（本条消息附带 {n} 张图片）" if text else f"（附带 {n} 张图片）"
     return f"来自{msg.label()}的消息，请直接回复：\n\n{text}"
 
 
@@ -103,10 +111,16 @@ class AgentBridge:
             self._pending += 1
         self._queue.put((msg, reply))
 
-    def ask(self, text: str, *, source: str = "控制台") -> str:
-        """同步跑一条（控制台输入走这条）：立刻执行、返回答案。"""
+    def ask(self, text: str, *, source: str = "控制台",
+            images: Optional[Sequence[str]] = None) -> str:
+        """同步跑一条（控制台输入走这条）：立刻执行、返回答案。
+
+        `images` 是本地路径或 http(s) 链接 —— 与 CLI `--image` 走同一条路：
+        `Runtime.run(images=…)` → `stage_images()` → 模型的多模态 `content`。
+        """
+        imgs = [str(i) for i in (images or []) if i]
         with self._run_lock:
-            doc = self.rt.run(text, session=True)
+            doc = self.rt.run(text, session=True, images=imgs or None)
         return str(doc.get("answer") or "")
 
     def under_lock(self, fn: Callable[[], Any]) -> Any:
@@ -137,7 +151,7 @@ class AgentBridge:
         try:
             if self.echo:
                 print(f"\n[频道] ◀ {msg.label()}：{msg.text[:200]}", flush=True)
-            answer = self.ask(compose_input(msg))
+            answer = self.ask(compose_input(msg), images=msg.images)
             if self.echo:
                 print(f"[频道] ▶ {msg.label()}：{answer[:200]}", flush=True)
             try:

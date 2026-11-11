@@ -124,6 +124,13 @@ _SPECS: Dict[str, ChannelSpec] = {
                   hint="message/send 最多等几秒把答案直接带回响应，默认 45"
                        "（缺省就等；调用方显式 blocking:false 才立刻回 ack；"
                        "要小于对面客户端的超时，OACP 默认 60）"),
+            Field("allow_images", "allow_images", default="true",
+                  hint="收不收对方发来的图片（true/false，默认收）。收 = 卡片声明"
+                       " image/* 且图片进模型；关就只声明 text/plain，图片 part 忽略"
+                       "并回一句说明。单张上限由 OPENTHREE_MAX_IMAGE_BYTES 定，"
+                       "但请求体 8 MiB 才是硬闸（≈6 MiB 原图）—— 更大的图到不了这一步。"
+                       "一条消息最多收 8 张（MAX_IMAGES_PER_MESSAGE）；assets/ 总量到"
+                       " 512 MiB（ASSETS_BUDGET_BYTES）后只拒新图，腾空间要手动清理"),
         ),
     ),
 }
