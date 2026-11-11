@@ -10,12 +10,12 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.7.0`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.7.0`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.8.0`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.8.0`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
-| 元数据 | `twine check` ✓ 两个 PASSED（0.7.0 产物） |
+| 元数据 | `twine check` ✓ 两个 PASSED（0.8.0 产物） |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄）；`recursive-include docs *.md` 按**磁盘**收集而非 git，未跟踪的废案靠 `MANIFEST.in` 里显式 `exclude` 挡住 |
-| 测试 | 755 passed（仓库根，0.7.0 实跑） |
+| 测试 | 780 passed（仓库根，0.8.0 实跑） |
 | 依赖 | `PyYAML>=6.0`、`json_repair>=0.30` —— **`openai` 已移除**：LLM 传输由 `openthree/llm.py` 用标准库 `http.client` 实现，于是 `pydantic` / `pydantic-core`（Rust）/ `httpx` / `anyio` 都不再进入依赖树；频道层同样只用标准库 |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
@@ -665,6 +665,47 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
   `--inspect` → 38 工具；`build_card` 无格言 → `DEFAULT_CARD_DESCRIPTION`、带格言 → 格言，
   `A2aChannel` 现读出 `identity.json` 里的 `motto` 并进 `card()["description"]` ✓
 
+### 0.8.0 实跑记录（2026-11-11）
+
+本版内容：**A2A 收图** —— 对端可随消息把图片送进来，图片落到 `.openthree/assets/`，
+进入 history 的只是引用占位。
+
+- **协议层**：`Part` 支持 `FilePart` 的 `bytes` 与 `uri` 两种形态。`bytes` 收下写 assets；
+  `uri` **一律不下载** —— 下载等于把一个无鉴权的公开入口变成出网口。
+- **频道层四道闸**：`allow_images`（默认开）/ `max_image_bytes` /
+  `MAX_IMAGES_PER_MESSAGE = 8`（模块常量，不可配置）/ `ASSETS_BUDGET_BYTES`（512 MiB）。
+  理由同一件事：A2A 是无鉴权的公开入口，而 `assets/` 只增不减（全仓库没有
+  `reset_assets()` 调用点）。
+- **历史层**：进 history 的只是 `[图片 N: mime]` 占位，base64 与本机路径都不进，
+  `tasks/get` 同样。
+- 测试数 755 → **780**（`tests/test_a2a_channel.py` 新增 25 条收图用例）。
+
+验收（仓库根实跑）：
+
+- `pyproject.toml` / `openthree/__init__.py:__version__` / `import openthree` 三处均为 `0.8.0` ✓
+- 全量 pytest → **780 passed / 0 failed**（109.96s）✓
+- `python -m build` → `openthree-0.8.0-py3-none-any.whl`（327,888 B） +
+  `openthree-0.8.0.tar.gz`（719,911 B）（先清空 `dist/` 与 `openthree.egg-info`）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist **104 项**，越界路径 0 项（无 `.openthree/`、`config.yaml`、`api_key`、
+  `identity.json`、`limits.json`、`memory.jsonl`），真实形态 api key 0 命中；
+  与 `git ls-files` 比对未跟踪 0 项 ✓
+
+**升级提示**：收图是 A2A 频道内的新增能力，`allow_images` 默认开；但 A2A 频道本身
+仍需显式配置才启用，其它频道与内核行为无变化。
+
+- **上传**：`twine upload --non-interactive --disable-progress-bar` 一次成功 →
+  <https://pypi.org/project/openthree/0.8.0/> ✓（凭据来自 `~/.pypirc`，无交互）
+- **双向核验**：`/pypi/openthree/0.8.0/json` 的 `info.version` 为 `0.8.0`；两个文件的
+  `size` 与 `digests.sha256` 与本地 `dist/` **全串一致**，`yanked` 均为 `False`；
+  索引侧 `latest` = `0.8.0` ✓
+- **安装版验收**：干净 venv（`_live/venv080`）从 `https://pypi.org/simple/` 装 `0.8.0`，
+  在仓库之外的**中性 cwd**（`D:\projects`）跑：`import openthree` → `0.8.0` 且
+  `__file__` 指向 site-packages、`python -m openthree --version` → `openthree 0.8.0`、
+  `--inspect` → 38 工具；`ASSETS_BUDGET_BYTES` = 536,870,912（512 MiB）、
+  `MAX_IMAGES_PER_MESSAGE` = 8、`IMAGE_EXTS` 含 `.bmp`、
+  `sniff_mime(b"BM…")` → `image/bmp`、`sniff_mime(PNG 头)` → `image/png` ✓
+
 ### 上传后核对（按版本）
 
 sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/json` 的
@@ -689,6 +730,8 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.6.1 | `openthree-0.6.1.tar.gz` | 568,416 | `662b48a6d11d04d104df2709a03c053463928c0cee4e8da31fe996dcdf662a15` |
 | 0.7.0 | `openthree-0.7.0-py3-none-any.whl` | 316,340 | `e792614ebed6b884088cb39f9dbffd1d5490fa668d7c19f15ea5bc593a0d1c6a` |
 | 0.7.0 | `openthree-0.7.0.tar.gz` | 682,887 | `86adb92ba3ec0b72d58a2b4825a58c85062c52e59538ba24feab2e37668a7074` |
+| 0.8.0 | `openthree-0.8.0-py3-none-any.whl` | 327,888 | `479df4a847a902286cbc93b51021463e034be129f421d06bdefba164606120d3` |
+| 0.8.0 | `openthree-0.8.0.tar.gz` | 719,911 | `2cd55e07f72aa7e0f26bdc233646b77268d58b0d411f7ef03f3369261e66377a` |
 
 
 
