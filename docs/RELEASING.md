@@ -10,12 +10,12 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.8.0`，见 <https://pypi.org/project/openthree/>） |
-| 版本 | `0.8.0`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
+| 包名 `openthree` 在 PyPI | **已占用**（本仓库所有；线上最新 `0.9.0`，见 <https://pypi.org/project/openthree/>） |
+| 版本 | `0.9.0`（`pyproject.toml` 与 `openthree/__init__.py:__version__` 必须同步；已上传的版本不可覆盖，改动只能发新版本号） |
 | 构建 | `python -m build` ✓ 产出 `dist/openthree-<ver>-py3-none-any.whl` + `.tar.gz` |
-| 元数据 | `twine check` ✓ 两个 PASSED（0.8.0 产物） |
+| 元数据 | `twine check` ✓ 两个 PASSED（0.9.0 产物） |
 | 安全 | sdist **不含 `.openthree/`**（`MANIFEST.in` 有 `prune .openthree` 安全网，API key 不外泄）；`recursive-include docs *.md` 按**磁盘**收集而非 git，未跟踪的废案靠 `MANIFEST.in` 里显式 `exclude` 挡住 |
-| 测试 | 780 passed（仓库根，0.8.0 实跑） |
+| 测试 | 808 passed / 1 skipped（仓库根，0.9.0 实跑） |
 | 依赖 | `PyYAML>=6.0`、`json_repair>=0.30` —— **`openai` 已移除**：LLM 传输由 `openthree/llm.py` 用标准库 `http.client` 实现，于是 `pydantic` / `pydantic-core`（Rust）/ `httpx` / `anyio` 都不再进入依赖树；频道层同样只用标准库 |
 
 > ⚠️ `0.1.0` 一旦上传到 PyPI **不可覆盖**（只能发新版本号）。
@@ -706,6 +706,48 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
   `MAX_IMAGES_PER_MESSAGE` = 8、`IMAGE_EXTS` 含 `.bmp`、
   `sniff_mime(b"BM…")` → `image/bmp`、`sniff_mime(PNG 头)` → `image/png` ✓
 
+### 0.9.0 实跑记录（2026-11-12）
+
+本版内容：**A2A 出站文件** —— 智能体可以把本地文件随答复发回给调用端，对方在
+`artifacts[].parts[]` 里收到真正的 `file` part（inline base64）。详见
+`docs/a2a-outbound-files-plan.md` 与 `docs/a2a-outbound-files-plan-self-review.md`。
+
+- `attach_file` **随包发布**（`openthree/attach.py`），注册期按 A2A 门控：`-A2A`
+  必然注册；`-i` / `-d` 读 `channels.yaml`；单次任务 / `-u` / `--no-channels` 不注册。
+  非 A2A 进程里它**不存在**（不是存在但失败）—— 用户 `pip install -U` 之后什么都不用装。
+- 回程：`InboundMessage.attachments` + 桥用 `KERNEL.state` 的 `attach-turn` 槽发布
+  当前回合；artifact 的 parts 是 `[text, file…]`（**文本永远第一**，老面板不会空白），
+  `status.message` 只放文本，`history` 只存 `[附件：name mime]` 占位。
+- 安全（A2A 端点**没有鉴权**，所以默认根是工作区、默认只监听 `127.0.0.1`）：
+  根白名单（`resolve` 后判，软链逃逸拦得住）/ **反向白名单**（`.openthree/` 下除
+  `assets/` 外全拒 —— 升级暂存的 `config.yaml` 副本也拦得住）/ 单文件 20 MiB、
+  每条 4 个、合计 24 MiB、任务表文件字节 256 MiB 预算 / 名字与 mime 由本机定。
+- 卡片跟随配置声明 `application/octet-stream`（`outbound_roots: []` 时退回
+  `text/plain` —— 卡片不撒谎）；`PUSH_TIMEOUT` 5 → **60 秒**，并加 150 秒总预算
+  （60 × 4 次重试会堵死单线程 FIFO）。
+
+验收（仓库根实跑）：
+
+- `pyproject.toml` / `openthree/__init__.py` 版本号一致（`0.9.0`）✓
+- 全量 pytest → **808 passed / 1 skipped**（111s）✓
+- 端到端（真 `A2aChannel` + 真 HTTP，不 fake 任何一层）：20 MiB 文件 →
+  `['text', 'file']`，base64 27,962,028 字符、解码一致；`tasks/get` 响应体
+  26.7 MB、0.36s ✓
+- 降级不撒谎：21 MiB / 根外路径 / `.openthree/config.yaml` 各自只拒那一个文件，
+  原因写进正文，整条仍是 `completed` ✓
+- `python -m build` → wheel + sdist（先清空 `dist/` 与 `openthree.egg-info`）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist 内容核验：与 `git ls-files` 比对，**未跟踪文件 0 项**（顺带补齐了此前在磁盘上
+  但未提交的 `docs/profile-composition-guide*`，否则它们只会进包不会进 git）✓
+- 安全核验：sdist 无 `.openthree/`、无 `config.yaml` ✓
+- `twine upload --non-interactive --disable-progress-bar` 一次成功 ✓
+
+> 两轮 `ocr review`（第一轮 10 条、第二轮 3 条）全部成立、全部修复。其中三条是
+> 安全/数据级的：`.openthree/channels.yaml` 与 `channels/` 的渠道凭证外带、
+> `workspace_root()` 未 resolve 导致黑名单被静默跳过、升级暂存副本 `config.yaml`
+> 绕过枚举黑名单；另有一条「空答案 + 附件全被拒仍记 completed」与一条
+> 「`ValueError` 逃逸让 task 永远 `working`」。
+
 ### 上传后核对（按版本）
 
 sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/json` 的
@@ -732,6 +774,8 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.7.0 | `openthree-0.7.0.tar.gz` | 682,887 | `86adb92ba3ec0b72d58a2b4825a58c85062c52e59538ba24feab2e37668a7074` |
 | 0.8.0 | `openthree-0.8.0-py3-none-any.whl` | 327,888 | `479df4a847a902286cbc93b51021463e034be129f421d06bdefba164606120d3` |
 | 0.8.0 | `openthree-0.8.0.tar.gz` | 719,911 | `2cd55e07f72aa7e0f26bdc233646b77268d58b0d411f7ef03f3369261e66377a` |
+| 0.9.0 | `openthree-0.9.0-py3-none-any.whl` | 340,968 | `4375690b539157fbc454f71732229633b04041f02b98f53e6c9c757629494ae0` |
+| 0.9.0 | `openthree-0.9.0.tar.gz` | 782,193 | `31ad90bd9df1e8d82699db3debf2cea6f8c747098d01d6b8d40af32e805244f0` |
 
 
 
