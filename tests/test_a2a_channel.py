@@ -1843,7 +1843,8 @@ def test_card_declares_only_the_modes_the_endpoint_really_accepts(tmp_path):
     modes = ch.card()["defaultInputModes"]
     assert modes[0] == "text/plain"
     assert set(modes[1:]) == {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"}
-    assert ch.card()["defaultOutputModes"] == ["text/plain"]    # 回图不做
+    # 默认开启出站文件 ⇒ 默认就声明能回文件（卡片不撒谎）；文本永远是第一个 mode。
+    assert ch.card()["defaultOutputModes"] == ["text/plain", "application/octet-stream"]
 
 
 def test_allow_images_false_keeps_the_card_honest(tmp_path):
@@ -2087,3 +2088,449 @@ def test_concurrent_writes_of_the_same_image_never_leave_a_half_file(tmp_path):
     assert results[0].read_bytes() == png              # 内容完整，不是半张
     assert sniff_mime(results[0].read_bytes()) == "image/png"
     assert [p.name for p in assets.iterdir() if ".tmp-" in p.name] == []
+
+
+# --- 出站文件 -------------------------------------------------------------
+# 被测的东西只有一句：**工具负责记下，频道负责校验并发送**。所以这里既测频道层
+# （`send_text` 之后 artifact 里有什么），也测工具层（槽在不在、回执说什么）。
+
+
+def _round_with_files(ch, seen, body: str, attachments: list[dict]) -> dict:
+    """跑一轮：发消息 → 把附件挂到那条 msg 上 → 回话 → 拉回 task 视图。"""
+    _, sent = _call(ch, "message/send", {"message": _user_msg("做个报告")})
+    task_id = sent["result"]["id"]
+    seen[-1].attachments.extend(attachments)
+    ch.send_text(seen[-1], body)
+    _, got = _call(ch, "tasks/get", {"id": task_id})
+    return got["result"]
+
+
+def test_an_attachment_becomes_a_file_part_after_the_text(tmp_path):
+    """文本永远第一位：老面板只读 `parts[].text`，它不该因为多了一个 file 而空白。"""
+    src = tmp_path / "report.bin"
+    payload = bytes(range(256)) * 4
+    src.write_bytes(payload)
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "报告生成好了，见附件。", [{"path": str(src)}])
+    parts = task["artifacts"][0]["parts"]
+    assert [p["kind"] for p in parts] == ["text", "file"]
+    assert parts[0]["text"] == "报告生成好了，见附件。"
+    assert parts[1]["file"]["name"] == "report.bin"
+    assert parts[1]["file"]["mimeType"] == "application/octet-stream"
+    assert base64.b64decode(parts[1]["file"]["bytes"]) == payload
+    assert task["status"]["state"] == "completed"
+
+
+def test_the_status_message_carries_text_only(tmp_path):
+    """同一份字节不在一个响应里出现两次。"""
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"x" * 32)
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [{"path": str(src)}])
+    assert [p["kind"] for p in task["status"]["message"]["parts"]] == ["text"]
+    assert "bytes" not in json.dumps(task["status"])
+
+
+def test_history_keeps_a_placeholder_not_the_bytes_or_the_local_path(tmp_path):
+    """与入站「历史里不存 base64」对称：否则此后每次 `tasks/get` 都背上这份字节。"""
+    src = tmp_path / "报告.bin"
+    src.write_bytes(b"payload")
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [{"path": str(src)}])
+    agent_turn = task["history"][-1]
+    assert [p["kind"] for p in agent_turn["parts"]] == ["text", "text"]
+    dumped = json.dumps(task["history"], ensure_ascii=False)
+    assert "payload" not in dumped
+    assert str(tmp_path) not in dumped          # 本机路径不进历史
+    assert "附件" in agent_turn["parts"][1]["text"]
+
+
+def test_a_file_over_the_per_file_limit_is_refused_but_the_answer_still_lands(
+        tmp_path, monkeypatch):
+    """一个文件超限只拒这一个 —— 文本那部分照样值得送回去。"""
+    monkeypatch.setattr(a2a_mod, "MAX_OUTBOUND_FILE_BYTES", 100)
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 200)
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [{"path": str(src)}])
+    assert task["status"]["state"] == "completed"
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text"]
+    assert "超过单文件上限" in _text_of(task)
+
+
+def test_too_many_files_are_refused_one_by_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(a2a_mod, "MAX_OUTBOUND_FILES", 2)
+    paths = []
+    for i in range(3):
+        p = tmp_path / f"f{i}.bin"
+        p.write_bytes(b"y" * 10)
+        paths.append(str(p))
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [{"path": p} for p in paths])
+    parts = task["artifacts"][0]["parts"]
+    assert [p["kind"] for p in parts] == ["text", "file", "file"]
+    assert "最多附" in _text_of(task)
+
+
+def test_the_total_budget_is_enforced(tmp_path, monkeypatch):
+    monkeypatch.setattr(a2a_mod, "MAX_OUTBOUND_TOTAL_BYTES", 100)
+    paths = []
+    for i in range(2):
+        p = tmp_path / f"t{i}.bin"
+        p.write_bytes(b"z" * 80)
+        paths.append(str(p))
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [{"path": p} for p in paths])
+    # 第一个 80 ≤ 100 放行；第二个会到 160 → 拒
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text", "file"]
+    assert "合计超过" in _text_of(task)
+
+
+def test_a_path_outside_the_allowed_roots_is_refused(tmp_path):
+    outside = tmp_path.parent / "outside-secret.bin"
+    outside.write_bytes(b"secret")
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [{"path": str(outside)}])
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text"]
+    assert "不在允许发送的目录内" in _text_of(task)
+
+
+def test_missing_directory_and_empty_files_are_refused(tmp_path):
+    empty = tmp_path / "empty.bin"
+    empty.write_bytes(b"")
+    directory = tmp_path / "somedir"
+    directory.mkdir()
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [
+        {"path": str(tmp_path / "nope.bin")},
+        {"path": str(directory)},
+        {"path": str(empty)},
+    ])
+    text = _text_of(task)
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text"]
+    assert "读不到这个路径" in text
+    assert "不是普通文件" in text
+    assert "空文件" in text
+
+
+def test_a_symlink_escaping_the_root_is_refused(tmp_path):
+    """`resolve()` 会解开符号链接 —— 判的是它真正落到的位置。"""
+    import os
+
+    outside = tmp_path.parent / "outside-link-target.bin"
+    outside.write_bytes(b"secret")
+    link = tmp_path / "link.bin"
+    try:
+        os.symlink(outside, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("这个平台 / 账户建不了符号链接")
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [{"path": str(link)}])
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text"]
+    assert "不在允许发送的目录内" in _text_of(task)
+
+
+def test_the_workspace_config_and_keys_are_never_sent(tmp_path):
+    ws = tmp_path / ".openthree"
+    ws.mkdir(parents=True, exist_ok=True)
+    for name in ("config.yaml", "identity.json", "limits.json"):
+        (ws / name).write_text("secret: sk-xxxx\n", encoding="utf-8")
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [
+        {"path": str(ws / "config.yaml")},
+        {"path": str(ws / "identity.json")},
+        {"path": str(ws / "limits.json")},
+    ])
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text"]
+    assert "密钥黑名单" in _text_of(task)
+
+
+def test_outbound_roots_empty_turns_the_feature_off(tmp_path):
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"x")
+    ch, seen = _img_channel(tmp_path, outbound_roots="[]")
+    task = _round_with_files(ch, seen, "好了", [{"path": str(src)}])
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text"]
+    assert "关掉了出站文件" in _text_of(task)
+    assert ch.card()["defaultOutputModes"] == ["text/plain"]
+
+
+def test_a_bridge_notice_never_carries_files(tmp_path):
+    """桥的通知不是结论：一条失败的答复不该顺手带出一个文件。"""
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"x")
+    ch, seen = _img_channel(tmp_path)
+    _, sent = _call(ch, "message/send", {"message": _user_msg("hi")})
+    seen[0].attachments.append({"path": str(src)})
+    seen[0].raw["notice"] = True
+    ch.send_text(seen[0], "[openthree] 正在退出")
+    _, got = _call(ch, "tasks/get", {"id": sent["result"]["id"]})
+    task = got["result"]
+    assert task["status"]["state"] == "failed"
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text"]
+
+
+def test_a_follow_up_resets_the_previous_attachments(tmp_path):
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"x")
+    ch, seen = _img_channel(tmp_path)
+    first = _round_with_files(ch, seen, "第一版", [{"path": str(src)}])
+    assert [p["kind"] for p in first["artifacts"][0]["parts"]] == ["text", "file"]
+    task_id = first["id"]
+    _call(ch, "message/send", {"message": _user_msg("再来一版", taskId=task_id)})
+    ch.send_text(seen[-1], "第二版")          # 这一轮没挂附件
+    _, got = _call(ch, "tasks/get", {"id": task_id})
+    assert [p["kind"] for p in got["result"]["artifacts"][0]["parts"]] == ["text"]
+    assert _text_of(got["result"]) == "第二版"
+
+
+def test_task_file_budget_downgrades_the_oldest_files_first(tmp_path, monkeypatch):
+    """条数上限对 20 MiB 的文件毫无约束 —— 字节预算超了就把最旧的降级成文本。"""
+    monkeypatch.setattr(a2a_mod, "MAX_TASK_FILE_BYTES", 400)
+    ch, seen = _img_channel(tmp_path)
+    ids = []
+    for i in range(3):
+        src = tmp_path / f"f{i}.bin"
+        src.write_bytes(b"z" * 300)           # base64 后 400 字节
+        task = _round_with_files(ch, seen, f"第{i}版", [{"path": str(src)}])
+        ids.append(task["id"])
+    first = _call(ch, "tasks/get", {"id": ids[0]})[1]["result"]
+    last = _call(ch, "tasks/get", {"id": ids[-1]})[1]["result"]
+    assert "文件已过期" in json.dumps(first, ensure_ascii=False)
+    assert any(p["kind"] == "file" for p in last["artifacts"][0]["parts"])
+
+
+def test_a_channel_that_cannot_carry_files_publishes_no_turn():
+    """微信 / 钉钉回合里槽不存在 → 工具必须说实话，不能假装附上了。"""
+    from openthree.attach import TURN_SLOT
+    from openthree.kernel import KERNEL
+
+    seen: dict = {}
+
+    class _Rec:
+        def run(self, text, **kwargs):
+            from openthree.attach import attach_file
+
+            seen["slot"] = any(k[0] == TURN_SLOT for k in list(KERNEL.state))
+            seen["reply"] = attach_file(str(Path(__file__)))
+            return {"answer": "ok"}
+
+    class _Plain:
+        supports_files = False
+
+        def send_text(self, msg, text):
+            seen["answer"] = text
+
+    bridge = AgentBridge(_Rec(), echo=False)
+    bridge.start()
+    try:
+        bridge.submit(InboundMessage(text="hi"), _Plain().send_text)
+        _wait_until(lambda: "answer" in seen, what="桥跑完这条")
+    finally:
+        bridge.stop(timeout=5)
+    assert seen["slot"] is False
+    assert "这次答复发不出文件" in seen["reply"]
+
+
+def test_a_channel_that_can_carry_files_hands_the_path_to_the_reply(tmp_path):
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"abcdef")
+    seen: dict = {}
+
+    class _Rec:
+        def run(self, text, **kwargs):
+            from openthree.attach import attach_file
+
+            seen["reply"] = attach_file(str(src))
+            return {"answer": "ok"}
+
+    class _Carrier:
+        supports_files = True
+
+        def send_text(self, msg, text):
+            seen["attachments"] = list(msg.attachments)
+
+    bridge = AgentBridge(_Rec(), echo=False)
+    bridge.start()
+    try:
+        bridge.submit(InboundMessage(text="hi"), _Carrier().send_text)
+        _wait_until(lambda: "attachments" in seen, what="桥回话")
+    finally:
+        bridge.stop(timeout=5)
+    assert seen["attachments"] == [{"path": str(src), "name": ""}]
+    assert "已记下" in seen["reply"]
+
+
+def test_push_timeout_covers_a_task_carrying_a_27mb_file():
+    """27 MB 的 Task 在公网 20 Mbps 上行要 11 秒 —— 5 秒会让回调必然超时。"""
+    assert a2a_mod.PUSH_TIMEOUT >= 60.0
+
+
+def test_a_push_snapshot_carries_the_file_parts(tmp_path):
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"x" * 8)
+    ch, seen = _img_channel(tmp_path)
+    _, sent = _call(ch, "message/send", {"message": _user_msg("hi")})
+    task = ch._tasks.get(sent["result"]["id"])
+    seen[0].attachments.append({"path": str(src)})
+    ch.send_text(seen[0], "好了")
+    with ch._tasks.lock:
+        view = a2a_mod._public(task)          # 回调送的就是这个视图
+    assert any(p["kind"] == "file" for p in view["artifacts"][0]["parts"])
+
+
+def test_attach_file_is_registered_only_inside_an_a2a_process():
+    from openthree.builtins import installed_builtins
+
+    assert "attach_file" not in installed_builtins()
+    assert "attach_file" in installed_builtins(a2a=True)
+    assert "finish" in installed_builtins(a2a=True)      # 常驻集不受影响
+
+
+def test_the_a2a_gate_has_four_distinct_states(monkeypatch):
+    """每一态都对应一条真实的错法 —— 漏一个就会给某一类启动方式装错工具集。"""
+    from openthree import cli as cli_mod
+
+    class _Args:
+        def __init__(self, **kw):
+            self.a2a = False
+            self.no_channels = False
+            self.upgrade = False
+            self.daemon = False
+            self.interactive = False
+            self.no_interactive = False
+            self.task = []
+            self.auto = 0
+            self.resume = 0
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    monkeypatch.setattr(cli_mod, "_collect_images", lambda a: [])
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: True)
+
+    assert cli_mod._a2a_flag(_Args(a2a=True)) is True            # -A2A：必然起
+    assert cli_mod._a2a_flag(_Args(interactive=True)) is None     # -i：读 channels.yaml
+    assert cli_mod._a2a_flag(_Args(daemon=True)) is None          # -d：同上
+    assert cli_mod._a2a_flag(_Args(task=["干点活"])) is False      # 单次任务
+    assert cli_mod._a2a_flag(_Args(interactive=True, no_channels=True)) is False
+    assert cli_mod._a2a_flag(_Args(upgrade=True, interactive=True)) is False
+
+
+def test_declares_a2a_reads_channels_yaml(tmp_path):
+    from openthree.channels.config import ChannelConfig, ChannelsConfig
+    from openthree.channels.manager import declares_a2a
+
+    class _WS:
+        dir = tmp_path / ".openthree"
+
+    ws = _WS()
+    ws.dir.mkdir(parents=True, exist_ok=True)
+    assert declares_a2a(ws) is False                    # 没有配置 = 不声明
+    cfg = ChannelsConfig(path=ws.dir / "channels.yaml", channels=[])
+    cfg.add(ChannelConfig(name="a2a", type="a2a", enabled=False))
+    cfg.save()
+    assert declares_a2a(ws) is False                    # disabled 不算
+    cfg.get("a2a").enabled = True
+    cfg.save()
+    assert declares_a2a(ws) is True
+
+
+def test_channel_credentials_are_never_sent(tmp_path):
+    """`channels.yaml` 里是 client_secret，`channels/` 下是各渠道的 token。
+
+    它们都在默认根（工作区）里 —— 少了这条闸，任何连得上端口的人都能把钥匙要走。
+    """
+    ws = tmp_path / ".openthree"
+    (ws / "channels").mkdir(parents=True, exist_ok=True)
+    (ws / "channels.yaml").write_text("channels: []\n", encoding="utf-8")
+    (ws / "channels" / "wechat.json").write_text('{"context_token": "x"}', encoding="utf-8")
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [
+        {"path": str(ws / "channels.yaml")},
+        {"path": str(ws / "channels" / "wechat.json")},
+    ])
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text"]
+    assert "密钥黑名单" in _text_of(task)
+
+
+def test_dotenv_variants_are_never_sent(tmp_path):
+    (tmp_path / ".env.production").write_text("API_KEY=x\n", encoding="utf-8")
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了",
+                             [{"path": str(tmp_path / ".env.production")}])
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text"]
+    assert "密钥黑名单" in _text_of(task)
+
+
+def test_supports_files_follows_the_outbound_switch(tmp_path):
+    """关掉出站文件时桥不该发布回合 —— 否则工具先说「已记下」、频道层再拒。"""
+    on, _ = _img_channel(tmp_path)
+    off, _ = _img_channel(tmp_path, outbound_roots="[]")
+    assert on.supports_files is True
+    assert off.supports_files is False
+
+
+def test_the_tool_says_no_above_the_count_limit(tmp_path):
+    """回执必须为真：第 5 个文件一定发不出去，就不能说「会随本次答复发出」。"""
+    from openthree.attach import MAX_OUTBOUND_FILES, TURN_SLOT, attach_file
+    from openthree.kernel import KERNEL
+
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"x")
+    msg = InboundMessage(text="hi")
+    slot = (TURN_SLOT, threading.get_ident())
+    KERNEL.state[slot] = msg
+    try:
+        replies = [attach_file(str(src)) for _ in range(MAX_OUTBOUND_FILES + 1)]
+    finally:
+        KERNEL.state.pop(slot, None)
+    assert len(msg.attachments) == MAX_OUTBOUND_FILES
+    assert "附满" in replies[-1]
+
+
+def test_a_reply_with_no_answer_and_every_file_refused_is_failed(tmp_path):
+    """被拒的说明不是结论：它不该把一条「什么也没有」的答复变成 completed。"""
+    outside = tmp_path.parent / "o3-outside-2.bin"
+    outside.write_bytes(b"secret")
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "", [{"path": str(outside)}])
+    assert task["status"]["state"] == "failed"
+    assert "不在允许发送的目录内" in _text_of(task)
+
+
+def test_the_upgrade_staging_copy_of_config_is_never_sent(tmp_path):
+    """升级模式把旧文件 `copy2` 到 `.openthree/upgrade/<ts>/files/…`。
+
+    那是同一份 `config.yaml` 的副本、同样带着 `llm.api_key` —— 枚举式黑名单会漏掉
+    它。反向白名单（`.openthree/` 下除 `assets/` 外全拒）才守得住。
+    """
+    stage = tmp_path / ".openthree" / "upgrade" / "20261112" / "files"
+    stage.mkdir(parents=True, exist_ok=True)
+    (stage / "config.yaml").write_text("llm:\n  api_key: sk-x\n", encoding="utf-8")
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [{"path": str(stage / "config.yaml")}])
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text"]
+    assert "工作区状态不发" in _text_of(task)
+
+
+def test_assets_are_still_sendable(tmp_path):
+    """`.openthree/assets/` 是反向白名单里唯一放行的子树 —— 收来的图正是要发的。"""
+    assets = tmp_path / ".openthree" / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    src = assets / "in.png"
+    src.write_bytes(_png())
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "图在这", [{"path": str(src)}])
+    assert [p["kind"] for p in task["artifacts"][0]["parts"]] == ["text", "file"]
+
+
+def test_the_just_finished_task_is_never_expired_by_its_own_budget_check(
+        tmp_path, monkeypatch):
+    """调用方不该在同一次响应里拿到 `completed` + 一个「已过期」占位。"""
+    monkeypatch.setattr(a2a_mod, "MAX_TASK_FILE_BYTES", 100)
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"z" * 90)                  # base64 后 120 > 预算 100
+    ch, seen = _img_channel(tmp_path)
+    task = _round_with_files(ch, seen, "好了", [{"path": str(src)}])
+    assert any(p["kind"] == "file" for p in task["artifacts"][0]["parts"])
+    assert "文件已过期" not in json.dumps(task, ensure_ascii=False)

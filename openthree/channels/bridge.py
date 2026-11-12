@@ -18,6 +18,8 @@ import queue
 import threading
 from typing import Any, Callable, Dict, Optional, Sequence
 
+from ..attach import TURN_SLOT
+from ..kernel import KERNEL
 from .base import InboundMessage
 
 # 一条消息在队列里可以等多久（秒）；超时说明智能体被别的活占住了
@@ -148,6 +150,17 @@ class AgentBridge:
     def _handle(self, msg: InboundMessage,
                 reply: Callable[[InboundMessage, str], None]) -> None:
         """跑一条消息并把答案送回去；任何异常都只影响这一条。"""
+        # 「当前回合」发布给 `attach_file`：工具与 `Runtime.run` 跑在**同一个线程**
+        # 里，所以它拿到的正是这条 msg，直接往 `msg.attachments` 上挂文件。
+        # 只有**声明支持文件**的频道才发布（`reply` 是 `channel.send_text` 这个绑定
+        # 方法，`__self__` 带回频道实例）：微信 / 钉钉回合里槽不存在，工具会老实回
+        # 「这次答复发不出文件」，而不是假装附上了。
+        # 键里带线程 id：同进程多频道共用一份 `KERNEL.state`，没有它就会串台。
+        channel = getattr(reply, "__self__", None)
+        slot = (TURN_SLOT, threading.get_ident())
+        carrier = bool(getattr(channel, "supports_files", False))
+        if carrier:
+            KERNEL.state[slot] = msg
         try:
             if self.echo:
                 print(f"\n[频道] ◀ {msg.label()}：{msg.text[:200]}", flush=True)
@@ -161,6 +174,8 @@ class AgentBridge:
         except Exception as exc:  # noqa: BLE001 - 智能体出错也只影响这一条
             self._reply_quietly(msg, reply, f"{NOTICE_PREFIX}这条消息没跑通：{exc}")
         finally:
+            if carrier:
+                KERNEL.state.pop(slot, None)
             with self._pending_lock:
                 self._pending = max(0, self._pending - 1)
 

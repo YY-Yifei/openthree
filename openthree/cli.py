@@ -346,6 +346,7 @@ def main(argv=None) -> int:
         max_rounds=args.max_rounds,
         name=args.name,
         profiles=profiles,
+        a2a=_a2a_flag(args),
     )
 
     # --- A2A 频道（`-A2A`）的前置校验（已上移到 Runtime 之前，见上） ---
@@ -846,6 +847,29 @@ def _wants_interactive(args) -> bool:
             and args.auto <= 0 and args.resume <= 0
             and _stdin_is_tty())
     )
+
+
+def _a2a_flag(args) -> Optional[bool]:
+    """本进程会不会真起 A2A 频道（三态；`None` = 交给 Runtime 读 channels.yaml）。
+
+    它决定 `attach_file` 在不在工具集里（`builtins.installed_builtins(a2a=…)`）。
+    三态缺一不可，每一态都有真实的错法：
+
+    * 只判 `args.a2a` → `-i` / `-d` 里配了 a2a 的人拿不到工具（最该有它的场景）；
+    * 不判 `no_channels` → `-i --no-channels` + 磁盘声明了 a2a：工具在，一个频道都不起；
+    * 不判单次任务 → 那是 CLI 的主力用法，压根不加载频道，不该多一个永远用不上的工具；
+    * 不判 `upgrade` → `-u` 走 `_interactive(..., no_channels=True, ...)`，在调用点硬关
+      频道，而 `args.no_channels` 仍是 False —— 只看它会漏。
+
+    判「会起」而不是「已起」：`Runtime.__init__` 装配工具集时频道还没装配。精确到
+    「已起」就得让工具集在进程中途变化，system 前缀每步都变（见 `installed_builtins`）。
+    """
+    if args.a2a:
+        return True
+    if (not args.no_channels and not args.upgrade
+            and (args.daemon or _wants_interactive(args))):
+        return None
+    return False
 
 
 def _daemon(rt: Runtime, args) -> int:

@@ -42,6 +42,7 @@ import errno
 import json
 import os
 import queue
+import re
 import socketserver
 import sys
 import threading
@@ -56,6 +57,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from .. import __version__
+from ..attach import MAX_OUTBOUND_FILES
 from ..multimodal import (ImageError, TMP_MARK, asset_dest, guess_mime, max_image_bytes,
                           save_image_bytes, sniff_mime)
 from .base import Channel, InboundMessage
@@ -104,8 +106,46 @@ REGISTER_INTERVAL = 60.0        # 心跳间隔
 REGISTER_BACKOFF = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0)
 TERMINAL_STATES = ("completed", "failed", "canceled")
 
+# --- 出站文件（把本地文件随答复发回给对方）---------------------------------
+# 单文件 20 MiB：base64 后 ≈26.7 MB，JSON 化后一个响应体 27 MB 上下。它会被复制
+# 三次（`_public()` 深拷贝、blocking 响应体、回调 POST），所以这是「够用」的上限，
+# 不是「随便用」的上限。体积账见 docs/a2a-outbound-files-plan.md §5。
+MAX_OUTBOUND_FILE_BYTES = 20 << 20
+# 一条消息最多附几个：`MAX_OUTBOUND_FILES` 从 `attach.py` 导入（工具要用它决定
+# 「还收不收」；两处各写一个 4，回执与行为迟早发散）。
+MAX_OUTBOUND_TOTAL_BYTES = 24 << 20     # 一条消息合计：一个 20 MiB 大文件 + 零头
+# 任务表里**文件字节**的总预算：`TASK_LIMIT` 只管条数，对 20 MiB 的文件毫无约束
+# （200 条 × 27 MB base64 是 GB 级常驻内存）。超了就把最旧 task 的 file part 换成
+# 文本占位 —— 降级写在协议里，不是静默丢。
+MAX_TASK_FILE_BYTES = 256 << 20
+# 默认根 = 工作区（`outbound_roots: []` 是唯一关法）。默认监听 127.0.0.1；
+# 跨机是人的显式决定 —— 从那一刻起，任何连得上这个端口的人都能让你把根内的
+# 文件发出去（`--a2a-host` 的 help 与 config 的 hint 都写了这句）。
+DEFAULT_OUTBOUND_ROOTS = "."
+OUTBOUND_MIME_FALLBACK = "application/octet-stream"
+# 密钥黑名单。按**路径组件**判，不按子串：`report-api_key-summary.pdf` 不该被误杀，
+# 而 `.openthree/config.yaml` 无论根放宽到哪儿都该被拦。
+OUTBOUND_DENY_NAMES = frozenset({
+    "api_key", "api_key.txt", "id_rsa", "id_ed25519",
+})
+# `.env` / `.env.local` / `.env.production`：按前缀判，不枚举。
+OUTBOUND_DENY_NAME_PREFIXES = (".env",)
+# 工作区状态目录 `.openthree/` 下**唯一**允许外发的子树：收来的图（对方要看的往往
+# 就是它）。其余一律不发 —— 这是**反向白名单**而不是枚举：枚举会漏，最现实的例子是
+# 升级模式把被覆盖的旧文件 `copy2` 到 `.openthree/upgrade/<ts>/files/config.yaml`，
+# 那是 `config.yaml` 的副本、同样带着 llm.api_key，却不在任何一张枚举表里。反向规则
+# 让「新增的状态文件」默认是**不可外发**的，而不是悄悄可外发。
+OUTBOUND_ALLOW_PATH = ".openthree/assets"
+
 # --- 回调（push notifications）的参数 --------------------------------------
-PUSH_TIMEOUT = 5.0              # 单次 POST 的超时（对面是个 HTTP 服务，不是 registry）
+# 单次 POST 的超时得罩得住一份 27 MB 的 Task：千兆 0.3 s、百兆 2.3 s、公网
+# 20 Mbps 上行约 11 s。5 秒会让公网回调**必然**超时，然后重试 4 次 —— 投递线程
+# 被占半分钟以上，还是一条都送不到。
+PUSH_TIMEOUT = 60.0
+# 但「每次 60 秒」× 4 次 = 4 分钟，而投递是**单线程 FIFO**：一个收下连接就不说话的
+# 对面能把后面所有回调堵住四分钟（队列里还排着 27 MB 的快照）。所以再加一道总预算：
+# 用完就放弃，日志说清还剩几次 —— 结论仍在 `tasks/get` 里。
+PUSH_TOTAL_BUDGET = 150.0
 PUSH_TRIES = 4                  # 最多试几次（首次 + 3 次重试）
 PUSH_BACKOFF = (0.5, 1.0, 2.0)  # 两次之间的等待
 PUSH_READ_LIMIT = 4096          # 只读这么多响应正文：我们只关心状态码
@@ -499,7 +539,8 @@ def message_text(message: Any) -> str:
 
 def build_card(*, name: str, url: str, version: str = __version__,
                motto: str = "",
-               input_modes: Sequence[str] = (TEXT_INPUT_MODE,)) -> Dict[str, Any]:
+               input_modes: Sequence[str] = (TEXT_INPUT_MODE,),
+               output_modes: Sequence[str] = (TEXT_INPUT_MODE,)) -> Dict[str, Any]:
     """构造 AgentCard。
 
     两拨人要同时喂饱：ADP 严格校验要 `supportedInterfaces` 非空、`capabilities`
@@ -521,13 +562,17 @@ def build_card(*, name: str, url: str, version: str = __version__,
     对自己的定义，比一句通用的内核说明更像「这个 agent 是谁」。没写格言时回退
     `DEFAULT_CARD_DESCRIPTION` —— 卡片是公开物，不该出现空 description。
 
-    `input_modes` 是 `defaultInputModes`。**判据：卡片不撒谎** —— 声明了
-    `image/*` 就必须真能收（`A2aChannel.input_modes()` 按 `allow_images` 决定）。
-    它是 MIME 能力，不承诺任意大小：两道闸（8 MiB 请求 / 单张图上限）仍在。
-    `defaultOutputModes` 恒为 `text/plain`：回图不做（面板只从
-    `artifacts[].parts[].text` 取文本，回 file part 会让它一片空白）。
+    `input_modes` / `output_modes` 是 `defaultInputModes` / `defaultOutputModes`。
+    **判据：卡片不撒谎** —— 声明了 `image/*` 就必须真能收
+    （`A2aChannel.input_modes()` 按 `allow_images` 决定），声明了能回文件就必须
+    真能发（`A2aChannel.output_modes()` 按 `outbound_roots` 决定）。两处都是 MIME
+    能力，不承诺任意大小：入站有 8 MiB 请求闸与单张图上限，出站有单文件 20 MiB /
+    单条 4 个 / 合计 24 MiB 三道闸。
+    回文件时 **文本 part 永远在第一位**：只从 `artifacts[].parts[].text` 取文本的
+    老面板照样拿到完整答案，file part 是给读得懂它的客户端的。
     """
     modes = [m for m in input_modes if m] or [TEXT_INPUT_MODE]
+    outs = [m for m in output_modes if m] or [TEXT_INPUT_MODE]
     return {
         "name": name or "openthree",
         "description": (motto or "").strip() or DEFAULT_CARD_DESCRIPTION,
@@ -539,7 +584,7 @@ def build_card(*, name: str, url: str, version: str = __version__,
         ],
         "capabilities": {"streaming": False, "pushNotifications": True},
         "defaultInputModes": modes,
-        "defaultOutputModes": [TEXT_INPUT_MODE],
+        "defaultOutputModes": outs,
         "skills": [
             {
                 "id": "openthree.task",
@@ -615,26 +660,129 @@ class _TaskStore:
                     self.on_terminal(old)
             old["_done"].set()
 
+    def enforce_file_budget(self, limit: Optional[int] = None,
+                            protect: str = "") -> int:
+        """任务表里**文件字节**的总预算：超了就把最旧 task 的文件降级成文本占位。
+
+        这是「条数」之外的另一个维度：`TASK_LIMIT = 200` 对 20 MiB 的文件毫无
+        约束，200 条 × 27 MB base64 是 GB 级常驻内存 —— 那不是理论值，是不装闸时
+        OOM 的算术。返回释放的字节数（0 = 没超）。
+
+        `protect` 是**刚产出文件的那条 task**：它必须被跳过。否则「大文件连发」时
+        预算会一路降到当前这条，调用方在同一次响应里拿到 `completed` + 一个
+        `[文件已过期：…]` 占位 —— 它刚要的文件在它眼前过期了。
+
+        降级**写在协议里**（`[文件已过期：name]`），不是静默丢：对方看得见文件
+        没了，也知道为什么。老面板只读 `parts[].text`，降级后它反而读得懂。
+        """
+        if limit is None:
+            # 运行期读模块常量，而不是写成默认参数：默认参数在**定义时**绑定，
+            # 改常量（或测试里 monkeypatch）不会生效 —— 那样预算就成了一个测不到、
+            # 也改不动的死值。
+            limit = MAX_TASK_FILE_BYTES
+        if limit <= 0:
+            return 0
+        with self.lock:
+            total = sum(_task_file_bytes(t) for t in self._items.values())
+            if total <= limit:
+                return 0
+            before = total
+            for task in list(self._items.values()):     # OrderedDict：最旧在前
+                if total <= limit:
+                    break
+                if protect and _as_text(task.get("id")) == protect:
+                    continue
+                total -= _drop_task_files(task)
+            return max(0, before - total)
+
 
 def _state_of(task: Dict[str, Any]) -> str:
     return str(_as_dict(task.get("status")).get("state") or "")
 
 
-def _set_terminal(task: Dict[str, Any], state: str, text: str) -> None:
+def _set_terminal(task: Dict[str, Any], state: str, text: str,
+                  files: Sequence[Dict[str, Any]] = ()) -> None:
     """置终态 + 写 artifact + 追加一条 agent 历史（**调用方持锁**）。
+
+    三条出站文件的判据：
+
+      * **文本 part 永远是第一位** —— 只从 `artifacts[].parts[].text` 取文本的老面板
+        不会空白：它读不懂 file part，但读不懂不等于看不见文本。
+      * **`status.message` 只放文本** —— 同一份字节不在一个响应里出现两次。
+      * **`history` 只放占位** —— 与入站「历史里不存 base64」对称；否则此后每次
+        `tasks/get` 都要背上这份字节。
 
     面板只从 `artifacts[].parts[].text` 取文本 —— 没有 artifact 的 task 在界面上
     是一片空白，失败原因也一样（所以 `failed` / `canceled` 同样带 artifact）。
-    三个入口共用这一处：正常回话、服务退出、任务表挤出。
+    共用这一处的入口：正常回话、服务退出、任务表挤出、取消。
     """
+    stamps = [_file_placeholder(f) for f in (files or ())]
     task["status"] = {"state": state, "timestamp": _now(),
                       "message": {"role": "agent", "parts": [{"kind": "text", "text": text}]}}
     task["artifacts"] = [{
         "artifactId": f"{task.get('id')}-answer",
         "name": "answer",
-        "parts": [{"kind": "text", "text": text}],
+        "parts": [{"kind": "text", "text": text}, *[dict(f) for f in (files or ())]],
     }]
-    task["history"].append({"role": "agent", "parts": [{"kind": "text", "text": text}]})
+    task["history"].append({"role": "agent",
+                            "parts": [{"kind": "text", "text": text}, *stamps]})
+
+
+def _file_placeholder(part: Dict[str, Any]) -> Dict[str, Any]:
+    """history 里的文件占位：一行文本，不含字节、不含本机路径。"""
+    file = _as_dict(_as_dict(part).get("file"))
+    name = _as_text(file.get("name")) or "附件"
+    mime = _as_text(file.get("mimeType")) or OUTBOUND_MIME_FALLBACK
+    return {"kind": "text", "text": f"[附件：{name} {mime}]"}
+
+
+def _clean_outbound_name(name: str, fallback: str = "download.bin") -> str:
+    """对方看到的文件名：只取 basename、滤掉控制字符与路径分隔符、截到 128。
+
+    模型可以为了对方看得懂而改名，但**不采信它**：路径分隔符能伪造目录，控制字符
+    能伪造日志行。留一个纯文件名就够。
+    """
+    base = Path(str(name or "")).name or fallback
+    cleaned = "".join(c for c in base if c.isprintable() and c not in '\\/:*?"<>|')
+    cleaned = cleaned.strip().strip(".")
+    if cleaned:
+        return cleaned[:128]
+    # 回落值也要消毒：它通常是真实文件名，而 POSIX 的文件名可以只由一个换行或一个
+    # 反斜杠组成 —— 那正是这个函数要挡的东西。
+    alt = "".join(c for c in str(fallback or "") if c.isprintable() and c not in '\\/:*?"<>|')
+    return (alt.strip().strip(".") or "download.bin")[:128]
+
+
+def _task_file_bytes(task: Dict[str, Any]) -> int:
+    """这条 task 的 file part 里有多少 base64 字节（预算的度量单位）。"""
+    total = 0
+    for art in task.get("artifacts") or ():
+        for part in _as_dict(art).get("parts") or ():
+            file = _as_dict(_as_dict(part).get("file"))
+            total += len(_as_text(file.get("bytes")))
+    return total
+
+
+def _drop_task_files(task: Dict[str, Any]) -> int:
+    """把一条 task 的 file part 换成文本占位，返回释放的字节数。
+
+    降级**写在协议里**：`[附件：name mime]` 换成 `[文件已过期：name]`，对方看得见
+    「文件没了」，也知道为什么 —— 不是静默丢。
+    """
+    freed = 0
+    for art in task.get("artifacts") or ():
+        parts = _as_dict(art).get("parts")
+        if not isinstance(parts, list):
+            continue
+        for i, part in enumerate(parts):
+            file = _as_dict(_as_dict(part).get("file"))
+            n = len(_as_text(file.get("bytes")))
+            if not n:
+                continue
+            freed += n
+            name = _as_text(file.get("name")) or "附件"
+            parts[i] = {"kind": "text", "text": f"[文件已过期：{name}]"}
+    return freed
 
 
 def _public(task: Dict[str, Any], history_length: Any = None) -> Dict[str, Any]:
@@ -869,6 +1017,57 @@ class A2aChannel(Channel):
         """
         return self.option_bool("allow_images", True)
 
+    @property
+    def outbound_roots(self) -> List[Path]:
+        """能随答复发出的文件根目录（`outbound_roots`，默认 `"."` = 工作区）。
+
+        **每次现读 options**，与 `allow_images` 同一个理由：卡片是每次 GET 现构造
+        的，请求也是每次现判的 —— 两处必须看同一个值。
+
+        配置层把选项值统一 `str()`（`ChannelConfig.from_dict`），所以 `[]` 会变成
+        `"[]"`、`[a, b]` 变成 `"['a', 'b']"`。这里按**分隔符**切而不是按逗号切，
+        两种写法都认；切完为空 = 关掉出站文件（`[]` 是唯一关法）。
+        """
+        raw = str(self.option("outbound_roots", DEFAULT_OUTBOUND_ROOTS) or "")
+        items = [x.strip() for x in re.split(r"[,;\[\]'\"]+", raw) if x.strip()]
+        if not items:
+            return []
+        base = self.workspace_root()
+        roots: List[Path] = []
+        for item in items:
+            # `expanduser()` 也在 try 里：`~nosuchuser` 抛 RuntimeError，漏掉它就会
+            # 从 `card()` 与 `send_text()` 里冒出去 —— 一条写错的配置不该让整条答复
+            # 变成 working 卡死。
+            try:
+                p = Path(item).expanduser()
+                if not p.is_absolute():
+                    p = base / p
+                roots.append(p.resolve())
+            except (OSError, RuntimeError, ValueError):
+                continue        # 单条路径解析不了不该让整个频道起不来
+        return roots
+
+    def workspace_root(self) -> Path:
+        """项目根（`.openthree` 的父目录）—— `outbound_roots` 与黑名单的相对路径基准。
+
+        **必须 resolve**：`_denied_outbound()` 拿它跟一个已经 resolve 过的绝对路径
+        比 `relative_to()`；基准是相对路径时那个调用抛 ValueError，整个 `.openthree`
+        黑名单就被静默跳过 —— 一条安全闸的失效，不该取决于工作区是怎么传进来的。
+        """
+        root = Path(self.workspace_dir) if self.workspace_dir else Path(".openthree")
+        return (root.parent if root.name == ".openthree" else root).resolve()
+
+    @property
+    def supports_files(self) -> bool:
+        """能不能把文件随答复送回去 —— 与 `outbound_roots` 同步。
+
+        桥据此决定要不要把这个回合发布给 `attach_file`。`outbound_roots: []` 时
+        必须为假：否则工具先说「已记下」、频道层再拒，回执就是假的。微信 / 钉钉
+        将来要实现 file part 时，加一行同样的属性即可，工具一个字不用改（它只认
+        「当前回合有没有承载者」）。
+        """
+        return bool(self.outbound_roots)
+
     # --- 状态落盘 -----------------------------------------------------
     def state_path(self) -> Path:
         root = Path(self.workspace_dir) if self.workspace_dir else Path(".openthree")
@@ -1047,9 +1246,20 @@ class A2aChannel(Channel):
         """
         return [TEXT_INPUT_MODE, *IMAGE_INPUT_MODES] if self.allow_images else [TEXT_INPUT_MODE]
 
+    def output_modes(self) -> List[str]:
+        """卡片声明的输出类型 —— **与出站文件开关同步**（卡片不撒谎）。
+
+        默认开（`outbound_roots` 默认 `"."`），所以默认就声明能回文件；人写
+        `outbound_roots: []` 关掉，这里就只剩 `text/plain`。开了却不说，严格
+        客户端根本不会来要文件；没开却说能，它会等一个永远不来的 file part。
+        """
+        return ([TEXT_INPUT_MODE, OUTBOUND_MIME_FALLBACK] if self.outbound_roots
+                else [TEXT_INPUT_MODE])
+
     def card(self) -> Dict[str, Any]:
         return build_card(name=self.display_name(), motto=self.display_motto(),
-                          url=self.card_url, input_modes=self.input_modes())
+                          url=self.card_url, input_modes=self.input_modes(),
+                          output_modes=self.output_modes())
 
     # --- 生命周期 -----------------------------------------------------
     def run(self) -> None:
@@ -1251,6 +1461,142 @@ class A2aChannel(Channel):
             shown = "".join(c if c.isprintable() else "?" for c in declared[:64])
             self.log.warning("a2a 图片声明 %s，内容其实是 %s", shown, actual or "未知")
         return str(path), ""
+
+    # --- 出站文件 -----------------------------------------------------
+    def _outbound_file_parts(
+            self, attachments: Sequence[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """把本轮要附的文件变成 file parts；返回 `(parts, 说明)`。
+
+        **不抛异常**：每个被拒的文件各留一句原因，与入站「一张图没收到不该让整条
+        消息失败」同一判据 —— 文本那部分照样值得送回去。
+
+        四道闸，顺序即代价（先便宜的）：
+          1. **根白名单** —— 先 `resolve(strict=True)` 再判是否在根内。resolve 会解开
+             符号链接，所以软链逃逸也拦得住；strict 让「读到一半被删」变成一个拒绝，
+             而不是一个空 file part。
+          2. **密钥黑名单** —— 工作区的配置 / 身份 / 限额 / memory / sessions 一律不发。
+          3. **三道上限** —— 单文件 / 个数 / 合计。超一个就只拒这一个，不整条失败。
+          4. **名字消毒 + mime 本机定** —— 模型给的 `name` 只留 basename、滤掉控制
+             字符与路径分隔符；`mimeType` 由 `guess_mime()` 按本机后缀猜，不采信任何
+             外部输入（与入站「类型只认 magic bytes」同源）。
+        """
+        parts: List[Dict[str, Any]] = []
+        notes: List[str] = []
+        pending = [a for a in (attachments or ()) if isinstance(a, dict)]
+        if not pending:
+            return parts, notes
+        roots = self.outbound_roots
+        if not roots:
+            # 关掉出站文件时本来不该有 attachments（工具会说「发不出去」）。这里仍兜
+            # 一句：万一有人绕开工具直接塞，也别让文件悄悄溜出去。
+            return parts, [f"（{len(pending)} 个附件没有发送：本频道关掉了出站文件）"]
+        total = 0
+        for item in pending:
+            raw = str(item.get("path") or "").strip()
+            shown = str(item.get("name") or "").strip() or Path(raw).name or "附件"
+            if not raw:
+                notes.append("（1 个附件没有发送：路径是空的）")
+                continue
+            try:
+                path = Path(raw).expanduser().resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                # `ValueError` 也要捕：含 NUL 的路径 `os.stat` 抛的是 ValueError 而不是
+                # OSError。漏掉它，异常会从 `send_text` 冒出去 —— 而桥的兜底会拿同一条
+                # msg 重入 `send_text` 再炸一次，这个 task 就永远停在 working。
+                notes.append(f"（{shown} 没有发送：读不到这个路径）")
+                continue
+            if not path.is_file():
+                notes.append(f"（{shown} 没有发送：不是普通文件）")
+                continue
+            denied = self._denied_outbound(path)
+            if denied:
+                notes.append(f"（{shown} 没有发送：{denied}）")
+                continue
+            if not self._within_outbound_roots(path, roots):
+                notes.append(f"（{shown} 没有发送：不在允许发送的目录内）")
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                notes.append(f"（{shown} 没有发送：读不到文件大小）")
+                continue
+            if size <= 0:
+                notes.append(f"（{shown} 没有发送：空文件）")
+                continue
+            if size > MAX_OUTBOUND_FILE_BYTES:
+                notes.append(f"（{shown} 没有发送：{size} 字节超过单文件上限 "
+                             f"{MAX_OUTBOUND_FILE_BYTES}）")
+                continue
+            if len(parts) >= MAX_OUTBOUND_FILES:
+                notes.append(f"（{shown} 没有发送：一条消息最多附 "
+                             f"{MAX_OUTBOUND_FILES} 个文件）")
+                continue
+            if total + size > MAX_OUTBOUND_TOTAL_BYTES:
+                notes.append(f"（{shown} 没有发送：附件合计超过 "
+                             f"{MAX_OUTBOUND_TOTAL_BYTES} 字节）")
+                continue
+            try:
+                # 只读 `size + 1` 字节。多读的那 1 字节就是「它在 stat 之后变了」的
+                # 证据，同时保证一次分配不超过单文件上限：`read_bytes()` 会按文件
+                # **现在**的大小分配 —— stat 与读之间的间隙够别人把它换成 2 GB。
+                with path.open("rb") as handle:
+                    data = handle.read(size + 1)
+            except OSError:
+                notes.append(f"（{shown} 没有发送：读不出来）")
+                continue
+            if len(data) != size:
+                notes.append(f"（{shown} 没有发送：文件在发送时被改动）")
+                continue
+            parts.append({
+                "kind": "file",
+                "file": {
+                    "name": _clean_outbound_name(shown, path.name),
+                    "mimeType": guess_mime(path) or OUTBOUND_MIME_FALLBACK,
+                    "bytes": base64.b64encode(data).decode("ascii"),
+                },
+            })
+            total += len(data)
+        return parts, notes
+
+    def _within_outbound_roots(self, path: Path, roots: Sequence[Path]) -> bool:
+        for root in roots:
+            try:
+                if path == root or path.is_relative_to(root):
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
+
+    def _denied_outbound(self, path: Path) -> str:
+        """命中黑名单就返回原因（空串 = 放行）。
+
+        两条规则，管的是两件事：
+
+        * **文件名**：`.env*` / `api_key` / 私钥 —— 按名字判，不管它在哪一层。
+          按组件判、不按子串：`report-api_key-summary.pdf` 不该被误杀。
+        * **工作区状态目录**：`.openthree/` 下除 `assets/` 外一律不发（反向白名单）。
+          枚举会漏 —— 升级模式把旧文件复制到 `.openthree/upgrade/<ts>/files/…`，
+          那是同一份 `config.yaml` 的副本，同样带着 llm.api_key，却不在任何一张
+          枚举表里。反向规则让「新增的状态文件」默认**不可外发**。
+        """
+        name = path.name.lower()
+        if name in OUTBOUND_DENY_NAMES:
+            return "命中密钥黑名单"
+        for prefix in OUTBOUND_DENY_NAME_PREFIXES:
+            if name == prefix or name.startswith(prefix + "."):
+                return "命中密钥黑名单（.env 里通常是密钥）"
+        try:
+            rel = path.relative_to(self.workspace_root())
+        except ValueError:
+            return ""
+        rel_text = rel.as_posix().lower()
+        if rel_text == ".openthree" or rel_text.startswith(".openthree/"):
+            if (rel_text == OUTBOUND_ALLOW_PATH
+                    or rel_text.startswith(OUTBOUND_ALLOW_PATH + "/")):
+                return ""
+            return "命中密钥黑名单（工作区状态不发）"
+        return ""
 
     # --- JSON-RPC -----------------------------------------------------
     def handle_rpc(self, raw: bytes, *, caller: str = "") -> Tuple[int, Dict[str, Any]]:
@@ -1508,31 +1854,56 @@ class A2aChannel(Channel):
         # `[openthree] ` 当作答案的开头（比如它正在解释这个前缀），只按前缀判会把
         # 一条真答案误记成失败回给对面的智能体。
         is_notice = isinstance(msg.raw, dict) and bool(msg.raw.get("notice"))
+        # 附件与文本一起走完这一次回程：`attach_file` 只往 `msg.attachments` 上挂了
+        # 「要发什么」，路径白名单与体积上限全部在这里判（安全判定只有一份）。
+        files, notes = self._outbound_file_parts(getattr(msg, "attachments", ()) or ())
+        if is_notice:
+            # 桥自己塞的话不是结论：连附件一起丢掉 —— 它跟一条失败的答复无关。
+            files, notes = [], []
+            answered = False
+        else:
+            # 「模型到底答没答」必须在拼 notes **之前**记下来：被拒说明本身也会让
+            # body 非空，拿它判就等于「所有附件都被拒 + 模型一个字没说」也记成
+            # completed —— 对面拿到一条只有拒绝理由的"成功"答复。
+            answered = bool(body)
+            if not answered and files:
+                body = "（这条答复只有附件，见 file part）"
+        if notes:
+            body = (body + "\n\n" + "\n".join(notes)).strip()
         if is_notice:
             # 桥自己塞的话（「正在退出」/「这条消息没跑通」）**不是**结论：
             # 记成 completed 会让对面拿到一条"成功"的空答案。
             self._finish(task, "failed", body or "这条消息没有跑完（桥给出的通知是空的）",
                          run_id=run_id)
-        elif not body:
-            self._finish(task, "failed", "智能体这次没有给出结论（answer 为空）",
+        elif not answered and not files:
+            # `body` 里可能已经有「附件为什么没发出去」—— 那是这条失败唯一有价值的
+            # 信息，别用一句通用文案把它盖掉。
+            self._finish(task, "failed", body or "智能体这次没有给出结论（answer 为空）",
                          run_id=run_id)
         else:
-            self._finish(task, "completed", body, run_id=run_id)
+            self._finish(task, "completed", body, run_id=run_id, files=files)
 
     def _finish(self, task: Dict[str, Any], state: str, text: str,
-                run_id: Any = None) -> None:
+                run_id: Any = None,
+                files: Sequence[Dict[str, Any]] = ()) -> None:
         """置终态 + 写 artifact + 唤醒 blocking 等待者。终态之后一律忽略。
 
         `run_id` 给了就在**同一把锁**里比所有权：比在锁外、改在锁内的话，中间
         那一瞬正好够一个已被 follow up 取代的旧 run 把答案写进来（先到先得），
         这一轮的真答案随后撞上终态检查被丢掉 —— 调用方看到「问 A 答 B」。
+
+        `files` 是这一轮要带回给对方的 file parts（已校验、已 base64）。
         """
         with self._tasks.lock:
             if run_id is not None and task.get("_run") != run_id:
                 return
             if _state_of(task) in TERMINAL_STATES:
                 return
-            _set_terminal(task, state, text)
+            _set_terminal(task, state, text, files=files)
+            # 文件字节也受任务表预算约束（RLock 可重入）：不装闸时 200 条 × 27 MB
+            # base64 是 GB 级常驻内存。`protect` 是这一条自己 —— 它刚产出的文件不该
+            # 在同一次响应里被自己的预算检查换成「已过期」占位。
+            self._tasks.enforce_file_budget(protect=_as_text(task.get("id")))
             # 入队回调（RLock 可重入；`_notify_push` 只快照 + 入队，不做 IO）：
             # 与终态在同一把锁里，送出去的快照就不会是「completed + 空 artifacts」。
             self._notify_push(task)
@@ -1626,10 +1997,14 @@ class A2aChannel(Channel):
             headers["Authorization"] = authorization
         where = _redact(url)                  # 日志里不出现 path：token 通常就在里面
         last = ""
+        deadline = time.monotonic() + PUSH_TOTAL_BUDGET
         for attempt in range(1, PUSH_TRIES + 1):
             try:
+                # 单次超时仍要罩得住 27 MB，但**不能超过总预算**：否则一个收下连接就
+                # 不说话的对面，会让这一次投递独吞整条 FIFO。
+                budget = min(PUSH_TIMEOUT, max(1.0, deadline - time.monotonic()))
                 status, _ = http_call(self._push_opener(), "POST", url, payload,
-                                      headers=headers, timeout=PUSH_TIMEOUT,
+                                      headers=headers, timeout=budget,
                                       read_limit=PUSH_READ_LIMIT)
             except _TransportError as exc:
                 last = str(exc)
@@ -1644,6 +2019,10 @@ class A2aChannel(Channel):
                                  f"结论仍在 tasks/get 里")
                     return False
             if attempt < PUSH_TRIES:
+                if time.monotonic() >= deadline:
+                    self._notice(f"回调 {where} 的总预算（{PUSH_TOTAL_BUDGET:.0f} 秒）用完，"
+                                 f"任务 {task_id} 剩下的投递放弃 —— 结论仍在 tasks/get 里")
+                    return False
                 time.sleep(PUSH_BACKOFF[min(attempt - 1, len(PUSH_BACKOFF) - 1)])
         self._notice(f"回调 {where} 连不上，任务 {task_id} 的结论没送出去（{last}）——"
                      f"结论仍在 tasks/get 里")

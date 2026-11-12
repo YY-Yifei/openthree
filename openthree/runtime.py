@@ -58,7 +58,8 @@ class Runtime:
                  turns: Optional[int] = None,
                  max_rounds: Optional[int] = None,
                  name: Optional[str] = None,
-                 profiles: Sequence[Path] = ()) -> None:
+                 profiles: Sequence[Path] = (),
+                 a2a: Optional[bool] = None) -> None:
         self.project_dir = Path(project_dir or Path.cwd()).resolve()
         self.quiet = quiet
         self.name_arg = (name or "").strip() or None    # --name：人类给的「命名种子」
@@ -85,6 +86,18 @@ class Runtime:
         self.ws = Workspace(self.project_dir, profiles=tuple(profiles)).init(
             force_prompts=force_prompts)
         self._seed_identity()
+        # 本进程会不会起 A2A 频道 —— 决定 `attach_file` 在不在工具集里。
+        # 三态：None = 没在命令行上说死，自己读 channels.yaml（`-i` / `-d` 的常见
+        # 情形）；True = 必然起（`-A2A`）；False = 一个频道都不起（单次任务 /
+        # `-u` / `--no-channels`）—— 后三者的判据在 `cli`，因为它才知道这次要跑什么。
+        # 判「会起」而不是「已起」：注册在这里，频道装配在之后；精确到「已起」就得让
+        # 工具集在进程中途变化，system 前缀每步都变（见 `installed_builtins`）。
+        # 延迟 import：别让内核模块在**加载期**就依赖频道层（yaml / bridge / 线程会被
+        # 一并拉进每一个 `from openthree.runtime import Runtime` 的地方）。
+        if a2a is None:
+            from .channels.manager import declares_a2a
+            a2a = declares_a2a(self.ws)
+        self.a2a_enabled = bool(a2a)
         self.config: LLMConfig = load_config(self.project_dir, model_override=model)
         # CLI 显式给的上下文窗口覆盖 config 里的值（config 已在 load_config 里兜过底）。
         if self._context_window_arg is not None:
@@ -102,7 +115,7 @@ class Runtime:
         self.context_budget_source = ("显式 --context-budget" if budget_arg is not None
                                       else f"按窗口 {_fmt_tokens(self.context_window_tokens)} 推导")
         self.registry = Registry(self.ws)
-        for name, fn in installed_builtins().items():
+        for name, fn in installed_builtins(a2a=self.a2a_enabled).items():
             self.registry.register_builtin(name, fn)
         self.registry.freeze_builtins()
         self.registry.reload()

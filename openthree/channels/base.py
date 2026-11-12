@@ -35,6 +35,11 @@ class InboundMessage:
     # `Runtime.run(images=…)`（与 CLI `--image` 同一条路）。
     # 有默认值 ⇒ 微信 / 钉钉 / 既有构造点零改动。
     images: List[str] = field(default_factory=list)
+    # 本轮答复要带回去的文件：`{"path": 本机路径, "name": 对方看到的文件名}`。
+    # 由 `attach_file` 往里追加，频道在回程取走并做**全部**安全校验（路径白名单
+    # 只在频道层有一份 —— 用户态工具绕不过它）。与 `images` 同构：有默认值 ⇒
+    # 微信 / 钉钉 / 既有构造点零改动。
+    attachments: List[Dict[str, Any]] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def label(self) -> str:
@@ -59,6 +64,10 @@ class Channel(ABC):
     """
 
     type: str = ""
+    # 这个频道能不能把文件送回对方。默认不能：桥只在它为真时才把「当前回合」
+    # 发布给 `attach_file`，于是微信 / 钉钉回合里调到那个工具时，它会老实回
+    # 「这次答复发不出文件」—— 而不是假装附上了。
+    supports_files: bool = False
 
     def __init__(self, name: str, options: Dict[str, Any], *,
                  on_message: Optional[OnMessage] = None,

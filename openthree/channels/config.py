@@ -131,6 +131,13 @@ _SPECS: Dict[str, ChannelSpec] = {
                        "但请求体 8 MiB 才是硬闸（≈6 MiB 原图）—— 更大的图到不了这一步。"
                        "一条消息最多收 8 张（MAX_IMAGES_PER_MESSAGE）；assets/ 总量到"
                        " 512 MiB（ASSETS_BUDGET_BYTES）后只拒新图，腾空间要手动清理"),
+            Field("outbound_roots", "outbound_roots", default=".",
+                  hint="能随答复发给对方的文件根目录（逗号分隔，默认 \".\" = 工作区；"
+                       "写 [] = 关掉出站文件，卡片也不再声明能回文件）。路径先 resolve "
+                       "再判是否在根内，符号链接逃逸拦得住；`.openthree/` 里的配置与密钥"
+                       "一律不发。**A2A 端点没有鉴权** —— 把 host 改成 0.0.0.0 跨机暴露"
+                       "之后，任何连得上这个端口的人都能让你把根内的文件发出去；"
+                       "跨机前先收窄这里（例如 assets,tmp）"),
         ),
     ),
 }
