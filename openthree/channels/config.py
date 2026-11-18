@@ -124,6 +124,18 @@ _SPECS: Dict[str, ChannelSpec] = {
                   hint="message/send 最多等几秒把答案直接带回响应，默认 45"
                        "（缺省就等；调用方显式 blocking:false 才立刻回 ack；"
                        "要小于对面客户端的超时，OACP 默认 60）"),
+            Field("cancel_grace", "cancel_grace",
+                  hint="tasks/cancel 最多等几秒确认「真的停了」，默认 2；0 = 立刻回"
+                       "「已请求」（之后要自己 tasks/get 看停没停）。等到了就把"
+                       "「停在第 N 步」直接写进 artifact，比只说「已请求」有用得多"),
+            Field("cancel_hard_grace", "cancel_hard_grace",
+                  hint="取消后多少秒仍未停下就硬退出整个进程（默认 30；0 = 关）。"
+                       "这是「停机器不是停一轮」：桥只有一条工作线程，一条无上界的"
+                       "工具（自造 function 的纯 Python 死循环）会把它扣住，队列里的"
+                       "新消息永远排不上。开了就必须有外部守护把它拉起来。"
+                       "**注意：A2A 端点没有鉴权 —— 任何能连上这个端口的人都能触发它**"
+                       "（发一条会卡住的任务再 tasks/cancel，30 秒后整个进程退出，"
+                       "任务表在内存里，其余任务一起没）。跨机暴露前先想清楚这一条"),
             Field("allow_images", "allow_images", default="true",
                   hint="收不收对方发来的图片（true/false，默认收）。收 = 卡片声明"
                        " image/* 且图片进模型；关就只声明 text/plain，图片 part 忽略"

@@ -28,6 +28,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
+from . import cancel
 from .agent import Agent, resolve_context_budget
 from .builtins import installed_builtins
 from .kernel import KERNEL
@@ -252,7 +253,8 @@ class Runtime:
             append: bool = False, session_id: Optional[str] = None,
             images: Optional[Sequence[Union[str, Path]]] = None,
             session: bool = False,
-            rounds: Optional[int] = None) -> Dict[str, Any]:
+            rounds: Optional[int] = None,
+            cancel_token: Optional[cancel.CancelToken] = None) -> Dict[str, Any]:
         """跑一次任务 —— **一次任务 = 若干轮（round），每轮是一次完整 ReAct 循环**。
 
         轮与步是两层：`max_iterations` 是**一轮**的步预算，`max_rounds` 是**整场**的
@@ -291,6 +293,10 @@ class Runtime:
         prev_summary = ""
         try:
             while True:
+                # 取消后**不再自动续轮**。漏了这处，「取消」会变成「取消了、又开
+                # 了一轮、继续烧」—— 上一轮若撞到步数上限，下面的 `more` 为真。
+                if docs and cancel_token is not None and cancel_token.requested:
+                    break
                 first = not docs
                 doc = self._run_round(
                     user_input if first else None,
@@ -303,12 +309,13 @@ class Runtime:
                     round_budget=budget,
                     next_round_summary=prev_summary,
                     reuse_task=(first and user_input is None),
+                    cancel_token=cancel_token,
                 )
                 docs.append(doc)
                 prev_summary = doc.get("next_round_summary") or ""
                 status = str(doc.get("status") or "")
 
-                if status in ("error", "interrupted"):
+                if status in ("error", "interrupted", "canceled"):
                     break
                 more = bool(doc.get("step_limit_hit")) or bool(doc.get("wants_next_round"))
                 if not more:
@@ -335,7 +342,8 @@ class Runtime:
                    first_round: bool = True,
                    round_budget: Optional[int] = None,
                    next_round_summary: str = "",
-                   reuse_task: bool = False) -> Dict[str, Any]:
+                   reuse_task: bool = False,
+                   cancel_token: Optional[cancel.CancelToken] = None) -> Dict[str, Any]:
         """跑**一轮**：建 Agent → 起 ReAct → finalize，返回本轮的会话文档。
 
         `user_input=None` 有**两种**语义，必须显式区分：
@@ -407,7 +415,8 @@ class Runtime:
                            max_rounds=self.max_rounds,
                            round_index=round_index,
                            round_budget=round_budget,
-                           next_round_summary=next_round_summary)
+                           next_round_summary=next_round_summary,
+                           cancel_token=cancel_token)
         self.agent.current_images = list(image_refs)
         self.agent.task_text = self.user_text
         KERNEL.agent = self.agent
@@ -436,6 +445,12 @@ class Runtime:
         except KeyboardInterrupt:  # pragma: no cover
             answer = "[用户中断]"
             status = "interrupted"
+        except cancel.Cancelled:
+            # **必须排在 `except Exception` 之前**：反过来的话，一次奉命取消会被记成
+            # 「运行时异常」—— CI 判成故障、报告里写「出错了」，而它其实是奉命收工。
+            # `canceled` 是独立终态：A2A 取消与 Ctrl-C 的语义不同，报告里要分得开。
+            answer = self.agent.cancel_summary()
+            status = "canceled"
         except Exception as exc:  # noqa: BLE001
             import traceback
             answer = f"[运行时异常] {type(exc).__name__}: {exc}"
@@ -495,7 +510,8 @@ class Runtime:
 
     def run_auto(self, user_input: Optional[str] = None, *, rounds: int = 5,
                  append: bool = False, session_id: Optional[str] = None,
-                 images: Optional[Sequence[Union[str, Path]]] = None) -> Dict[str, Any]:
+                 images: Optional[Sequence[Union[str, Path]]] = None,
+                 cancel_token: Optional[cancel.CancelToken] = None) -> Dict[str, Any]:
         """长任务自主推进：跑一轮，若计划里还有未完成项，就自动接力下一轮。
 
         `rounds` 是自动接力的**总轮数上限**（含首轮）；若人类另用 `--max-rounds`
@@ -544,6 +560,10 @@ class Runtime:
         hit_limit = False
         try:
             for i in range(rounds):
+                # 与 `run()` 同一处判据：取消之后不再自动接力下一轮。
+                if i and cancel_token is not None and cancel_token.requested:
+                    self.say(f"[auto] 已按调用方要求停止，不再自动接力（已跑 {i} 轮）。")
+                    break
                 first = (i == 0)
                 try:
                     doc = self._run_round(
@@ -557,6 +577,7 @@ class Runtime:
                         round_budget=rounds,
                         next_round_summary=prev_summary,
                         reuse_task=(first and user_input is None),
+                        cancel_token=cancel_token,
                     )
                 except RuntimeError as exc:
                     self.say(f"[auto] 第 {i + 1} 轮启动失败：{exc}")
@@ -568,7 +589,7 @@ class Runtime:
 
                 status = str(doc.get("status") or "")
                 open_items = self.ws.plan_open_items()
-                if status in ("error", "interrupted"):
+                if status in ("error", "interrupted", "canceled"):
                     self.say(f"[auto] 第 {i + 1} 轮 {status}，停止自动接力。")
                     break
                 # 未完成项只以「接力期间写过的计划」为准（否则是磁盘上的残留）；

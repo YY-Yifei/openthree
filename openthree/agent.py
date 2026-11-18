@@ -42,6 +42,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from . import cancel
 from .kernel import KERNEL
 from .llm import (CHARS_PER_TOKEN, DEFAULT_CONTEXT_WINDOW_TOKENS,
                   REASONING_FIELDS, LLM, extract_reasoning, parse_token_count,
@@ -157,7 +158,8 @@ class Agent:
                  max_rounds: Optional[int] = None,
                  round_index: int = 1,
                  round_budget: Optional[int] = None,
-                 next_round_summary: str = "") -> None:
+                 next_round_summary: str = "",
+                 cancel_token: Optional[cancel.CancelToken] = None) -> None:
         self.ws = workspace
         self.reg = registry
         self.llm = llm
@@ -249,6 +251,14 @@ class Agent:
         # 输出被 max_tokens 截断时的重发次数（截断可恢复，不该杀死整场任务）
         self.max_truncations = max(0, int(max_truncations))
         self.truncations = 0
+        # 取消令牌：调用方要停手时，它由频道层创建、经 Runtime 传进来。没有取消
+        # 通道时（单次任务 / `-i` / 既有测试）是永不触发的 NULL —— 于是检查点
+        # 可以无条件写，行为与改造前逐字节相同。
+        self.cancel_token: cancel.CancelToken = cancel_token or cancel.NULL
+        self.cancelled = False
+        # 停止时要说清「烧到哪儿了」：这两个计数只用于那句话，不参与任何判断。
+        self.llm_calls = 0
+        self.tool_calls = 0
 
     # ---------------------------------------------------------------- 上下文策略
     def _read_context_policy(self) -> Tuple[int, bool]:
@@ -638,11 +648,33 @@ class Agent:
 
     # ---------------------------------------------------------------- 主循环
     def run(self) -> str:
+        """跑本轮 ReAct；取消请求从某个检查点冒出时，`Cancelled` 抛给 Runtime。
+
+        绑定令牌在这一层：`llm.py` / `builtins.run_shell` 用线程本地的
+        `cancel.current()` 就地取到它，于是它们的签名与工具 schema 一个字节不动。
+        """
+        cancel.bind(self.cancel_token)
+        try:
+            return self._run_loop()
+        except cancel.Cancelled:
+            self.cancelled = True
+            # 「请求过取消」与「真的被中止」是两件事：只有走到这里才算后者。
+            # 落终态看的是这个标志（见 `a2a.send_text`），否则一次落在最后一个
+            # 检查点之后的取消，会把一份完整的答案记成 canceled。
+            self.cancel_token.mark_aborted()
+            raise
+        finally:
+            cancel.unbind(self.cancel_token)
+
+    def _run_loop(self) -> str:
         while not self.finished and self.iteration < self.max_iterations:
             self.iteration += 1
             self.rec.begin_step()
             self.progress.step(self.iteration, self.max_iterations)
             self.tick()                        # 每一步重读「上下文策略 / 运行边界」——改了就生效
+            # 检查点①：取消了就不再发起新的一步。放在这一步最前（tick 之后），
+            # 于是「已请求」当场兑现成「不再烧下一次 LLM 请求」。
+            self.cancel_token.check()
             self._apply_pending_compactions()
             self._auto_compact()
             self._inject_next_round_summary()  # 上一轮 next_round 的交接说明（只在首步注入）
@@ -672,12 +704,27 @@ class Agent:
             result = self.llm.chat(messages, tools=self.reg.schemas() or None,
                                    max_tokens=self.max_tokens,
                                    temperature=self.temperature, **gen_kwargs)
-            msg = result.get("message") or {}
+            self.llm_calls += 1
+            # 先落盘这次「真的发出去过」的请求，再判取消：先 raise 的话日志里就少
+            # 一条 llm 事件 —— 而「取消之后 llm 事件不再增长」正是本方案的验收
+            # 判据，`cancel_summary()` 说的次数也会与事件数对不上（N vs N-1）。
+            # 终端那一行按「奉命收工」措辞：`Progress.llm_done` 见到 `error` 非空就按
+            # 失败排版，会打出「✗ 模型调用失败：[已取消] …」—— 与语义正好相反。
+            # 落盘那一份仍保留 `error`（事件条数要与 `cancel_summary` 的次数对得上）。
+            cancelled = result.get("error_kind") == "cancelled"
             self.progress.llm_done(result.get("elapsed_ms", 0.0), result.get("usage"),
-                                   result.get("error"), result.get("attempts", 1))
+                                   None if cancelled else result.get("error"),
+                                   result.get("attempts", 1))
             self.rec.record_llm(result.get("raw_request", {}), result.get("raw_response", {}),
                                 result.get("elapsed_ms", 0.0), result.get("usage"),
                                 result.get("error"), result.get("attempts", 1))
+            # 检查点③：认领 LLM 层带回来的取消信号。阻塞中的 `read()` 被
+            # `shutdown()` 之后，`error_kind="cancelled"` 是它唯一的说法 ——
+            # 不认领的话它会落进下面的 `if result.get("error")` 分支，
+            # 被记成「模型调用失败」，取消就降级成了一次故障。
+            if result.get("error_kind") == "cancelled":
+                raise cancel.Cancelled(self.cancel_token.reason or "调用方要求停止")
+            msg = result.get("message") or {}
 
             if result.get("error"):
                 # 被 max_tokens 截断：这是**可恢复**的 —— tool_calls 极可能是半截
@@ -857,10 +904,28 @@ class Agent:
                 summaries.append(f"{name} → （跳过：已 finish）")
                 continue
 
+            # 检查点②：一批 5 个工具，取消之后剩下的一次都不调。逐条判而不是在批首
+            # 判一次 —— 上一批里可能正好跑完了一个几分钟的命令。
+            # **放在 `if self.finished` 之后**：finish 提交之后这一轮在逻辑上已经
+            # 结束、答案已是最终答案；此时取消若抛 `Cancelled`，一份合法答案会被
+            # 改写成 `canceled`（`aborted` 这个标志防的就是这件事）。
+            self.cancel_token.check()
+
             args = _parse_args(raw_args)
             started = time.time()
             self.progress.tool_start(name, args)
-            output, error = self._execute(name, args)
+            # 执行中就先把「正在做什么」写进 `last_action`：批次末尾那次赋值在
+            # mid-batch 取消时根本到不了，`cancel_summary()` 会报**上一步**的动作
+            # —— 而「最后动作是什么」正是这句话唯一的用处。
+            self.last_action = f"{name}({_short_args(args)})（执行中）"
+            # 记下「此刻卡在哪个工具」：取消时 `tasks/cancel` 才能说清停在哪，
+            # 而不是只说一句「已请求停止」（调用方分不清真停了还是在卡着）。
+            self.cancel_token.in_flight(name)
+            try:
+                output, error = self._execute(name, args)
+            finally:
+                self.cancel_token.in_flight("")
+            self.tool_calls += 1
             elapsed = (time.time() - started) * 1000
 
             # 工具返回带图结果：tool 消息只能承载文本，图片另补一条 user 消息。
@@ -1013,7 +1078,21 @@ class Agent:
             note = f"\n... [已截断，共 {len(text)} 字符]"
         return text[:limit] + note
 
+    def cancel_summary(self) -> str:
+        """取消之后这一轮的结论：如实说停在第几步、最后做了什么。
+
+        `tasks/cancel` 的 artifact 与 `logs/<session>.json` 的 answer 都取它 ——
+        报告里不能出现「done」，也不能只说一句「已取消」而不说烧到哪儿了。
+        """
+        return (f"[已按调用方要求停止] 停在第 {self.iteration} 步"
+                f"（最后动作：{self.last_action or '（无）'}）。"
+                f"本轮已发出 {self.llm_calls} 次 LLM 请求、{self.tool_calls} 次工具调用；"
+                f"已产生的副作用不回滚。")
+
     def _execute(self, name: str, args: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+        # 检查点④：与检查点②冗余但便宜，且覆盖 ② 覆盖不到的路径（一批里第一个
+        # 调用之前令牌就已请求 ⇒ 一次工具都不执行）。
+        self.cancel_token.check()
         tool = self.reg.get(name)
         if tool is None:
             return "", f"未知工具 {name}。当前可用：" + ", ".join(self.reg.names())
@@ -1028,6 +1107,11 @@ class Agent:
             return "", (f"参数不匹配：{exc}\n正确签名：{tool.signature_hint()}\n"
                         f"（可用参数：{', '.join(tool.parameters) or '无'}；"
                         f"必填：{', '.join(tool.required) or '无'}）")
+        except cancel.Cancelled:
+            # **必须排在 `except Exception` 之前**。反过来，取消会变成一条工具
+            # 错误字符串：ReAct 读到它、以为工具失败了，于是**继续跑下一步** ——
+            # 取消被工具吞掉，日志上却看不出任何异常。
+            raise
         except Exception as exc:  # noqa: BLE001
             import traceback
             return "", f"执行异常 {type(exc).__name__}: {exc}\n{traceback.format_exc()[-800:]}"

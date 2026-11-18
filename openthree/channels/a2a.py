@@ -23,7 +23,10 @@ URL。想「让面板替我们收任务」是不成立的。
   * 没有流式（`message/stream` / `tasks/resubscribe` 一律拒）；
   * 任务共享本进程的会话（与钉钉一样），远端能通过提示读到最近的对话；
   * 任务表只在内存，进程重启后 `tasks/get` 是 `-32001`；
-  * `tasks/cancel` 只是「不再等」，模型仍会把这一步跑完；
+  * `tasks/cancel` **会真的停手**：取消之后不再发新的 LLM 请求、不再调新工具
+    （判据见 `openthree/cancel.py`）。但**正在跑的那一步**只能「拆掉它在等的
+    东西」—— socket 用 `shutdown()`、子进程用杀进程树；纯 Python 死循环停不下来，
+    由 `cancel_hard_grace` 硬退出兜底（默认 30s）；
   * **图片只收 base64**（`kind:"file"` 的 `bytes` / 1.x 的 `raw`）：URI 引用一律
     不下载 —— 一个无鉴权端点 + 服务端主动取任意 URL 等于把内网暴露给任何能发
     消息的人。收下的图落 `.openthree/assets/`（sha1 去重、只增不减）；
@@ -57,6 +60,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from .. import __version__
+from .. import cancel
 from ..attach import MAX_OUTBOUND_FILES
 from ..multimodal import (ImageError, TMP_MARK, asset_dest, guess_mime, max_image_bytes,
                           save_image_bytes, sniff_mime)
@@ -67,6 +71,13 @@ DEFAULT_REGISTRY = "http://127.0.0.1:8000"
 DEFAULT_HOST = "127.0.0.1"
 PORT_RANGE = (9000, 9999)
 DEFAULT_BLOCK_WAIT = 45.0
+# `tasks/cancel` 等多久确认「真的停了」：2 秒换一句「停在第 N 步」，比立刻回一句
+# 「已请求」有用得多。0 = 不等（立刻回「已请求」，由客户端自己再 tasks/get）。
+DEFAULT_CANCEL_GRACE = 2.0
+# 取消之后多少秒还没停下就**硬退出进程**（交给外部守护重启），0 = 关。
+# 默认开：桥只有一条工作线程，一条无上界的工具（纯 Python 死循环）会把它扣住，
+# 队列里的新消息永远排不上 —— 「服务能接活」比「进程不重启」重要。
+DEFAULT_CANCEL_HARD_GRACE = 30.0
 # 端口的第三个来源（比「多一个来源」更贵）：命令行与 channels.yaml 已经够了。
 ENV_REGISTRY = "OPENTHREE_A2A_REGISTRY"
 
@@ -1000,7 +1011,50 @@ class A2aChannel(Channel):
         self.block_wait = _as_float(self.option("block_wait", ""), DEFAULT_BLOCK_WAIT)
         if self.block_wait < 0:
             raise A2aError(f"block_wait 不能是负数：{self.block_wait}")
+        # 两个取消旋钮与 `block_wait` 不同：它们**任意时刻可读**（取消可能发生在
+        # `run()` 之前 —— 测试里 `handle_rpc` 会在没有 run() 的情况下被调），
+        # 所以做成现读的 property，不参与 `_prepared` 的一次性定型。
         self._prepared = True
+
+    @property
+    def cancel_grace(self) -> float:
+        """`tasks/cancel` 最多等几秒确认「真的停了」（默认 2；0 = 不等）。
+
+        2 秒换一句「停在第 N 步」很划算；但它**只在 `wait()` 位于
+        `_tasks.lock` 之外时**才成立 —— 挪进锁里，这 2 秒会变成自锁。
+        """
+        return max(0.0, self._cancel_option("cancel_grace", DEFAULT_CANCEL_GRACE))
+
+    @property
+    def cancel_hard_grace(self) -> float:
+        """取消后多少秒仍未停下就硬退出进程（默认 30；0 = 关）。
+
+        这是「停机器不是停一轮」：收益完全建立在「外部守护会把它拉起来」之上，
+        但代价那一侧也是真的 —— 桥只有一条工作线程，一条无上界的工具会把它
+        扣住，队列里的新消息永远排不上。所以默认开，部署时按守护情况调。
+        """
+        return max(0.0, self._cancel_option("cancel_hard_grace",
+                                            DEFAULT_CANCEL_HARD_GRACE))
+
+    def _cancel_option(self, key: str, default: float) -> float:
+        """现读一个取消旋钮。坏值与布尔否定一律落到 **0**（关 / 不等）。
+
+        捕获的是 `A2aError` 而不是 `TypeError/ValueError`：`_as_float` 自己就把
+        后两者转成了 `A2aError`。捕错类型等于没捕 —— 而且它是在 `token.request()`
+        之后才读的，抛出去会让调用方拿到 `-32603`，取消其实已经生效了。
+
+        **落到 0 而不是落到 `default`**：`cancel_hard_grace` 的默认值是「开」，
+        而 YAML 里写 `false` 会变成字符串 `"False"`、`_as_float` 抛 `A2aError`。
+        若这时退回默认 30，用户明确写下的「关」就被静默改成了「取消一个任务就把
+        整个进程杀掉」—— 对一个会杀进程的旋钮，坏值只有一个安全的去处。
+        """
+        raw = self.option(key, "")
+        if str(raw).strip().lower() in ("false", "no", "off", "否", "关"):
+            return 0.0
+        try:
+            return max(0.0, _as_float(raw, default))
+        except A2aError:
+            return 0.0
 
     @property
     def mode(self) -> str:
@@ -1741,6 +1795,11 @@ class A2aChannel(Channel):
                 if push is not None:
                     task["_push"] = push
                 wait_event = task["_done"]      # 同上：在锁里取，别在锁外重读
+            # 取消令牌在这里创建，**与复位同一把锁**：取消天然是「针对某一次
+            # 运行」，而 follow up 会把它换成新的 —— 旧 run 的取消不该杀掉新
+            # run，反之亦然。与 `_run` 的所有权规则完全同源。
+            run_token = cancel.CancelToken(task_id=(task.get("id") or task_id))
+            task["_cancel"] = run_token
 
         # 有效回调地址看的是 **task**，不是这次请求：follow up 常常不带 configuration，
         # 但地址仍然有效（配置跟着 task 走）。只看这次请求的话，一个已经登记了回调的
@@ -1759,6 +1818,9 @@ class A2aChannel(Channel):
             msg_id=task["id"],
             reply_token=task["id"],        # send_text 靠它找回这个 task
             images=images,                 # 桥把它原样交给 Runtime.run(images=…)
+            # 令牌随消息进桥：桥把它交给 `Runtime.run(cancel=…)`，于是「停止」
+            # 从一句状态变成真的不再发请求、不再调工具。
+            cancel=run_token,
             raw={"task": task["id"], "context": context_id,
                  "blocking": blocking, "run": run_id},
         )
@@ -1781,6 +1843,11 @@ class A2aChannel(Channel):
         return self._view(task, params.get("historyLength"))
 
     def _rpc_cancel(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """取消：发信号 → 有界等它收工 → 按等到什么写终态。顺序不能反。
+
+        先发信号再等：「等」的前提是「有人会去停」；先落终态再发信号，会在
+        「已取消」的假象里继续烧 token、继续跑工具（那正是这一版要修的东西）。
+        """
         task_id = _as_text(params.get("id") or params.get("taskId"))
         if not task_id:
             raise _RpcError(-32602, "缺少 id")
@@ -1790,10 +1857,88 @@ class A2aChannel(Channel):
         with self._tasks.lock:
             if _state_of(task) in TERMINAL_STATES:
                 raise _RpcError(-32002, f"任务已是终态，不能取消：{_state_of(task)}")
-        # 诚实语义：只是**不再等**，不是停手 —— ReAct 每一步都在等模型返回，
-        # 没有中断点。结果照跑，只是不再写进这个 task。
-        self._finish(task, "canceled", "调用方取消了这个任务（模型可能仍会把这一步跑完）")
+            done = task["_done"]            # 锁里取：follow up 会在锁里换掉它
+            run_id = task.get("_run")       # 同上：取消只对「快照到的那一轮」有效
+            queued = task.get("_cancel")
+
+        # ① 先发信号。**两个令牌都要发**：`running` 是正在跑的那一轮，`queued`
+        # 是刚被 follow up 换上来、还排在桥队列里的那一轮。只掐前者的话，后者
+        # 随后照跑一整轮 ReAct（烧 token），答案还会被终态检查丢掉 ——
+        # 调用方以为停了，其实又跑了一遍。
+        running = cancel.running_of(task_id)
+        for tok in {t for t in (running, queued) if t is not None}:
+            tok.request(f"调用方取消任务 {task_id}")
+
+        # ② 有界地等它收工。**必须在 `_tasks.lock` 之外**：桥收工要走 `_finish`，
+        # 而 `_finish` 第一件事就是拿这把锁 —— 锁里等就是自锁（取消持锁等它 set，
+        # 它 set 前要先拿那把锁），上界从「2 秒」变成「永不返回」。
+        grace = self.cancel_grace
+        stopped = bool(grace > 0 and done.wait(grace))
+        if not stopped:
+            # 一步都没跑过（还在桥队列里）：没有「当前这一步」可卡住，也没有硬退出
+            # 可兜 —— 如实说「未执行」。说得太满会把桥那句更准的「开跑前已被取消」
+            # 挤掉（终态之后 `_finish` 一律忽略）。
+            if running is None:
+                self._finish(task, "canceled",
+                             "调用方取消了这个任务；它还没开跑（未执行）",
+                             run_id=run_id)
+                return self._view(task)
+            # ③ 没等到：如实说「已请求」+ 停在哪儿 + 上界，并给「停不下来」留出口。
+            # 硬退出只认**正在跑的那个**令牌：排队中的那一轮根本不会卡住桥。
+            self._arm_hard_exit(task_id, running)
+            where = running.in_flight_text()
+            text = "已请求停止，但当前这一步还没结束"
+            if where:
+                text += f"（卡在 {where}）"
+            text += ("；此后不会再发起新的一步。上界：卡在内置命令里 —— 毫秒级"
+                     "（杀进程树）；卡在自造 function 的纯 Python 死循环里 —— "
+                     "无上界，将由硬退出兜底。")
+            # `run_id` 必须带上：`done.wait()` 期间可能有 follow up 把 `_run` 换成
+            # 新的一轮。不带它就绕过了所有权检查，会把**新**那一轮标成 canceled，
+            # 而新那一轮照跑 —— 正是 `_finish` 的 `run_id` 参数存在的理由。
+            self._finish(task, "canceled", text, run_id=run_id)
+        # 等到了：终态由**它自己**落（`send_text` 见令牌已请求 ⇒ 记 canceled）。
+        # 若它其实在这段时间里正常答完了，状态就是 completed —— 这里不改写：
+        # 它确实答完了，把它改写成 canceled 才是撒谎。
         return self._view(task)
+
+    def _arm_hard_exit(self, task_id: str,
+                       token: Optional[cancel.CancelToken]) -> None:
+        """grace 用尽仍没停下 ⇒ 再等 `cancel_hard_grace` 秒，然后硬退出进程。
+
+        **这是「停机器」不是「停一轮」**：桥只有一条工作线程，一条无上界的工具
+        （自造 function 里的纯 Python 死循环）会把它扣住，队列里的新消息永远
+        排不上 —— 取消得再准，也换不来「能接新活」。
+
+        **存活判据只有一条：`cancel.running_of(task_id) is token`**（这一轮还绑着）。
+        不能用 `_done` 事件：`_rpc_cancel` 紧接着就会 `_finish(…)`，而 `_finish`
+        做的最后一件事正是 `done.set()` —— 拿它判，watch 立刻以为「它停了」，
+        硬退出永远不开火，而这一格本来要兜的正是「它停不下来」。
+        """
+        grace = self.cancel_hard_grace
+        if grace <= 0 or token is None:
+            # `token is None` ⇒ 这个 task 根本没有**正在跑**的那一轮（消息还在队列里，
+            # 或已经收工）。没有在跑的令牌就没有「卡住」，不能布防 —— 否则
+            # `running_of() is not None` 永远成立（None is not None 是 False），
+            # watch 会等到 grace 到点把整个进程杀掉。
+            return
+
+        def _watch() -> None:
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                if cancel.running_of(task_id) is not token:
+                    return                  # 已收工，或已换一轮，不是它卡住
+                time.sleep(0.2)
+            if cancel.running_of(task_id) is not token:
+                return
+            sys.stderr.write(
+                f"[a2a] 任务 {task_id} 取消后 {grace:g}s 仍未停下，强制退出进程"
+                "（137）—— 交给外部守护重启，否则队列里的新消息永远排不上。\n")
+            sys.stderr.flush()
+            os._exit(137)
+
+        threading.Thread(target=_watch, name="a2a-cancel-hard-exit",
+                         daemon=True).start()
 
     # --- 回调登记（push notification config）--------------------------
     def _push_task(self, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -1854,12 +1999,24 @@ class A2aChannel(Channel):
         # `[openthree] ` 当作答案的开头（比如它正在解释这个前缀），只按前缀判会把
         # 一条真答案误记成失败回给对面的智能体。
         is_notice = isinstance(msg.raw, dict) and bool(msg.raw.get("notice"))
+        tok = getattr(msg, "cancel", None)
+        # 判的是「真的被中止了」，不是「请求过取消」：取消可能落在最后一个检查点
+        # 之后，那一轮会正常 finish 并交出完整答案 —— 把它记成 canceled 会让
+        # 调用方丢掉一个合法答案。
+        #
+        # 但「排队时就被取消」是另一条路：那条消息**从没跑过**，`aborted` 不会置位，
+        # 而桥回的恰好是一句 notice。此时必须把「requested + notice」也算作取消，
+        # 否则任务被记成 failed —— 取消最该说清的场景反而最容易被记错。
+        cancelled = tok is not None and (
+            getattr(tok, "aborted", False)
+            or (is_notice and getattr(tok, "requested", False)))
         # 附件与文本一起走完这一次回程：`attach_file` 只往 `msg.attachments` 上挂了
         # 「要发什么」，路径白名单与体积上限全部在这里判（安全判定只有一份）。
         files, notes = self._outbound_file_parts(getattr(msg, "attachments", ()) or ())
-        if is_notice:
-            # 桥自己塞的话不是结论：连附件一起丢掉 —— 它跟一条失败的答复无关。
+        if is_notice or cancelled:
+            # 桥自己塞的话不是结论；奉命收工也不是结论 —— 两者都不带附件。
             files, notes = [], []
+        if is_notice:
             answered = False
         else:
             # 「模型到底答没答」必须在拼 notes **之前**记下来：被拒说明本身也会让
@@ -1870,7 +2027,15 @@ class A2aChannel(Channel):
                 body = "（这条答复只有附件，见 file part）"
         if notes:
             body = (body + "\n\n" + "\n".join(notes)).strip()
-        if is_notice:
+        if cancelled:
+            # **必须排在 `is_notice` 之前**：排队中被取消的消息，桥回的正是一句
+            # notice（带 `notice` 标记）。先判 notice 就会把它记成 failed ——
+            # 而那恰恰是取消最该说清的场景（「在开跑前已被取消，未执行」）。
+            # 它也不是「答完了」：记 completed 会让这句话躺在一个成功任务里。
+            self._finish(task, "canceled",
+                         body or "已按调用方要求停止（本轮没有产出结论）",
+                         run_id=run_id)
+        elif is_notice:
             # 桥自己塞的话（「正在退出」/「这条消息没跑通」）**不是**结论：
             # 记成 completed 会让对面拿到一条"成功"的空答案。
             self._finish(task, "failed", body or "这条消息没有跑完（桥给出的通知是空的）",

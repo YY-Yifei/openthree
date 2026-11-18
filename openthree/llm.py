@@ -37,6 +37,7 @@ try:
 except ImportError:  # pragma: no cover
     yaml = None
 
+from . import cancel
 from .multimodal import sanitize_for_log
 
 
@@ -427,6 +428,47 @@ def _proxy_for(scheme: str, host: str) -> Optional[Tuple[str, int, Optional[str]
     return (parts.hostname, port, auth)
 
 
+def _raise_unless_aborted(sock: Any) -> None:
+    """socket 是被**取消**关掉的就抛 `Cancelled` —— 别把奉命收工记成网络故障。
+
+    `shutdown()` 在读端造成的异常（Windows 上是 `OSError: [WinError 10038]`）
+    与真的断线长得一模一样，只有注册表知道是谁关的。
+    """
+    if cancel.was_aborted(sock):
+        raise cancel.Cancelled("调用方要求停止")
+
+
+def _wait_cancel(tok: Optional[cancel.CancelToken], seconds: float) -> bool:
+    """退避等待，但取消能**立刻**打断它。
+
+    用 `time.sleep` 的话，一次取消要多等一个 backoff（最长 30s），而那张停止
+    上界表上写的是「毫秒级」—— 表与实现不能说两句话。
+    """
+    if tok is None:
+        time.sleep(seconds)
+        return False
+    return tok.wait(seconds)
+
+
+def _cancelled_result(payload: Dict[str, Any], started: float, used: int,
+                      reason: str) -> Dict[str, Any]:
+    """取消的返回体：与失败同形状，但 `error_kind="cancelled"` 说清是奉命收工。
+
+    判「是不是取消」只看这个字段，不匹配错误文本 —— 与 `_is_truncation` 同一套
+    判据风格（文本会被 provider 的说法带偏，字段不会）。
+    """
+    return {
+        "message": {"role": "assistant", "content": f"[已取消] {reason}"},
+        "usage": {},
+        "elapsed_ms": (time.time() - started) * 1000,
+        "raw_request": _redact(payload),
+        "raw_response": {"error": f"Cancelled: {reason}"},
+        "error": f"[已取消] {reason}",
+        "error_kind": "cancelled",
+        "attempts": used,
+    }
+
+
 def post_json(url: str, api_key: str, payload: Dict[str, Any], *,
               timeout: float = 600.0,
               connect_timeout: float = 5.0) -> Dict[str, Any]:
@@ -490,21 +532,42 @@ def post_json(url: str, api_key: str, payload: Dict[str, Any], *,
             if p_auth:
                 headers["proxy-authorization"] = p_auth
 
+    # 必须在 `try` **之前**绑定：`connect()` 自己就会失败（DNS / 拒绝连接 /
+    # connect 超时），而两个 `except` 与 `finally` 都要读它。在 try 里赋值就等于
+    # 「连不上时抛 UnboundLocalError」，把本来该报的 TransportError 整个盖掉，
+    # 连 `_retryable()` 也因此认不出它、白白丢掉一次重试。
+    sock: Any = None
     try:
         conn.connect()  # 建连（+ CONNECT + TLS 握手）：只受 connect_timeout 管
-        if conn.sock is not None:
-            conn.sock.settimeout(timeout)  # 连上之后：等模型的那个 timeout
+        # **存局部变量**：`http.client` 在 `getresponse()` 内部出错时会自己
+        # `close()` 并把 `conn.sock` 置成 None。等到 `except` / `finally` 再去读
+        # `conn.sock`，拿到的就是 None —— 于是「这次是取消还是网络故障」判不出来
+        # （取消会被记成网络故障并**重试一次**），而且注册表里的那条永远删不掉。
+        sock = conn.sock
+        if sock is not None:
+            # 登记进取消注册表：调用方取消时对它 shutdown(SHUT_RDWR)，阻塞中的
+            # read() 立刻抛。这是「等模型返回」那最长 600 秒唯一的中断手段 ——
+            # 只加检查点解决不了它（检查点在阻塞结束之后才轮得到）。
+            cancel.watch(sock)
+            sock.settimeout(timeout)  # 连上之后：等模型的那个 timeout
         conn.request("POST", request_path, body=body, headers=headers)
         resp = conn.getresponse()
         status = resp.status
         raw = resp.read()
+        # shutdown 之后，一个**干净 EOF** 也可能不抛异常（响应没有 Content-Length
+        # 又非 chunked 时）。那样下面会落进 `if not text.strip(): return {}`，
+        # 把一次取消当成「正常的空回复」—— 取消就悄悄变成了一次成功。
+        _raise_unless_aborted(sock)
         encoding = (resp.getheader("content-encoding") or "").lower()
     except TimeoutError as exc:
+        _raise_unless_aborted(sock)
         raise TransportError(
             f"超时（connect {connect_timeout:g}s / read {timeout:g}s）：{exc}") from exc
     except (OSError, http.client.HTTPException) as exc:
+        _raise_unless_aborted(sock)
         raise TransportError(f"{type(exc).__name__}: {exc}") from exc
     finally:
+        cancel.unwatch(sock)   # 同时清掉「被我们关掉」的标记，否则会缓慢涨
         conn.close()
 
     text = _body_text(raw, encoding)
@@ -583,6 +646,15 @@ class LLM:
         attempts = max(0, self.config.retries) + 1
         used = 0
         data: Dict[str, Any] = {}
+        # 令牌是**线程本地**的（`Agent.run()` 起跑前绑好）：于是本函数签名不必多
+        # 一个参数，`tests/` 里那十几个 `_StubLLM` 也不用跟着改。
+        tok = cancel.current()
+        # 已经请求过取消：一个字节都不该再发出去。否则下面仍会先 connect
+        # （DNS + TCP/TLS，最长 connect_timeout）才被 `watch` 拆掉 ——
+        # 「取消是毫秒级」在这条窗口上就变成了「最长一个 connect 超时」。
+        if tok is not None and tok.requested:
+            return _cancelled_result(payload, started, 0,
+                                     tok.reason or "调用方要求停止")
         for attempt in range(attempts):
             used = attempt + 1
             try:
@@ -590,6 +662,11 @@ class LLM:
                                  timeout=self.config.timeout,
                                  connect_timeout=self.config.connect_timeout)
                 break
+            except cancel.Cancelled as exc:
+                # 奉命收工**不是可重试的错误**：连 `_retryable` 都不问，直接返回。
+                # 靠「Cancelled 恰好不含 timeout/connection 这些 marker」是碰巧，
+                # 而碰巧的东西不该承担「取消之后又发了一次请求」这种后果。
+                return _cancelled_result(payload, started, used, str(exc))
             except Exception as exc:  # noqa: BLE001
                 if attempt == attempts - 1 or not _retryable(exc):
                     elapsed = (time.time() - started) * 1000
@@ -603,7 +680,9 @@ class LLM:
                         "error": f"{type(exc).__name__}: {exc}",
                         "attempts": used,
                     }
-                time.sleep(_backoff(attempt))
+                if _wait_cancel(tok, _backoff(attempt)):
+                    return _cancelled_result(payload, started, used,
+                                             "调用方要求停止（退避等待中被打断）")
         elapsed = (time.time() - started) * 1000
 
         choice = (data.get("choices") or [{}])[0]

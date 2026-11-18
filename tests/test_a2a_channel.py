@@ -490,13 +490,21 @@ def test_message_text_reads_all_three_shapes():
 
 
 # --- 取消 ---------------------------------------------------------------
-def test_cancel_is_honest_about_not_stopping_the_model(tmp_path):
-    ch = _channel(tmp_path)
+def test_cancel_is_terminal_and_not_repeatable(tmp_path):
+    """取消即终态；重复取消是 -32002。
+
+    「取消之后还有没有可能继续烧 token」由 `tests/test_cancel.py` 守 —— 这里只管
+    A2A 层的状态机：终态不可回退、不能重复取消。
+    """
+    ch = _channel(tmp_path, cancel_grace="0")
     ch._load_options()
+    ch.emit = lambda msg: None
     _, body = _call(ch, "message/send", {"message": _user_msg("跑很久的任务")})
     task_id = body["result"]["id"]
     _, body = _call(ch, "tasks/cancel", {"id": task_id})
     assert body["result"]["status"]["state"] == "canceled"
+    # 取消**是信号**：task 上那一个令牌真的被置位了（不是只改了个状态）
+    assert ch._tasks.get(task_id)["_cancel"].requested is True
     # 终态不能重复取消
     _, body = _call(ch, "tasks/cancel", {"id": task_id})
     assert body["error"]["code"] == -32002

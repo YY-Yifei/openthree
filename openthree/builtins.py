@@ -39,6 +39,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
+from . import cancel
+
 from .attach import attach_file
 from .decide import optional_builtins
 from .kernel import KERNEL
@@ -587,27 +589,74 @@ def run_shell(command: str, cwd: str = "", timeout: int = 60) -> str:
     timed_out = False
     killed = ""
     stream_cut = False
-    try:
-        out_b, err_b = proc.communicate(timeout=limit)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        killed = _kill_tree(proc)
+    # 取消通道：令牌是线程本地的（`Agent.run()` 起跑前绑好），于是本工具的签名
+    # 与 schema 一个字节不动，而它照样能被调用方停掉。
+    tok = cancel.current()
+    fired: List[bool] = []      # killer 真的动过手 → 才敢说「已取消」
+    tree: List[str] = []
+
+    def _killer() -> None:
+        """取消时拆掉它在等的东西：**整棵进程树**一次杀掉。
+
+        顺序是「先整树」而不是「先 kill 直接子进程」，这条是实测纠正的：
+        `shell=True` 起的是 `cmd.exe`，`python` / `pytest` 是它的**孙进程**。
+        先 `proc.kill()` 只死 cmd，孙进程带着继承来的 stdout/stderr 继续跑 ——
+        `communicate()` 仍要等它自己结束（实测 30s 的命令一秒都没提前返回）；
+        而且此时再调 `_kill_tree()` 会被它首行的 `poll()` 判成「早已退出」，
+        直接返回 `already-exited`，整棵树根本没杀。
+
+        `_kill_tree()` 自己做「taskkill /F /T → 失败再 proc.kill()」的兜底，
+        所以这里只需调它一次；它是整段里唯一可能慢的（taskkill 自带 10s 上限），
+        因此在后台线程里跑，不占 `tasks/cancel` 的响应时间。
+        """
+        fired.append(True)
+        how = _kill_tree(proc)
+        if how == "already-exited" and os.name != "nt":
+            # 直接子进程已退出（`sh -c "job &"` 就是这样），但进程组里的孙进程
+            # 可能还攥着继承来的 stdout/stderr。`_popen_kwargs()` 给了新会话，
+            # 所以 leader 死了组还在 —— 取消仍要整组杀，不能就此收工。
+            try:
+                import signal
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                how = "killpg(cancel)"
+            except Exception:  # noqa: BLE001 - 组已空 / PID 已回收
+                pass
+        tree.append(how)
+
+    # 登记不是纯操作：令牌若已请求，`attach_killer` 会**立刻起一个线程**去拆资源，
+    # 而 `Thread.start()` 是会抛的（线程数到上限）。不包住它，异常会带着一个
+    # 已经起来的子进程逃出 `run_shell` —— 既没人 wait 也没人杀。
+    hook = None
+    if tok is not None:
         try:
-            out_b, err_b = proc.communicate(timeout=_KILL_GRACE)
+            hook = tok.attach_killer(_killer)
+        except Exception:  # noqa: BLE001 - 登记失败也必须收拾掉那个子进程
+            _kill_tree(proc)
+    try:
+        try:
+            out_b, err_b = proc.communicate(timeout=limit)
         except subprocess.TimeoutExpired:
-            # 极端兜底：管道 EOF 等不到 —— 写端攥在一个**脱离的孙进程**手里
-            # （它继承了 stdout/stderr，而直接子进程已退出、没有 PID 可杀）。
-            # 此刻唯一正确的动作是**放弃读取、立刻返回**。
-            #
-            # 绝不在这里 close() 那两个管道对象：communicate() 起的读线程正阻塞
-            # 在同一个缓冲区上，close() 要先拿到同一把锁 —— 会和读线程互锁，把
-            # 「超时兜底」变成永久挂死（实测）。读线程是 daemon，随本进程退出即
-            # 消失，那两根管道一并交还操作系统，不必在这里收。
-            stream_cut = True
-            out_b, err_b = b"", b""
-    except Exception as exc:  # noqa: BLE001
-        _kill_tree(proc)
-        return f"[错误] 执行失败: {type(exc).__name__}: {exc}"
+            timed_out = True
+            killed = _kill_tree(proc)
+            try:
+                out_b, err_b = proc.communicate(timeout=_KILL_GRACE)
+            except subprocess.TimeoutExpired:
+                # 极端兜底：管道 EOF 等不到 —— 写端攥在一个**脱离的孙进程**手里
+                # （它继承了 stdout/stderr，而直接子进程已退出、没有 PID 可杀）。
+                # 此刻唯一正确的动作是**放弃读取、立刻返回**。
+                #
+                # 绝不在这里 close() 那两个管道对象：communicate() 起的读线程正阻塞
+                # 在同一个缓冲区上，close() 要先拿到同一把锁 —— 会和读线程互锁，把
+                # 「超时兜底」变成永久挂死（实测）。读线程是 daemon，随本进程退出即
+                # 消失，那两根管道一并交还操作系统，不必在这里收。
+                stream_cut = True
+                out_b, err_b = b"", b""
+        except Exception as exc:  # noqa: BLE001
+            _kill_tree(proc)
+            return f"[错误] 执行失败: {type(exc).__name__}: {exc}"
+    finally:
+        if tok is not None and hook is not None:
+            tok.detach_killer(hook)
 
     code = proc.returncode if proc.returncode is not None else proc.poll()
     out = _decode(out_b).strip()
@@ -615,6 +664,20 @@ def run_shell(command: str, cwd: str = "", timeout: int = 60) -> str:
     parts = [f"$ {command}", f"exit={code}"]
     if timed_out:
         tail = f"[错误] 命令超时（{limit}s），已强杀进程树（{killed}）"
+        if stream_cut:
+            tail += "；输出管道未能收尾，已放弃读取"
+        parts.append(tail)
+    if fired:
+        # killer 动过手：如实说清「它是怎么结束的」以及进程树清干净没有。
+        # 不写清这一句，调用方会以为它自己跑完了 —— 而它可能还在后台写文件。
+        if hook is not None:
+            hook.done.wait(2.0)          # 有界地等清树结果，不猜
+        how = tree[0] if tree else "清理仍在后台进行"
+        if how == "already-exited":
+            # 我们动手之前进程已自行退出：命令其实跑完了。说成「被强制结束」是撒谎。
+            tail = "[已取消] 调用方要求停止；命令在此前已自行结束（进程树：already-exited）"
+        else:
+            tail = f"[已取消] 调用方要求停止，命令被强制结束（进程树：{how}）"
         if stream_cut:
             tail += "；输出管道未能收尾，已放弃读取"
         parts.append(tail)

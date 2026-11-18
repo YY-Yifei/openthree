@@ -40,7 +40,9 @@ FLUSH_INTERVAL = 2.0   # 至少间隔多少秒
 # 会话的合法终态：finalize 只认这些，其余（含 "running"）一律回落成 "done"。
 # 落盘的 status 必须如实：把 unfinished/interrupted/error 压成 running，
 # 事后就分不清「真收尾了但状态写错」与「进程被 kill」。
-_TERMINAL_STATUSES = ("done", "unfinished", "interrupted", "error")
+# `canceled` 是**奉命收工**，与 interrupted（Ctrl-C）语义不同：报告要分得开
+# 「调用方要求停」与「人在终端按了 Ctrl-C」，所以它是独立终态，不是别名。
+_TERMINAL_STATUSES = ("done", "unfinished", "interrupted", "error", "canceled")
 
 
 def _jsonable(obj: Any) -> Any:

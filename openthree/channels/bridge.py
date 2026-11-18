@@ -114,15 +114,22 @@ class AgentBridge:
         self._queue.put((msg, reply))
 
     def ask(self, text: str, *, source: str = "控制台",
-            images: Optional[Sequence[str]] = None) -> str:
+            images: Optional[Sequence[str]] = None,
+            cancel: Any = None) -> str:
         """同步跑一条（控制台输入走这条）：立刻执行、返回答案。
 
         `images` 是本地路径或 http(s) 链接 —— 与 CLI `--image` 走同一条路：
         `Runtime.run(images=…)` → `stage_images()` → 模型的多模态 `content`。
+
+        `cancel` 是这一条消息的取消令牌；只有它非空时才往 `run()` 里传 ——
+        于是既有的 rt 替身（测试里的假 Runtime）不必认识这个参数。
         """
         imgs = [str(i) for i in (images or []) if i]
+        extra: Dict[str, Any] = {}
+        if cancel is not None:
+            extra["cancel_token"] = cancel
         with self._run_lock:
-            doc = self.rt.run(text, session=True, images=imgs or None)
+            doc = self.rt.run(text, session=True, images=imgs or None, **extra)
         return str(doc.get("answer") or "")
 
     def under_lock(self, fn: Callable[[], Any]) -> Any:
@@ -162,9 +169,18 @@ class AgentBridge:
         if carrier:
             KERNEL.state[slot] = msg
         try:
+            # 还在队列里就被取消：一次 ReAct 都不跑。不让「取消」在排队场景下变成
+            # 「取消了个寂寞，它还是烧了 200 步」—— 令牌在 `_rpc_send` 建好时就
+            # 跟着消息进来了，这里只是看一眼。
+            tok = getattr(msg, "cancel", None)
+            if tok is not None and getattr(tok, "requested", False):
+                self._reply_quietly(
+                    msg, reply,
+                    NOTICE_PREFIX + "这条消息在开跑前已被调用方取消，未执行。")
+                return
             if self.echo:
                 print(f"\n[频道] ◀ {msg.label()}：{msg.text[:200]}", flush=True)
-            answer = self.ask(compose_input(msg), images=msg.images)
+            answer = self.ask(compose_input(msg), images=msg.images, cancel=tok)
             if self.echo:
                 print(f"[频道] ▶ {msg.label()}：{answer[:200]}", flush=True)
             try:

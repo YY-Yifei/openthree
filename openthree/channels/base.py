@@ -40,6 +40,10 @@ class InboundMessage:
     # 只在频道层有一份 —— 用户态工具绕不过它）。与 `images` 同构：有默认值 ⇒
     # 微信 / 钉钉 / 既有构造点零改动。
     attachments: List[Dict[str, Any]] = field(default_factory=list)
+    # 本次运行的取消令牌（`openthree.cancel.CancelToken`）。频道把它建在「一次
+    # 运行」上，桥原样交给 `Runtime.run(cancel=…)` —— 频道不认识 ReAct，只是
+    # 置了自己那一个事件。默认 None ⇒ 微信 / 钉钉 / 既有构造点零改动。
+    cancel: Any = None
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def label(self) -> str:
