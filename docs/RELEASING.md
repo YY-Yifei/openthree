@@ -748,6 +748,58 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
 > 绕过枚举黑名单；另有一条「空答案 + 附件全被拒仍记 completed」与一条
 > 「`ValueError` 逃逸让 task 永远 `working`」。
 
+### 0.10.0 实跑记录（2026-11-18）
+
+本版内容：**A2A 真实停止** —— `tasks/cancel` 从「不再等」变成「真的停手」。详见
+`docs/a2a-real-cancel-plan.md` 与 `docs/a2a-real-cancel-plan-self-review.md`。
+
+判据不是「状态变 canceled」，而是**此后不再有新的 LLM 请求、不再有新的工具调用**
+（可数 `logs/<session>.json` 里的 `llm` / `tool` 事件验证）。按这条判据新增 13 条测试。
+
+- 新增 `openthree/cancel.py`：`CancelToken`（幂等 / 线程安全 / 不可重置）+ `Cancelled`
+  异常 + 线程本地 `current()`（令牌走线程本地，所以 `LLM.chat` / `post_json` /
+  所有工具签名与 schema **一个字节没动** —— 既有的 `_StubLLM` 与自造 function 零改动）
+  + 带 owner 的 socket 注册表 + killer 契约。
+- 六个检查点：步首 / 每个 tool call 之前 / `llm.chat` 返回后 / `_execute` 入口 /
+  `Runtime.run` 轮循环头 / `run_auto` 轮循环头。后两处是「取消了、又开一轮、继续烧」
+  的唯一入口（撞到步数上限时 `step_limit_hit` 会触发自动续轮）。
+- 拆资源：等模型返回到达秒级 —— `post_json` 把 `conn.sock` 注册进表，取消时
+  `shutdown(SHUT_RDWR)`，`read()` 立刻抛；退避 `sleep` 可打断；已请求时连 connect 都不做。
+- 拆资源（命令）：`run_shell` 挂 killer —— `communicate(timeout=limit)` **原样不动**，
+  另一线程 `proc.kill()` 把它唤醒（实测 1.000s 返回、`kill()` 自身 0.0000s、已吐出的
+  输出完整），随后后台 `taskkill /F /T` 清进程树。覆盖 `pytest` / `ocr review` /
+  `python -m build` / `git` / `pip` 这些长活。
+- 硬退出：`cancel_hard_grace`（默认 **30s**）—— 纯 Python 死循环 / C 扩展长调用
+  **不可杀**，到点 `os._exit(137)` 交外部守护重启。它按人类拍板默认开；代价与前提
+  写在 README「A2A 频道」一节（端点无鉴权 ⇒ 这是一个可达的开关）。
+- 终态：新增 `canceled`（不等同于 `interrupted` —— 「调用方要求停」与「人在终端
+  按了 Ctrl-C」在报告里要分得开）。`recorder.py` 白名单与 `runtime.py` 两处
+  `status in (...)` 同步。
+- 频道配置两项：`cancel_grace` 2s（等多久再写终态）/ `cancel_hard_grace` 30s；
+  不新增 CLI flag —— 所有 A2A 旋钮都长在 `channels.yaml` 那条缝上。
+- 三条诚实残留（写进 README 与本方案 §10）：同一 task 连发两条 follow up 时只掐
+  最新那条；取消路径的 `communicate` 仍可能等满 `limit`（孙进程脱离进程组还攥着管道）；
+  纯 Python 死循环只能靠硬退出，且**已产生的副作用不回滚**、取消时不交付附件。
+
+验收（仓库根实跑）：
+
+- `pyproject.toml` / `openthree/__init__.py` 版本号一致（`0.10.0`）✓
+- 全量 pytest → **822 passed / 0 failed**（134.06s）✓
+- 三轮 `ocr review`（10 / 13 / 5 条 = 28 条）：逐条对源码核实后 **22 修 / 3 记 /
+  1 不采纳 / 1 删死字段**。其中四条 P0 由本轮实现自曝并被测试钉住：硬退出永不开火
+  （watch 等的是自己刚 `set()` 的那个事件）、`None is not token` 恒假导致误杀进程
+  （全量 pytest 一次 `exit=137` 抓到）、`conn.sock` 可能为 `None` 把取消记成网络故障
+  并重试、以及修 P0 时新引入的 `sock` 未初始化回归 ✓
+- `python -m build` → wheel + sdist（先清空 `dist/` 与 `openthree.egg-info`）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist 内容核验：与 `git ls-files` 比对，**未跟踪文件 0 项** ✓
+- 安全核验：sdist 无 `.openthree/`、无 `config.yaml`、无 `api_key` 形迹 ✓
+- `twine upload --non-interactive --disable-progress-bar` 一次成功 ✓
+
+> 升级提示：本版**默认开启**硬退出（30s）。常驻部署用它就必须配外部守护重启；
+> 不想让远程取消能停掉进程，就把 `cancel_hard_grace` 设为 0（`false` / `no` / `off`
+> 同样落「关」，坏值与布尔否定一律落关，绝不退回默认的「开」）。
+
 ### 上传后核对（按版本）
 
 sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/json` 的
