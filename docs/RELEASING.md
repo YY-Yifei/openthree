@@ -805,11 +805,16 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
   `--inspect` → 38 工具；包内 `openthree/cancel.py` 可 import（`CancelToken`）、
   `channels/config.py` 含 `cancel_grace` 与 `cancel_hard_grace` 两个字段 ✓
 
-> 上传时踩到一个环境坑（与产物无关）：本进程以 SYSTEM 身份运行，`~` 展开成
-> `C:\Windows\system32\config\systemprofile`，于是 twine 报
-> `NonInteractive: Credential not found for API token` —— 而凭据其实在
-> `C:\Users\<user>\.pypirc`。补 `USERPROFILE` / `HOME` 指向真实用户目录后一次通过。
-> 这条是本机跑法，不写进产物。
+> 本机跑法的一个环境坑（与产物无关，但两处都会撞到）：本进程以 SYSTEM 身份运行，
+> `~` 展开成 `C:\Windows\system32\config\systemprofile`，而所有凭据都在真实用户目录里。
+>
+> - **twine**：报 `NonInteractive: Credential not found for API token`，凭据其实在
+>   `C:\Users\<user>\.pypirc`。
+> - **git push**（远端是 `git@github.com:…`）：报 `Host key verification failed`，
+>   密钥与 `known_hosts` 其实在 `C:\Users\<user>\.ssh`。
+>
+> 两者补同一句就都好：`set "HOME=C:\Users\<user>" && set "USERPROFILE=C:\Users\<user>"`。
+> 不必往 systemprofile 里复制 `.pypirc` 或 `.ssh` —— 那会多出第二份要维护的凭据。
 
 > 升级提示：本版**默认开启**硬退出（30s）。常驻部署用它就必须配外部守护重启；
 > 不想让远程取消能停掉进程，就把 `cancel_hard_grace` 设为 0（`false` / `no` / `off`
