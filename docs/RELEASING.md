@@ -794,7 +794,22 @@ site-packages 而非源码）：写一个只含 `__system_prompts__`、没有任
 - `python -m twine check dist/*` → **两个 PASSED** ✓
 - sdist 内容核验：与 `git ls-files` 比对，**未跟踪文件 0 项** ✓
 - 安全核验：sdist 无 `.openthree/`、无 `config.yaml`、无 `api_key` 形迹 ✓
-- `twine upload --non-interactive --disable-progress-bar` 一次成功 ✓
+- `twine upload --non-interactive --disable-progress-bar` 一次成功 →
+  <https://pypi.org/project/openthree/0.10.0/> ✓
+- **双向核验**：`/pypi/openthree/0.10.0/json` 的 `info.version` 为 `0.10.0`；两个文件的
+  `size` 与 `digests.sha256` 与本地 `dist/` **全串一致**，`yanked` 均为 `False`；
+  索引侧 `latest` = `0.10.0` ✓
+- **安装版验收**：干净 venv（`_live/venv0100`）从 `https://pypi.org/simple/` 装 `0.10.0`，
+  在仓库之外的**中性 cwd**（`D:\projects`）跑：`import openthree` → `0.10.0` 且
+  `__file__` 指向 site-packages、`python -m openthree --version` → `openthree 0.10.0`、
+  `--inspect` → 38 工具；包内 `openthree/cancel.py` 可 import（`CancelToken`）、
+  `channels/config.py` 含 `cancel_grace` 与 `cancel_hard_grace` 两个字段 ✓
+
+> 上传时踩到一个环境坑（与产物无关）：本进程以 SYSTEM 身份运行，`~` 展开成
+> `C:\Windows\system32\config\systemprofile`，于是 twine 报
+> `NonInteractive: Credential not found for API token` —— 而凭据其实在
+> `C:\Users\<user>\.pypirc`。补 `USERPROFILE` / `HOME` 指向真实用户目录后一次通过。
+> 这条是本机跑法，不写进产物。
 
 > 升级提示：本版**默认开启**硬退出（30s）。常驻部署用它就必须配外部守护重启；
 > 不想让远程取消能停掉进程，就把 `cancel_hard_grace` 设为 0（`false` / `no` / `off`
@@ -828,6 +843,8 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.8.0 | `openthree-0.8.0.tar.gz` | 719,911 | `2cd55e07f72aa7e0f26bdc233646b77268d58b0d411f7ef03f3369261e66377a` |
 | 0.9.0 | `openthree-0.9.0-py3-none-any.whl` | 340,968 | `4375690b539157fbc454f71732229633b04041f02b98f53e6c9c757629494ae0` |
 | 0.9.0 | `openthree-0.9.0.tar.gz` | 782,193 | `31ad90bd9df1e8d82699db3debf2cea6f8c747098d01d6b8d40af32e805244f0` |
+| 0.10.0 | `openthree-0.10.0-py3-none-any.whl` | 357,500 | `16f720f92e6f56e1e74b27e71be34e0b3ec27696571cbf8604ef1cae4ad51163` |
+| 0.10.0 | `openthree-0.10.0.tar.gz` | 832,595 | `1dba0aef58c58c9422eda4e52edcb49b3dcaeeab15ade98ae1061edd8d22b9cf` |
 
 
 
