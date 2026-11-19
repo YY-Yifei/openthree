@@ -850,6 +850,37 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.9.0 | `openthree-0.9.0.tar.gz` | 782,193 | `31ad90bd9df1e8d82699db3debf2cea6f8c747098d01d6b8d40af32e805244f0` |
 | 0.10.0 | `openthree-0.10.0-py3-none-any.whl` | 357,500 | `16f720f92e6f56e1e74b27e71be34e0b3ec27696571cbf8604ef1cae4ad51163` |
 | 0.10.0 | `openthree-0.10.0.tar.gz` | 832,595 | `1dba0aef58c58c9422eda4e52edcb49b3dcaeeab15ade98ae1061edd8d22b9cf` |
+| 0.11.0 | `openthree-0.11.0-py3-none-any.whl` | 378,037 | `ea1e23dd12d58d6f57ae645030bf34beb655226e1668e38087fbc5e50217a39e` |
+| 0.11.0 | `openthree-0.11.0.tar.gz` | 865,153 | `1aeac945161984005a87c87c6fb1ddd4b778ed50eaaee6a105352a40cb2a3b23` |
+
+### 0.11.0 实跑记录（2026-11-19）
+
+本版内容：**频道状态可观测** —— 钉钉收到就回一句、处理全程用表情显形；A2A 的
+`working` 里带「第 N 步 · 在调什么 · 已运行多久」。
+
+验收（仓库根实跑）：
+
+- 全量 pytest → **851 passed / 0 failed**（141.47s）✓
+- 三轮 `ocr review`（4 / 3 / 2 条 = 9 条）：逐条对源码核实后 **9 条全部采纳并修好**，
+  各带测试。其中两条是**自曝的谎报**：钉钉的 `idle` 会把「调用 run_shell」写回上一个
+  阶段；A2A 把一个 `status: error` 的跑挂任务记成 `completed`。
+- `python -m build` → wheel 378,037 B / sdist 865,153 B（先清空 `dist/` 与 `openthree.egg-info`）✓
+- `twine check` → **两个 PASSED** ✓
+- sdist 内容核验：121 条 tar 条目去掉目录与 setuptools 产物后，与 `git ls-files`（110）
+  对得上；**无 `.openthree/`、无 `config.yaml`** ✓
+- 密钥核验：按形态扫 `sk-` / `AKIA` / `ghp_` 长串，只命中 `tests/test_decide.py` 里两处
+  测试假 key（`sk-test-…` / `sk-evil-…`），**无真凭据** ✓
+- `twine upload --non-interactive --disable-progress-bar` 一次成功 →
+  <https://pypi.org/project/openthree/0.11.0/> ✓
+- **双向核验**：`/pypi/openthree/0.11.0/json` 两个文件的 `size` 与 `digests.sha256`
+  与本地 `dist/` **全串一致**，`yanked` 均为 `False`；索引侧 `latest` = `0.11.0` ✓
+
+> 环境坑的第三次撞墙（同一个根因）：`ocr` **也不在 SYSTEM 的 PATH 里**
+> （`C:\Users\95875\AppData\Roaming\npm`），补了 PATH 之后它又读不到
+> `~/.opencodereview/config.json`。与 `twine` / `git` 一模一样，一条前缀解决三个：
+> `set "HOME=C:\Users\95875" && set "USERPROFILE=C:\Users\95875" && set "PATH=C:\Users\95875\AppData\Roaming\npm;%PATH%" && <命令>`。
+> **不要**往 systemprofile 里复制密钥或 `.pypirc` —— 那会凭空多出一份要维护的凭据。
+
 
 
 
