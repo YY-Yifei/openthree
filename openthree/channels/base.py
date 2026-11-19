@@ -72,6 +72,9 @@ class Channel(ABC):
     # 发布给 `attach_file`，于是微信 / 钉钉回合里调到那个工具时，它会老实回
     # 「这次答复发不出文件」—— 而不是假装附上了。
     supports_files: bool = False
+    # 这个频道能不能把「收到了 / 在排队 / 正处理 / 已完成」显形给对方。默认不能：
+    # 桥于是既不调 `notify()`，也不给它造进度观察者 —— 微信等频道行为一个字节不变。
+    supports_status: bool = False
 
     def __init__(self, name: str, options: Dict[str, Any], *,
                  on_message: Optional[OnMessage] = None,
@@ -95,8 +98,13 @@ class Channel(ABC):
         """请求退出（尽量几秒内生效；重复调用必须安全）。"""
 
     @abstractmethod
-    def send_text(self, msg: InboundMessage, text: str) -> None:
-        """把一段纯文本回复发回 `msg` 的来源会话。"""
+    def send_text(self, msg: InboundMessage, text: str) -> Any:
+        """把一段纯文本回复发回 `msg` 的来源会话。
+
+        返回值可选但有用：**显式 `False` 表示「明确没送到」**（webhook 过期、
+        非 2xx），桥据此把终态记成「答复没发出去」而不是 ✅。`None` / `True`
+        一律当作「送到了，或者这个渠道没法判断」—— 于是既有实现不改也不受影响。
+        """
 
     # --- 工具 ---------------------------------------------------------
     def emit(self, msg: InboundMessage) -> None:
@@ -104,6 +112,36 @@ class Channel(ABC):
         msg.channel_type = msg.channel_type or self.type
         if self._on_message is not None:
             self._on_message(msg)
+
+    # --- 状态显形（可选）---------------------------------------------
+    def notify(self, msg: InboundMessage, state: str, detail: str = "") -> None:
+        """把一条消息的生命周期状态告诉频道 —— 默认什么都不做。
+
+        `state` 只有这几个值，桥是唯一来源：
+
+            accepted  已收到（还没开跑）
+            queued    排在别的消息后面（`detail` 说前面还有几条）
+            running   开始处理
+            done      处理完了（答案已经送出）
+            error     这条没跑通
+            canceled  调用方取消了 / 收工时还排在队里
+            skipped   压根没开跑（正在退出）
+
+        **必须立刻返回**：调用它的是收消息线程与 ReAct 线程，谁都不该为「亮个灯」
+        等一次网络往返。要发请求就自己排队交给后台线程。
+        """
+
+    def progress_for(self, msg: InboundMessage) -> Optional[Any]:
+        """返回一个订阅 `Progress` 事件的观察者；默认 None = 不订阅。
+
+        观察者协议见 `openthree/progress.py`：方法名与 `Progress` 同名同参
+        （`step` / `llm_start` / `llm_done` / `thought` / `tool_start` /
+        `tool_done` / `note` / `idle`），只实现关心的那几个即可。
+        它拿到的是**步级**回声（第几步、正在调哪个工具、等了多久），
+        与 `notify()` 的生命周期状态互补 —— **终态只听 `notify()`**：一个
+        `Progress` 是一轮的（多轮任务里会有 N 个），它的结束不是任务的结束。
+        """
+        return None
 
     @property
     def stopping(self) -> bool:

@@ -92,6 +92,17 @@ _SPECS: Dict[str, ChannelSpec] = {
                   hint="钉钉开放平台「应用信息」里的 AppSecret / Client Secret"),
             Field("require_mention", "群聊需 @", default="true",
                   hint="群聊里只回应 @ 了机器人的消息（true/false）"),
+            Field("robot_code", "robot_code",
+                  hint="机器人编码（钉钉开放平台「机器人」里的那串 dingxxxx）；"
+                       "留空 = 用 client_id。表情状态要用它"),
+            Field("status_reactions", "status_reactions", default="true",
+                  hint="在处理过程中用表情反应显示状态：👀已接收 / ⏳排队中 / "
+                       "🤔处理中·<正在做什么> <已耗时> / ✅完成 / ☹️出错 / 🚫已取消"
+                       "（true/false，默认开）。要应用有机器人权限；发不出去只是"
+                       "看不到表情，不影响收发"),
+            Field("ack_text", "ack_text", default="已接收，正在处理…",
+                  hint="收到消息立刻回的一句话（与最终答复是两条消息）；排队时自动"
+                       "补上「前面还有几条」。留空 = 不发回执，只靠表情"),
             Field("allow_from", "allow_from",
                   hint="允许的发送者 staffId，逗号分隔；留空 = 不限制"),
         ),

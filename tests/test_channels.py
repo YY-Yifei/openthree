@@ -21,13 +21,17 @@ import pytest
 
 from openthree.channels import _qr
 from openthree.channels import config as ch_config
+from openthree.channels import dingtalk as dt
 from openthree.channels._ws import (OPCODE_PING, OPCODE_TEXT, WebSocket, WebSocketError,
                                     decode_frame, _encode_frame)
 from openthree.channels.base import Channel, InboundMessage
-from openthree.channels.bridge import SHUTDOWN_NOTICE, AgentBridge, compose_input
+from openthree.channels.bridge import (SHUTDOWN_NOTICE, AgentBridge, _final_state,
+                                       compose_input)
 from openthree.channels.config import ChannelConfig, ChannelsConfig, config_path
-from openthree.channels.dingtalk import (ack_payload, extract_text as dt_extract,
+from openthree.channels.dingtalk import (DingTalkChannel, ack_payload,
+                                         extract_text as dt_extract,
                                          parse_callback_data, strip_at)
+from openthree.progress import Progress
 from openthree.channels.manager import ChannelManager, ChannelManagerError, instantiate
 from openthree.channels.wechat import (WeChatChannel, extract_text as wx_extract,
                                        make_headers, parse_inbound, split_text)
@@ -894,5 +898,385 @@ def test_qr_render_respects_terminal_width():
     assert narrow and len(narrow.splitlines()[0]) == 2 * (41 + 2)
     # 静默区收到底还装不下：宁可不画（折行的码扫不出来），让调用方给路径
     assert _qr.render_matrix(matrix, style="full", max_width=40, min_quiet=1) == ""
+
+
+# --- 钉钉：状态显形（即时回执 + 表情）----------------------------------
+def _dt_msg(msg_id: str = "m-1", conv: str = "cid") -> InboundMessage:
+    return InboundMessage(text="在吗", channel="ding", channel_type="dingtalk",
+                          user_id="s1", conversation_id=conv, msg_id=msg_id,
+                          reply_token="https://hook")
+
+
+def _fake_dingtalk(monkeypatch, **options):
+    """一个不发真请求的钉钉频道：把模块里的两个 HTTP 出口换成假的，记下每次调用。"""
+    calls = {"token": 0, "emotion": [], "text": []}
+
+    def fake_post_json(url, payload=None, **kwargs):
+        if url.endswith("/oauth2/accessToken"):
+            calls["token"] += 1
+            return {"accessToken": "tk", "expireIn": 7200}
+        headers = kwargs.get("headers") or {}
+        calls["emotion"].append({
+            "action": url.rsplit("/", 1)[-1],
+            "name": (payload or {}).get("emotionName"),
+            "token": headers.get("x-acs-dingtalk-access-token"),
+            "body": payload or {},
+        })
+        return {}
+
+    def fake_post_status(url, payload=None, **kwargs):
+        calls["text"].append(((payload or {}).get("text") or {}).get("content"))
+        return 200, "{}"
+
+    monkeypatch.setattr(dt, "post_json", fake_post_json)
+    monkeypatch.setattr(dt, "post_json_status", fake_post_status)
+    opts = {"client_id": "cid", "client_secret": "sec"}
+    opts.update(options)
+    return DingTalkChannel("ding", opts), calls
+
+
+def _wait_for(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_dingtalk_ack_text_and_received_emoji(monkeypatch):
+    """收到就回一句 + 挂「已接收」表情：两个请求都要真的发出来。"""
+    ch, calls = _fake_dingtalk(monkeypatch)
+    try:
+        ch.notify(_dt_msg(), "accepted")
+        assert _wait_for(lambda: calls["text"] and calls["emotion"])
+    finally:
+        ch.stop()
+
+    assert calls["text"] == ["已接收，正在处理…"]
+    first = calls["emotion"][0]
+    assert (first["action"], first["name"]) == ("reply", "👀已接收")
+    assert first["token"] == "tk"                       # 令牌真的带上了
+    body = first["body"]
+    assert body["openMsgId"] == "m-1"
+    assert body["openConversationId"] == "cid"
+    assert body["robotCode"] == "cid"                   # 留空 robot_code = client_id
+    assert body["emotionType"] == 2 and body["textEmotion"]["emotionId"] == dt.TEXT_EMOTION_ID
+
+
+def test_dingtalk_status_moves_from_running_to_done(monkeypatch):
+    """换状态 = 先摘旧表情再挂新的；回执只发一次。"""
+    ch, calls = _fake_dingtalk(monkeypatch)
+    msg = _dt_msg()
+    try:
+        ch.notify(msg, "running", "调用 run_shell")
+        assert _wait_for(lambda: len(calls["emotion"]) >= 1)
+        ch.notify(msg, "done", "用时 42s")
+        assert _wait_for(lambda: len(calls["emotion"]) >= 3)
+    finally:
+        ch.stop()
+
+    actions = [c["action"] for c in calls["emotion"]]
+    names = [c["name"] for c in calls["emotion"]]
+    assert actions == ["reply", "recall", "reply"]
+    assert names[0].startswith("🤔调用 run_shell")
+    assert names[1] == names[0]                          # 摘的正是刚才那枚
+    assert names[2] == "✅完成·用时 42s"
+    assert len(calls["text"]) == 1                       # 终态不补发回执
+
+
+def test_dingtalk_status_survives_api_failure(monkeypatch):
+    """表情发不出去只是看不见状态：回执照发，`send_emotion` 只回 False、不抛。"""
+    ch, calls = _fake_dingtalk(monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise dt.HttpError("表情接口 500")
+
+    monkeypatch.setattr(dt, "post_json", boom)
+    msg = _dt_msg()
+    try:
+        ch.notify(msg, "accepted")
+        # 等到「警告只记一次」那个标记：它只在 `_apply` 走完表情那一步后才置位，
+        # 于是后台线程确已停下 —— 不然测试结束后它会拿着**未打桩**的 post_json 去发真请求。
+        assert _wait_for(lambda: calls["text"] and ch._emotion_warned)
+        assert ch.send_emotion(msg, "👀已接收") is False
+    finally:
+        ch.stop()
+
+    assert calls["emotion"] == []
+    assert calls["text"] == ["已接收，正在处理…"]
+
+
+def test_dingtalk_status_can_be_turned_off(monkeypatch):
+    """一个开关同时关掉回执与表情（`ack_text` 留空 + `status_reactions: false`）。"""
+    ch, calls = _fake_dingtalk(monkeypatch, status_reactions="false", ack_text="")
+    msg = _dt_msg()
+    try:
+        ch.notify(msg, "accepted")
+        time.sleep(0.2)
+        assert ch.progress_for(msg) is None
+    finally:
+        ch.stop()
+
+    assert calls["emotion"] == [] and calls["text"] == []
+
+
+def test_dingtalk_face_text_reads_like_a_status():
+    assert dt._face("queued", "", 0) == "⏳排队中"
+    assert dt._face("running", "调用 run_shell", 80) == "🤔调用 run_shell 1m20s"
+    assert dt._face("running", "", 5) == "🤔处理中 5s"
+    assert dt._face("done", "用时 42s", 0) == "✅完成·用时 42s"
+    assert len(dt._face("running", "x" * 60, 0)) <= 24    # 表情挂不下就截断，不能整条丢掉
+
+
+def test_dingtalk_duration_formats():
+    assert dt.duration(0) == "0s"
+    assert dt.duration(59) == "59s"
+    assert dt.duration(60) == "1m"
+    assert dt.duration(200) == "3m20s"
+    assert dt.duration(3700) == "1h01m"
+
+
+def test_dingtalk_heartbeat_never_rewinds_the_activity():
+    """心跳只推进耗时，绝不把活动描述写回上一个阶段。
+
+    `Progress` 只等心跳线程 0.3 秒，一枚卡在 `_say()` 里的心跳醒来时带的是**旧**
+    阶段名；照着写就把 `tool_start` 刚写下的「调用 run_shell」覆盖成「等待模型
+    返回」—— 看起来正好像卡在了上一步。A2A 的 `_Echo.idle` 用同一条纪律。
+    """
+    class _Recorder:
+        def __init__(self) -> None:
+            self.puts = []
+
+        def put(self, msg, state, detail="") -> None:
+            self.puts.append((state, detail))
+
+    box = _Recorder()
+    echo = dt._StepProgress(box, _dt_msg())
+    echo.tool_start("run_shell")
+    echo.idle("等待模型返回", 45.0)
+    # 两条的 detail 都必须是「调用 run_shell」：心跳不改它，只让耗时继续走
+    assert [d for _, d in box.puts] == ["调用 run_shell", "调用 run_shell"]
+
+
+def test_bridge_counts_the_console_when_reporting_the_queue_position():
+    """控制台占着运行锁时，排队位要把它算进去。
+
+    只在「队列本来就空」时补那一条，会漏掉「控制台在跑 + 已经排了一条」：
+    报成「前面还有 1 条」而实际是两条 —— 读数少报一条，等于告诉人它比实际更快轮到。
+    """
+    class _NoopRT:
+        def run(self, *args, **kwargs):
+            return {"answer": ""}
+
+    ch = _RecordingChannel()
+    bridge = AgentBridge(_NoopRT(), echo=False)
+    gate = threading.Event()
+    holder = threading.Thread(target=lambda: bridge.under_lock(gate.wait), daemon=True)
+    holder.start()
+    try:
+        assert _wait_for(lambda: bridge._console == 1), "控制台没有拿到运行锁"
+        bridge.submit(_dt_msg(), ch.send_text)
+        assert ch.states[0][0] == "queued"
+        assert ch.states[0][1] == "前面还有 1 条"
+    finally:
+        gate.set()
+        holder.join(5.0)
+
+
+def test_dingtalk_does_not_cry_wolf_about_the_terminal_face(monkeypatch):
+    """终态帧停在消息上的那枚 ✅ 不算「没摘掉」。
+
+    它就在 `info["faces"]` 里（刚挂上的），把它也算成残留，这条警告会在每一次
+    正常收工时报一次反话 —— 真出问题时没人会再信它。
+    """
+    ch, calls = _fake_dingtalk(monkeypatch)
+    warnings = []
+
+    class _Log:
+        def warning(self, fmt, *args) -> None:
+            warnings.append(fmt % args if args else fmt)
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    ch.log = _Log()
+    msg = _dt_msg()
+    try:
+        ch.notify(msg, "accepted")
+        assert _wait_for(lambda: calls["emotion"])
+        ch.notify(msg, "done", "用时 1s")
+        assert _wait_for(lambda: any(e["name"].startswith("✅") for e in calls["emotion"]))
+    finally:
+        ch.stop()
+
+    assert warnings == []
+
+
+# --- 桥：把生命周期状态交给频道 ---------------------------------------
+class _RecordingChannel(Channel):
+    """只记「收到哪些状态」的假频道（不会真发请求）。"""
+
+    type = "recording"
+    supports_status = True
+
+    def __init__(self) -> None:
+        super().__init__("rec", {})
+        self.states = []
+        self.texts = []
+        self.done = threading.Event()
+
+    def run(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def send_text(self, msg, text) -> None:
+        self.texts.append(text)
+        self.done.set()
+
+    def notify(self, msg, state, detail="") -> None:
+        self.states.append((state, detail))
+
+    def progress_for(self, msg):
+        return "observer" if getattr(msg, "text", "") == "带观察者" else None
+
+
+def test_bridge_reports_lifecycle_states():
+    class FakeRT:
+        def run(self, text, session=True, images=None, **kwargs):
+            return {"answer": "好的"}
+
+    ch = _RecordingChannel()
+    bridge = AgentBridge(FakeRT(), echo=False)
+    bridge.start()
+    try:
+        bridge.submit(_dt_msg(), ch.send_text)
+        assert ch.done.wait(5.0)
+        assert _wait_for(lambda: [s for s, _ in ch.states] == ["accepted", "running", "done"])
+    finally:
+        bridge.stop()
+
+    assert ch.states[-1][1].startswith("用时 ")          # 完成时带上花了多久
+    assert ch.texts == ["好的"]
+
+
+def test_bridge_marks_a_waiting_message_as_queued():
+    """桥只有一条工作线程：第二条必须被明说成「排队」，否则对方以为死机了。"""
+    gate = threading.Event()
+    seen = {}
+
+    class SlowRT:
+        def run(self, text, session=True, images=None, **kwargs):
+            seen.update(kwargs)
+            gate.wait(5.0)
+            return {"answer": "好"}
+
+    ch = _RecordingChannel()
+    bridge = AgentBridge(SlowRT(), echo=False)
+    bridge.start()
+    try:
+        bridge.submit(_dt_msg("m-1"), ch.send_text)
+        assert _wait_for(lambda: any(s == "running" for s, _ in ch.states))
+        bridge.submit(_dt_msg("m-2", "cid2"), ch.send_text)
+        assert _wait_for(lambda: any(s == "queued" for s, _ in ch.states))
+    finally:
+        gate.set()
+        bridge.stop()
+
+    queued = [d for s, d in ch.states if s == "queued"]
+    assert queued and "前面还有 1 条" in queued[0]
+    assert "observer" not in seen                        # 没要观察者的消息不多传参数
+
+
+def test_bridge_passes_observer_to_runtime():
+    """要观察者的频道，桥必须把它透传给 `Runtime.run(observer=…)`。"""
+    seen = {}
+
+    class FakeRT:
+        def run(self, text, session=True, images=None, **kwargs):
+            seen.update(kwargs)
+            return {"answer": "好"}
+
+    ch = _RecordingChannel()
+    bridge = AgentBridge(FakeRT(), echo=False)
+    bridge.start()
+    try:
+        msg = _dt_msg()
+        msg.text = "带观察者"
+        bridge.submit(msg, ch.send_text)
+        assert ch.done.wait(5.0)
+    finally:
+        bridge.stop()
+
+    assert seen.get("observer") == "observer"
+
+
+def test_bridge_marks_failed_run_as_error_not_done():
+    """运行期把失败写进 `status` 并**正常返回** —— 桥不能把这种情况标成 ✅。
+
+    它和「抛异常」不是一回事：`Runtime.run()` 会把内部异常、取消、中断都收进
+    `doc["status"]`，正文照旧是一句 `[运行时异常] …`。只看「函数返回了」就会把
+    一次失败显示成完成 —— 那正是「报告里撒谎」。
+    """
+
+    class FailingRT:
+        def run(self, text, session=True, images=None, **kwargs):
+            return {"answer": "[运行时异常] boom", "status": "error"}
+
+    ch = _RecordingChannel()
+    bridge = AgentBridge(FailingRT(), echo=False)
+    bridge.start()
+    try:
+        bridge.submit(_dt_msg(), ch.send_text)
+        assert _wait_for(lambda: [s for s, _ in ch.states]
+                         == ["accepted", "running", "error"])
+    finally:
+        bridge.stop()
+
+    assert ch.texts == ["[运行时异常] boom"]          # 那句话还是要送给对方
+
+
+def test_final_state_maps_runtime_status():
+    assert _final_state("error", True, 12) == ("error", "用时 12s")
+    assert _final_state("canceled", True, 5) == ("canceled", "用时 5s")
+    assert _final_state("interrupted", True, 5) == ("canceled", "用时 5s")
+    assert _final_state("unfinished", True, 30) == ("done", "用时 30s（未收尾）")
+    assert _final_state("", True, 3) == ("done", "用时 3s")
+    assert _final_state("", False, 3) == ("error", "答复没发出去")
+
+
+# --- 进度回声的观察者旁路 ---------------------------------------------
+def test_progress_observer_sees_step_and_tool_events():
+    import io
+
+    seen = []
+
+    class Obs:
+        def step(self, iteration, max_iterations):
+            seen.append(("step", iteration))
+
+        def tool_start(self, name, args=None):
+            seen.append(("tool", name))
+
+    p = Progress(stream=io.StringIO(), heartbeat=0, observer=Obs())
+    p.step(2, 10)
+    p.tool_start("run_shell")
+    p.tool_done("run_shell", 12.0)
+    assert seen == [("step", 2), ("tool", "run_shell")]
+
+
+def test_progress_observer_failure_is_swallowed():
+    """观察者炸了绝不能让 ReAct 跟着炸 —— 它是纯旁路。"""
+    import io
+
+    class Boom:
+        def step(self, *args, **kwargs):
+            raise RuntimeError("观察者炸了")
+
+    p = Progress(stream=io.StringIO(), heartbeat=0, observer=Boom())
+    p.step(1, 1)          # 不该抛
+    p.close()
 
 

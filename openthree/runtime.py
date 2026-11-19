@@ -254,7 +254,8 @@ class Runtime:
             images: Optional[Sequence[Union[str, Path]]] = None,
             session: bool = False,
             rounds: Optional[int] = None,
-            cancel_token: Optional[cancel.CancelToken] = None) -> Dict[str, Any]:
+            cancel_token: Optional[cancel.CancelToken] = None,
+            observer: Optional[Any] = None) -> Dict[str, Any]:
         """跑一次任务 —— **一次任务 = 若干轮（round），每轮是一次完整 ReAct 循环**。
 
         轮与步是两层：`max_iterations` 是**一轮**的步预算，`max_rounds` 是**整场**的
@@ -310,6 +311,7 @@ class Runtime:
                     next_round_summary=prev_summary,
                     reuse_task=(first and user_input is None),
                     cancel_token=cancel_token,
+                    observer=observer,
                 )
                 docs.append(doc)
                 prev_summary = doc.get("next_round_summary") or ""
@@ -343,7 +345,8 @@ class Runtime:
                    round_budget: Optional[int] = None,
                    next_round_summary: str = "",
                    reuse_task: bool = False,
-                   cancel_token: Optional[cancel.CancelToken] = None) -> Dict[str, Any]:
+                   cancel_token: Optional[cancel.CancelToken] = None,
+                   observer: Optional[Any] = None) -> Dict[str, Any]:
         """跑**一轮**：建 Agent → 起 ReAct → finalize，返回本轮的会话文档。
 
         `user_input=None` 有**两种**语义，必须显式区分：
@@ -397,7 +400,10 @@ class Runtime:
         KERNEL.recorder = self.recorder
 
         # 进度回声：CLI 上「还活着、在干什么」。quiet 时它什么都不说。
-        progress = Progress(heartbeat=self.heartbeat, enabled=not self.quiet)
+        # `observer` 是同一批事件的**旁路**（频道用它把状态显形给对方），
+        # None = 没人订阅，行为与以前完全一致。
+        progress = Progress(heartbeat=self.heartbeat, enabled=not self.quiet,
+                            observer=observer)
 
         self.agent = Agent(self.ws, self.registry, self.llm, self.recorder,
                            max_iterations=self.max_iterations,
@@ -511,7 +517,8 @@ class Runtime:
     def run_auto(self, user_input: Optional[str] = None, *, rounds: int = 5,
                  append: bool = False, session_id: Optional[str] = None,
                  images: Optional[Sequence[Union[str, Path]]] = None,
-                 cancel_token: Optional[cancel.CancelToken] = None) -> Dict[str, Any]:
+                 cancel_token: Optional[cancel.CancelToken] = None,
+                 observer: Optional[Any] = None) -> Dict[str, Any]:
         """长任务自主推进：跑一轮，若计划里还有未完成项，就自动接力下一轮。
 
         `rounds` 是自动接力的**总轮数上限**（含首轮）；若人类另用 `--max-rounds`
@@ -578,6 +585,7 @@ class Runtime:
                         next_round_summary=prev_summary,
                         reuse_task=(first and user_input is None),
                         cancel_token=cancel_token,
+                        observer=observer,
                     )
                 except RuntimeError as exc:
                     self.say(f"[auto] 第 {i + 1} 轮启动失败：{exc}")
