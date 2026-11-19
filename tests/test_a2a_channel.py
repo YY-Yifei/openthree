@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import io
 import json
 import socket
 import sys
@@ -45,6 +46,7 @@ from openthree.channels.bridge import (NOTICE_PREFIX, SHUTDOWN_NOTICE, AgentBrid
                                        compose_input)
 from openthree.channels.config import ChannelConfig, ChannelsConfig
 from openthree.channels.manager import ChannelManager, apply_extra
+from openthree.progress import Progress
 
 # --- 小工具 ---------------------------------------------------------------
 def _free_port() -> int:
@@ -2542,3 +2544,292 @@ def test_the_just_finished_task_is_never_expired_by_its_own_budget_check(
     task = _round_with_files(ch, seen, "好了", [{"path": str(src)}])
     assert any(p["kind"] == "file" for p in task["artifacts"][0]["parts"])
     assert "文件已过期" not in json.dumps(task, ensure_ascii=False)
+
+
+# --- 过程显形：working 里到底在干什么 -------------------------------------
+#
+# 被保护的不变量：`tasks/get` 的 `working` 必须能回答「跑到第几步 / 在干什么 /
+# 已经多久」，而**终态之后不留任何过程残影**。只给一个光秃秃的 `working`，
+# 轮询十几分钟也读不出「正在调 run_shell」和「进程已经卡死」的区别 —— 那正是
+# 这个频道此前最要命的盲区。
+
+def _open_task(ch: A2aChannel, text: str = "q"):
+    """发一条「收下不回」的消息，返回 `(task_id, 频道收到的 InboundMessage)`。"""
+    seen: list[InboundMessage] = []
+    ch._on_message = seen.append
+    _, body = _call(ch, "message/send", {"message": _user_msg(text)})
+    return body["result"]["id"], seen[0]
+
+
+def _get(ch: A2aChannel, task_id: str) -> dict:
+    return _call(ch, "tasks/get", {"id": task_id})[1]["result"]
+
+
+def _status_text(task: dict) -> str:
+    return task["status"]["message"]["parts"][0]["text"]
+
+
+def test_durations_are_written_the_way_a_human_reads_them():
+    """`status.message` 里那句时长要一眼有量感 —— `130s` 得心算，`2m10s` 不用。"""
+    assert a2a_mod._dur(0) == "0s"
+    assert a2a_mod._dur(42.7) == "42s"
+    assert a2a_mod._dur(80) == "1m20s"
+    assert a2a_mod._dur(7500) == "2h05m"
+    assert a2a_mod._dur(-5) == "0s"
+
+
+def test_submitted_already_says_it_is_queued():
+    """`submitted` 也得有一句人话：分不出「刚收到」和「压根没被处理」就是黑箱。"""
+    store = a2a_mod._TaskStore()
+    task = store.new(task_id="t-1", context_id="c-1", text="q")
+    assert task["status"]["state"] == "submitted"
+    assert "排队" in _status_text(task)
+    assert task["status"]["timestamp"]
+    # 还没开跑：没有进展可报，也就不该有 metadata
+    assert "metadata" not in task
+
+
+def test_working_reports_the_step_the_tool_and_the_elapsed_time(tmp_path):
+    ch = _channel(tmp_path)
+    ch._load_options()
+    task_id, msg = _open_task(ch)
+    echo = ch.progress_for(msg)
+    assert echo is not None
+    echo.step(7, 200)
+    echo.tool_start("run_shell", {"command": "pytest"})
+
+    task = _get(ch, task_id)
+    assert task["status"]["state"] == "working"
+    text = _status_text(task)
+    assert "第 7/200 步" in text and "调用 run_shell" in text and "已运行" in text
+    info = task["metadata"]["openthree"]
+    assert (info["step"], info["maxSteps"], info["activity"]) == (7, 200, "调用 run_shell")
+    # `TaskStatus` 只有 state / message / timestamp 三个字段，结构化细节只能住
+    # 在 `Task.metadata`：程序化的调用方读它，不必去解析那句中文
+    assert isinstance(info["elapsedS"], float) and info["elapsedS"] >= 0
+
+
+def test_a_late_heartbeat_never_rewinds_the_activity(tmp_path):
+    """心跳只证明「还活着」，绝不把活动描述写回上一个阶段。
+
+    `Progress` 只等心跳线程 0.3 秒，所以一枚 `idle` 完全可能落在 `tool_start`
+    之后 —— 它若写回「等待模型返回」，界面就从「调用 run_shell」倒退回去，
+    看起来像卡在了上一步。
+    """
+    ch = _channel(tmp_path)
+    ch._load_options()
+    task_id, msg = _open_task(ch)
+    echo = ch.progress_for(msg)
+    echo.step(3, 200)
+    echo.tool_start("run_shell")
+    echo.idle("等待模型返回", 45.0)
+
+    task = _get(ch, task_id)
+    assert task["metadata"]["openthree"]["activity"] == "调用 run_shell"
+    assert "调用 run_shell" in _status_text(task)
+
+
+def test_a_terminal_task_carries_no_leftover_progress(tmp_path):
+    """终态之后不许留「第 9 步 · 调用 run_shell」—— 那是会让人以为没收工的证据。"""
+    ch = _channel(tmp_path)
+    ch._load_options()
+    task_id, msg = _open_task(ch)
+    echo = ch.progress_for(msg)
+    echo.step(9, 200)
+    echo.tool_start("run_shell")
+    ch.send_text(msg, "答案")
+
+    task = _get(ch, task_id)
+    assert task["status"]["state"] == "completed"
+    assert "metadata" not in task
+    assert "第 9" not in json.dumps(task, ensure_ascii=False)
+
+
+def test_progress_arriving_after_the_terminal_state_is_ignored(tmp_path):
+    """一枚迟到的心跳点不亮一个已经完成的任务。"""
+    ch = _channel(tmp_path)
+    ch._load_options()
+    task_id, msg = _open_task(ch)
+    echo = ch.progress_for(msg)
+    ch.send_text(msg, "答案")
+    before = _get(ch, task_id)
+    echo.step(11, 200)
+    echo.idle("等待模型返回", 3.0)
+    after = _get(ch, task_id)
+    assert after["status"] == before["status"]
+    assert "metadata" not in after
+
+
+def test_notify_writes_the_queue_position_without_touching_the_state(tmp_path):
+    """桥的排队位落进 `status.message`，但不替 task 推进状态机。"""
+    ch = _channel(tmp_path)
+    ch._load_options()
+    task_id, msg = _open_task(ch)
+    state_before = _get(ch, task_id)["status"]["state"]
+    ch.notify(msg, "queued", "前面还有 1 条")
+    task = _get(ch, task_id)
+    assert task["status"]["state"] == state_before
+    text = _status_text(task)
+    assert "排队中" in text and "前面还有 1 条" in text
+    # 终态只由 `_finish` 写（那才是带 artifact 的一份）；桥的终态通知不改任何东西
+    ch.notify(msg, "done", "用时 3s")
+    assert _get(ch, task_id)["status"]["state"] == state_before
+
+
+def test_progress_for_a_forgotten_task_is_none(tmp_path):
+    """被挤出表的 task 不再订阅进展 —— 它的答案已经无处可交。"""
+    ch = _channel(tmp_path)
+    ch._load_options()
+    ch._tasks = a2a_mod._TaskStore(limit=1)     # 只留最近一条
+    ch._tasks.on_terminal = ch._notify_push
+    first_id, first_msg = _open_task(ch, "一")
+    _open_task(ch, "二")
+    assert ch._tasks.get(first_id) is None
+    assert ch.progress_for(first_msg) is None
+
+
+def test_follow_up_clears_the_previous_round_progress(tmp_path):
+    """上一轮的「第 40 步」不能出现在这一轮的第一帧里。"""
+    ch = _channel(tmp_path)
+    ch._load_options()
+    task_id, msg = _open_task(ch)
+    echo = ch.progress_for(msg)
+    echo.step(40, 200)
+    echo.tool_start("run_shell")
+    assert "第 40/200 步" in _status_text(_get(ch, task_id))
+
+    ch._on_message = lambda m: None
+    _call(ch, "message/send", {"message": _user_msg("再问", taskId=task_id)})
+    task = _get(ch, task_id)
+    assert task["status"]["state"] == "working"
+    # 复位后的第一帧是「已收到」，不该带着上一轮那个步数
+    assert "step" not in task["metadata"]["openthree"]
+    assert "第 40" not in json.dumps(task, ensure_ascii=False)
+
+
+class _EchoRuntime:
+    """假运行期：按真 `Progress` 的顺序发事件，中途停住等测试看一眼。
+
+    这个替身存在的唯一理由：接线（桥 → `Progress(observer=…)` → `_Echo` →
+    `status.message`）只有真跑一遍才证明得了，单独测 `_Echo` 只能证明它自己。
+    """
+
+    def __init__(self, gate: threading.Event) -> None:
+        self.gate = gate
+        self.started = threading.Event()
+
+    def run(self, text, *, session=False, images=None, cancel_token=None, observer=None):
+        progress = Progress(stream=io.StringIO(), heartbeat=0.0, observer=observer)
+        progress.step(3, 200)
+        progress.llm_start("fake-model")
+        progress.tool_start("run_shell", {"command": "pytest -q"})
+        self.started.set()
+        self.gate.wait(5)
+        progress.tool_done("run_shell", 1500, 10)
+        progress.close()
+        return {"answer": "好了", "status": "done"}
+
+
+def test_the_real_bridge_puts_progress_into_tasks_get(tmp_path):
+    """端到端：真桥 + 真 `Progress` 的步级回声，轮询 `tasks/get` 就看得见。"""
+    gate = threading.Event()
+    rt = _EchoRuntime(gate)
+    bridge = AgentBridge(rt, echo=False)
+    bridge.start()
+    ch = _channel(tmp_path)
+    ch._load_options()
+    ch._on_message = lambda msg: bridge.submit(msg, ch.send_text)
+    try:
+        _, body = _call(ch, "message/send", {"message": _user_msg("q")})
+        task_id = body["result"]["id"]
+        assert rt.started.wait(5), "桥没有把这条消息跑起来"
+        task = _get(ch, task_id)
+        assert task["status"]["state"] == "working"
+        text = _status_text(task)
+        assert "第 3/200 步" in text and "调用 run_shell" in text
+    finally:
+        gate.set()
+        bridge.stop()
+
+    # 收工之后这份过程残影必须消失
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        task = _get(ch, task_id)
+        if task["status"]["state"] == "completed":
+            break
+        time.sleep(0.02)
+    assert task["status"]["state"] == "completed"
+    assert "metadata" not in task
+
+
+def test_the_elapsed_clock_starts_at_the_first_real_event(tmp_path):
+    """计时不在观察者构造时起表。
+
+    观察者是桥在**拿到运行锁之前**造出来的（它得先有观察者才能传给
+    `Runtime.run`）。控制台正跑着一条时，从造它开始计时，第一帧就会写
+    「已运行 5m」—— 而这个数正是调用方用来判断「卡了多久」的。
+    """
+    ch = _channel(tmp_path)
+    ch._load_options()
+    task_id, msg = _open_task(ch)
+    echo = ch.progress_for(msg)
+    assert echo._started is None                  # 还没起表
+    echo.step(1, 200)
+    info = _get(ch, task_id)["metadata"]["openthree"]
+    assert info["elapsedS"] < 5.0                 # 从第一个真事件算起，而不是从造它算起
+
+
+def test_a_previous_rounds_progress_never_lands_on_the_reset_task(tmp_path):
+    """follow up 复位之后，上一轮迟到的帧必须被丢弃（与 `_finish` 同一判据）。
+
+    桥只有一条工作线程，而 follow up 是 HTTP 线程直接复位的 —— 上一轮的 ReAct
+    还在跑，它的观察者也还在发事件。不比对 `_run`，它的「第 40 步」就写进了
+    这一轮刚复位的 task，正是复位想避免的那件事。
+    """
+    ch = _channel(tmp_path)
+    ch._load_options()
+    task_id, msg = _open_task(ch)
+    old = ch.progress_for(msg)
+    old.step(40, 200)
+    assert "第 40/200 步" in _status_text(_get(ch, task_id))
+
+    ch._on_message = lambda m: None
+    _call(ch, "message/send", {"message": _user_msg("再问", taskId=task_id)})
+    old.tool_start("run_shell")           # 上一轮还没停，这一帧属于它
+    dumped = json.dumps(_get(ch, task_id), ensure_ascii=False)
+    assert "第 40" not in dumped
+    assert "调用 run_shell" not in dumped
+
+
+def test_a_run_that_raised_is_reported_as_failed_not_completed(tmp_path):
+    """跑挂的那条也带着一句话正常返回 —— 只按「答复非空」判会记成成功。
+
+    `Runtime.run()` 出异常时给的是 `{"answer": "[运行时异常] …", "status": "error"}`，
+    桥走的是**正常**回复路径（`notice` 不设）。所以判词得单独带过来（`verdict`）：
+    否则对面轮询 `tasks/get`，看到的是一个跑挂了的任务报 `completed` —— 正是
+    「把失败报成成功」。
+    """
+    class _BoomRT:
+        def run(self, text, **kwargs):
+            return {"answer": "[运行时异常] RuntimeError: 炸了", "status": "error"}
+
+    bridge = AgentBridge(_BoomRT(), echo=False)
+    bridge.start()
+    ch = _channel(tmp_path)
+    ch._load_options()
+    ch._on_message = lambda msg: bridge.submit(msg, ch.send_text)
+    try:
+        _, body = _call(ch, "message/send", {"message": _user_msg("q")})
+        task_id = body["result"]["id"]
+        deadline = time.monotonic() + 5
+        task = _get(ch, task_id)
+        while time.monotonic() < deadline:
+            task = _get(ch, task_id)
+            if task["status"]["state"] in ("failed", "completed"):
+                break
+            time.sleep(0.02)
+        assert task["status"]["state"] == "failed"
+        # 失败要说得清为什么：那句异常说明仍然原样进 artifact
+        assert "运行时异常" in _text_of(task)
+    finally:
+        bridge.stop()

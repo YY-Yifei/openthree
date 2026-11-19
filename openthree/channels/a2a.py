@@ -208,6 +208,31 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _dur(seconds: float) -> str:
+    """把秒数写成「人类一眼读得懂」的时长：`42s` / `1m20s` / `2h05m`。
+
+    为什么不用 `130.0s`：这个字符串会出现在对端看到的 `status.message` 里，
+    而它要回答的问题是「卡了多久」—— `1m20s` 一眼就有量感，`130s` 要心算。
+    """
+    total = int(max(0.0, float(seconds)))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _status_message(text: str) -> Dict[str, Any]:
+    """`status.message` 的形状（协议里它是一个 `Message`，不是裸字符串）。
+
+    只放文本 part：`status.message` 是**过程**的频道，文件永远走 `artifacts` ——
+    同一份字节在一个响应里出现两次，就多了一处要被预算和过期逻辑照顾的地方。
+    """
+    return {"role": "agent", "parts": [{"kind": "text", "text": str(text)}]}
+
+
 def _as_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -632,7 +657,10 @@ class _TaskStore:
         task = {
             "id": task_id,
             "contextId": context_id,
-            "status": {"state": "submitted", "timestamp": _now()},
+            # `submitted` 也带一句人话：只给 `state` 的话，一个看不见内部状态的
+            # 调用方对着 `submitted` 分不出「刚收到」和「压根没被处理」。
+            "status": {"state": "submitted", "timestamp": _now(),
+                       "message": _status_message("已接收，正在排队")},
             "artifacts": [],
             "history": [{"role": "user", "parts": [{"kind": "text", "text": text}]}],
             "_done": threading.Event(),
@@ -730,6 +758,10 @@ def _set_terminal(task: Dict[str, Any], state: str, text: str,
     stamps = [_file_placeholder(f) for f in (files or ())]
     task["status"] = {"state": state, "timestamp": _now(),
                       "message": {"role": "agent", "parts": [{"kind": "text", "text": text}]}}
+    # 过程态的东西在终态一律清掉：`metadata.openthree` 里那一份是**几分钟前**的
+    # 快照（第 N 步 / 在用哪个工具），留着它，一个轮询的调用方会对着
+    # `completed` 读到「第 7 步 · 调用 run_shell」—— 一条会让人以为没收工的证据。
+    task.pop("metadata", None)
     task["artifacts"] = [{
         "artifactId": f"{task.get('id')}-answer",
         "name": "answer",
@@ -809,7 +841,94 @@ def _public(task: Dict[str, Any], history_length: Any = None) -> Dict[str, Any]:
         "artifacts": task.get("artifacts") or [],
         "history": history,
     }
+    # `metadata` 是协议给的扩展位（`Task.metadata`），过程细节放这里：`TaskStatus`
+    # 只有 `state / message / timestamp` 三个字段，塞不进结构化信息，而只把细节
+    # 写成中文塞进 `message`，程序化的调用方只能去解析人话。空的时候不输出这个键
+    # —— 老客户端读不到它，也就不会被一个 `{}` 弄糊涂。
+    meta = task.get("metadata")
+    if isinstance(meta, dict) and meta:
+        doc["metadata"] = meta
     return json.loads(json.dumps(doc, ensure_ascii=False))
+
+
+# --- 过程显形（把 ReAct 的步级回声写进 status.message / metadata）----------
+class _Echo:
+    """把 `Progress` 的事件写进一个 A2A task 的 `status.message` 与 `metadata`。
+
+    **为什么需要它**：A2A 侧此前只有三档状态（`submitted` → `working` → 终态），
+    而 `working` 一个字的细节都没有。调用方轮询十几分钟只看到同一个 `working`，
+    分不出「正在调 run_shell」和「进程已经卡死」—— 这与钉钉那边「一下子卡很久」
+    是同一个病，只是这边得靠 `tasks/get` 才看得见。
+
+    **契约（与 `openthree/progress.py` 的观察者协议同源）**：
+
+      * 方法会被**并发调用**（心跳线程发 `idle`，ReAct 线程发 `step` / `tool_*`）；
+      * 必须**立刻返回** —— 所以这里只写一次内存（`_TaskStore` 的 RLock），
+        一个网络请求都不发。真发不出去也不影响 ReAct：`_note` 静默放弃。
+
+    **它只管过程，不管终态**：任务的终态由桥经 `Channel.notify()` 落到 `_finish`。
+    `_set_state` 自己会在终态上返回，所以一枚迟到的 `idle` 点不亮一个已完成的任务。
+    """
+
+    def __init__(self, channel: "A2aChannel", task_id: str,
+                 started: Optional[float] = None, run_id: Any = None) -> None:
+        self._channel = channel
+        self._task_id = task_id
+        # `None` = **第一次真事件才起表**。观察者是在 `ask_doc()` **之前**被造出来的
+        # （桥要先拿到它才能传给 `Runtime.run`），而那一刻这条消息可能还排在控制台
+        # 那把运行锁后面 —— 从造它开始计时，第一帧就会写「已运行 5m」，而这个数是
+        # 调用方用来判断「卡了多久」的。宁可晚起表，也不要一个虚高的读数。
+        self._started = started
+        self._run = run_id
+        self._step = 0
+        self._max = 0
+        self._activity = ""
+
+    # --- Progress 的事件（只实现关心的几个，缺的当没有）---------------
+    def step(self, iteration: int, max_iterations: int) -> None:
+        self._step = int(iteration or 0)
+        self._max = int(max_iterations or 0)
+        # `第 7/200 步` 本身就是回答「跑到哪了」，此时还没有具体动作可报。
+        self._write("")
+
+    def llm_start(self, model: str) -> None:
+        self._write("等模型返回")
+
+    def tool_start(self, name: str, args: Optional[Dict[str, Any]] = None) -> None:
+        self._write(f"调用 {name}")
+
+    def tool_done(self, name: str, elapsed_ms: float, output_len: int = 0,
+                  error: Optional[str] = None) -> None:
+        spent = _dur((elapsed_ms or 0) / 1000)
+        self._write(f"{name} 失败（{spent}）" if error else f"{name} 完成（{spent}）")
+
+    def idle(self, phase: str, waited: float) -> None:
+        """心跳：证明「还活着」，并且把「已运行 Ns」这一格一直刷新。
+
+        **它绝不改活动描述**：一枚慢到的心跳（`Progress` 只等 0.3 秒）若把阶段名
+        写回「等待模型返回」，界面上就会从「调用 run_shell」倒退回去 —— 看起来
+        像卡在了上一步。判据很简单：心跳的唯一职责是证明**还在**，而「在干什么」
+        只有真事件说了算。
+        """
+        self._write(None)
+
+    # --- 落盘 ---------------------------------------------------------
+    def _write(self, activity: Optional[str]) -> None:
+        """`activity=None` = 心跳（保留上一次的活动，只刷新时长）。"""
+        if activity is not None:
+            self._activity = activity
+        if self._started is None:
+            self._started = time.time()
+        elapsed = max(0.0, time.time() - self._started)
+        head = f"第 {self._step}/{self._max} 步" if self._step else ""
+        bits = [b for b in (head, self._activity) if b]
+        text = " · ".join(bits) or "开始处理"
+        self._channel._note(self._task_id,
+                            f"处理中 · {text}（已运行 {_dur(elapsed)}）",
+                            {"phase": "working", "step": self._step,
+                             "maxSteps": self._max, "activity": self._activity,
+                             "elapsedS": round(elapsed, 1)},
+                            run_id=self._run)
 
 
 # --- HTTP 层 --------------------------------------------------------------
@@ -948,6 +1067,12 @@ class A2aChannel(Channel):
     """A2A 服务端频道：JSON-RPC 进来 → `emit()` → 桥 → `send_text()` 回答案。"""
 
     type = "a2a"
+
+    # 进展要显形：`True` 让桥把「已接收 / 排队中 / 开始处理」告诉这一层
+    # （见 `Channel.notify`），并且为每条消息造一个进度观察者
+    # （`progress_for`）。两者都只写内存 —— A2A 的出站是 JSON-RPC 响应，
+    # 没有「改一条已发出的消息」这回事，所以不需要钉钉那种后台状态线程。
+    supports_status = True
 
     def __init__(self, name: str, options: Dict[str, Any], **kwargs: Any) -> None:
         super().__init__(name, options, **kwargs)
@@ -1121,6 +1246,70 @@ class A2aChannel(Channel):
         「当前回合有没有承载者」）。
         """
         return bool(self.outbound_roots)
+
+    # --- 过程显形 -----------------------------------------------------
+    def notify(self, msg: InboundMessage, state: str, detail: str = "") -> None:
+        """桥的生命周期状态 → 写进 `status.message`（**只写内存，立刻返回**）。
+
+        只有「还没开始干活」的那几档在这里有意义：`running` / 终态都会被随后的
+        进度事件或 `_finish` 覆盖，而 `canceled` / `error` / `skipped` 的真终态
+        由 `send_text` / `_finish` 写（**那才是带 artifact 的那一份**）。
+
+        这一条补的正是协议层面的一个缺口：`submitted` 分不出「刚收到」和「排在
+        别人后面」。桥知道排队位（它是唯一知道队列长度的地方），所以由它说。
+        """
+        if state not in ("accepted", "queued", "running"):
+            return
+        task = self._tasks.get(_as_text(msg.reply_token or msg.msg_id))
+        if task is None:
+            return
+        text = {
+            "accepted": "已接收",
+            "queued": f"已接收，排队中（{detail}）" if detail else "已接收，排队中",
+            "running": "开始处理",
+        }[state]
+        # **不改 state**：task 的状态机是它自己的事（`submitted` → `working` →
+        # 终态由 `_rpc_send` / `_finish` 推进）。桥只说「在队里排第几」——
+        # 让它顺手把状态推一格，一条还排在队里的消息会先被标成「开始处理」。
+        # 所有权判据同样交给 `_set_state` 在锁内做：follow up 换轮之后，上一轮
+        # 迟到的通知不该落进新的这一轮。
+        run_id = msg.raw.get("run") if isinstance(msg.raw, dict) else None
+        self._set_state(task, _state_of(task) or "working", message=text,
+                        extra={"phase": "working", "activity": text},
+                        run_id=run_id)
+
+    def progress_for(self, msg: InboundMessage) -> Optional[Any]:
+        """为这条消息造一个进度观察者 —— 它把 ReAct 的步级回声写进 task。
+
+        task 已经被挤出表时返回 `None`（不订阅）：那条 ReAct 仍然会跑完，但它
+        的答案已经无处可交，再往一个不在表里的对象上写进展只是浪费。
+
+        `started` 传 `None`（第一次真事件才起表，见 `_Echo.__init__`）；
+        `run_id` 一起带上：follow up 会在同一个 task 上换掉 `_run`，而**上一轮**
+        的观察者还在发事件 —— 不比对，它的「第 40 步」会写进这一轮刚复位的 task。
+        """
+        task_id = _as_text(msg.reply_token or msg.msg_id)
+        if not task_id or self._tasks.get(task_id) is None:
+            return None
+        run_id = msg.raw.get("run") if isinstance(msg.raw, dict) else None
+        return _Echo(self, task_id, run_id=run_id)
+
+    def _note(self, task_id: str, text: str, extra: Dict[str, Any],
+              run_id: Any = None) -> None:
+        """观察者往一个 task 上写一帧进展；task 没了 / 已终态 / 换了轮次就放弃。
+
+        观察者的方法必须立刻返回（见 `_Echo` 的契约），所以这里只做一次
+        查表 + 一次持锁写，不做任何 IO。
+
+        **所有权判据与 `_finish` 完全同源**：`run_id` 给了就必须等于
+        `task["_run"]` —— follow up 复位同一个 task 时，上一轮的观察者还在跑，
+        它迟到的帧属于上一轮，写进来就毁了「这一轮才刚开始」这件事。
+        比对**在 `_set_state` 的锁内**做（不在这里先查后写：那条缝正好够一次复位）。
+        """
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+        self._set_state(task, "working", message=text, extra=extra, run_id=run_id)
 
     # --- 状态落盘 -----------------------------------------------------
     def state_path(self) -> Path:
@@ -1768,7 +1957,12 @@ class A2aChannel(Channel):
                 # **先复位再跑**：上一次的终态与 `_done` 都得清掉，否则 `_set_state`
                 # 与 `_finish` 会因「已是终态」直接返回 —— 新答案被丢弃，而 blocking
                 # 的调用方立刻拿到上一次的旧答案。
-                previous["status"] = {"state": "working", "timestamp": _now()}
+                previous["status"] = {"state": "working", "timestamp": _now(),
+                                      "message": _status_message("已接收，开始处理")}
+                # 上一轮的进展细节与终态一样必须清掉：留着它，这一轮的第一次
+                # `tasks/get` 会先看到「第 40 步 · 调用 run_shell」，而这一轮其实
+                # 才刚开始。
+                previous.pop("metadata", None)
                 previous["artifacts"] = []
                 previous["_done"] = threading.Event()
                 previous["_run"] = run_id          # 与复位同一把锁：所有权切换是原子的
@@ -1806,7 +2000,11 @@ class A2aChannel(Channel):
         # 追加消息会被白等满 `block_wait`，而答案马上就会由回调送到 —— 正是「等」要
         # 避开的浪费，只是反了过来。
         blocking = _client_waits(config, push=isinstance(task.get("_push"), dict))
-        self._set_state(task, "working")
+        # 「已收到」这一句是给**非 blocking** 调用方的：它立刻拿到这个 task 就走，
+        # 之后看到的第一帧不该是一个没有任何细节的 `working`。blocking 的调用方
+        # 随后会等到终态，这一帧它看不到 —— 写它不会让谁多等。
+        self._set_state(task, "working", message="已收到，开始处理",
+                        extra={"phase": "working", "activity": "开始处理"})
         msg = InboundMessage(
             text=text,
             channel=self.name,
@@ -2027,6 +2225,11 @@ class A2aChannel(Channel):
                 body = "（这条答复只有附件，见 file part）"
         if notes:
             body = (body + "\n\n" + "\n".join(notes)).strip()
+        # 运行期的判词（桥在送答案**之前**写的 `msg.raw["verdict"]`）。
+        # `interrupted` 与 `error` 都会带着一句话正常返回，只按「答复非空」判
+        # 就会把它们记成 `completed` —— 对面轮询 `tasks/get` 看到的是一个跑挂了的
+        # 任务报「成功」。`unfinished` 不在此列：答案是完整的，只是没收尾。
+        verdict = _as_text(msg.raw.get("verdict")) if isinstance(msg.raw, dict) else ""
         if cancelled:
             # **必须排在 `is_notice` 之前**：排队中被取消的消息，桥回的正是一句
             # notice（带 `notice` 标记）。先判 notice 就会把它记成 failed ——
@@ -2039,6 +2242,14 @@ class A2aChannel(Channel):
             # 桥自己塞的话（「正在退出」/「这条消息没跑通」）**不是**结论：
             # 记成 completed 会让对面拿到一条"成功"的空答案。
             self._finish(task, "failed", body or "这条消息没有跑完（桥给出的通知是空的）",
+                         run_id=run_id)
+        elif verdict in ("error", "interrupted", "canceled"):
+            # `error` / `interrupted` / `canceled` 三个判词都可能带着一句正文正常
+            # 返回（`[运行时异常] …`、被硬打断、被取消）。正文会**原样进 artifact**，
+            # 但那句话躺在一个 `completed` 的任务里，就是一次谎报。
+            self._finish(task,
+                         "canceled" if verdict != "error" else "failed",
+                         body or ("这一轮被中断了" if verdict != "error" else "运行时异常"),
                          run_id=run_id)
         elif not answered and not files:
             # `body` 里可能已经有「附件为什么没发出去」—— 那是这条失败唯一有价值的
@@ -2078,11 +2289,38 @@ class A2aChannel(Channel):
             done = task["_done"]
         done.set()
 
-    def _set_state(self, task: Dict[str, Any], state: str) -> None:
+    def _set_state(self, task: Dict[str, Any], state: str, message: str = "",
+                   extra: Optional[Dict[str, Any]] = None,
+                   run_id: Any = None) -> None:
+        """推进过程态：`state` + 一句人话（`message`）+ 结构化细节（`metadata`）。
+
+        两个额外参数都是**可选**的：老路径 `_set_state(task, "working")` 一字不改，
+        产出的仍是原来那个只有 `state` + `timestamp` 的 status —— 协议里它仍是一条
+        合法 task，只是不带细节。
+
+        `run_id` 给了就必须等于 `task["_run"]`，**而且这个比对必须在锁内**：
+        follow up 是 HTTP 线程直接复位同一个 task 的（换 `_run`、清 metadata），
+        锁外先查后写的话，那条缝正好够一个已被取代的旧 run 把上一轮的「第 40 步」
+        写进刚复位的新一轮。与 `_finish` 的所有权判据完全同源。
+
+        **不需要序号防护**：观察者的方法会被并发调用（心跳线程发 `idle`，ReAct
+        线程发 `step` / `tool_*`），而 `Progress` 只等心跳 0.3 秒 —— 一枚慢到的
+        `idle` 确实可能落在 `tool_done` 之后。但 `idle` **不改 activity**（它只
+        刷新「已运行 Ns」，见 `_Echo.idle`），所以迟到的它写不进一个过期的阶段名。
+        """
         with self._tasks.lock:
-            if _state_of(task) in TERMINAL_STATES:
+            if run_id is not None and task.get("_run") != run_id:
                 return
-            task["status"] = {"state": state, "timestamp": _now()}
+            if _state_of(task) in TERMINAL_STATES:
+                # 终态之后一律忽略：一枚迟到的心跳点不亮一个已完成的任务。
+                return
+            status: Dict[str, Any] = {"state": state, "timestamp": _now()}
+            text = _as_text(message)
+            if text:
+                status["message"] = _status_message(text)
+            task["status"] = status
+            if isinstance(extra, dict) and extra:
+                task["metadata"] = {"openthree": dict(extra)}
 
     def _view(self, task: Dict[str, Any], history_length: Any = None) -> Dict[str, Any]:
         """持锁快照。

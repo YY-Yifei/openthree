@@ -674,6 +674,39 @@ PNG 解成模块矩阵，用半块字符（`█ ▀ ▄`）画在控制台上，
 连方块字符都不认（`ascii`）时退成 `##`。PNG 仍旧落在
 `.openthree/channels/<频道名>-qrcode.png`，事后重扫 / 转发都用得上。
 
+### 钉钉：长任务里也看得见「在干什么」
+
+桥只有**一条**工作线程（内核就在这一个进程里，一次只跑一条 ReAct）。前一条是十分钟的
+构建，后面那条就真等十分钟 —— 这是设计，但以前对方无从知道这一点：聊天窗口里一个
+像素都不动，看着和进程死了没区别。所以钉钉频道把状态做成两样东西：
+
+| 你看到 | 什么时候 | 说明 |
+| --- | --- | --- |
+| 一条文字消息「已接收，正在处理…」 | 收到那一刻 | 排队时自动带上「（前面还有 1 条，轮到你就开跑）」 |
+| 消息上的一枚表情 | 状态变化时，处理中每几十秒刷一次耗时 | 👀已接收 · ⏳排队中 · 🤔调用 run_shell 1m20s · ☹️出错 · 🚫已取消 · ✅完成·用时 42s |
+
+表情是钉钉的「文字表情」（`emotionType: 2`，所以带得下「在处理什么」），走
+`/v1.0/robot/emotion/reply` 挂、`/v1.0/robot/emotion/recall` 摘，令牌走
+`/v1.0/oauth2/accessToken`。**两者都是尽力而为**：应用没开机器人权限、令牌拿不到、
+网络抖动 —— 只记一条警告，回执与答复照常发出。三个开关都在 `channels.yaml`：
+
+```yaml
+- name: ding
+  type: dingtalk
+  options:
+    client_id: 你的AppKey
+    client_secret: 你的AppSecret
+    robot_code: dingxxxx        # 表情接口要的机器人编码；留空 = client_id
+    status_reactions: true      # 表情状态；false = 只看回执
+    ack_text: 已接收，正在处理… # 回执那句话；留空 = 不发回执，只靠表情
+```
+
+这层状态不占 ReAct 的任何一行：`Progress` 把「第几步 / 正在调哪个工具 / 等了多少秒」
+旁路给频道（`Runtime.run(observer=…)`），生命周期（排队 / 开跑 / 完成 / 出错 / 取消）
+由桥自己通知（`Channel.notify`）。两个钩子在 `Channel` 基类上默认是空的，所以微信与
+A2A 的行为一个字节没变 —— 它们只是不订阅。
+
+
 ### A2A：让别的智能体来派任务
 
 第三类频道的另一端不是人，是另一个智能体（或 OACP 面板）：
@@ -707,6 +740,40 @@ openthree -A2A -i                  # 控制台与 A2A 并存（共用一个会�
 账本，`GetTask` 只在用户点按钮时才发一次。对这类调用方，答案不进这次响应就等于没有
 （实测：任务 5 秒跑完，面板上却永远「执行中」）。窗口必须**小于**对面客户端的超时
 （OACP 默认 60），否则会把一个一定能返回的 `working` 拖成对方眼里的连接超时。
+
+#### 进展：`working` 里看得见跑到哪一步
+
+一个 `working` 卡十分钟，调用方分不出「正在调 `run_shell`」和「进程已经死了」——
+所以 `status.message` 与 `metadata` 会随着 ReAct 往前走：
+
+```json
+"status": {"state": "working", "timestamp": "…",
+           "message": {"role": "agent", "parts": [
+               {"kind": "text", "text": "处理中 · 第 7/200 步 · 调用 run_shell（已运行 2m10s）"}]}},
+"metadata": {"openthree": {"phase": "working", "step": 7, "maxSteps": 200,
+                           "activity": "调用 run_shell", "elapsedS": 130.0}}
+```
+
+- **两处都要**：`message` 是给人读的（面板、日志），`metadata` 是给程序读的 ——
+  A2A 的 `TaskStatus` 只有 `state` / `message` / `timestamp` 三个字段，结构化信息塞不
+  进去，只能借 `Task.metadata` 这个扩展位。只写中文的话，程序化的调用方得去解析人话。
+- **只有 `state` / `timestamp` 是老客户端就认识的全部**：`message` 与 `metadata` 都是
+  附加项，读不懂的客户端行为不变。
+- **终态会清掉它们**：`completed` 的 task 里不会留一个「第 7 步」的残影，否则轮询的人
+  会对着一个已收工的任务读出一条「还在跑」的证据。
+- **排队有一个协议里没有的位置**：`submitted` 分不出「刚收到」和「排在别人后面」，
+  所以桥报的队列位会写进 `status.message`（「已接收，排队中（前面还有 1 条）」）——
+  它**不推进状态机**，只补一句话。
+- **心跳只证明还活着**：长等待里每 15 秒刷一次 `elapsedS`（`--a2a` 侧走
+  `Progress.heartbeat`），它**不会**把 `activity` 写回上一个阶段 —— 一枚慢到的心跳若
+  覆盖了刚发生的「调用 run_shell」，界面看起来就像卡在了上一步。
+
+用法就是一句话：**显式 `blocking: false` 拿到 task，然后轮询 `tasks/get`**。
+`blocking` 缺省仍然会等（理由见上），那种情况下这一路进展你看不到 —— 你只等到终态。
+
+诚实边界：push 通知仍**只在终态发**（要收到过程事件得用 `message/stream`，而卡片
+声明 `streaming: false`），`tasks/resubscribe` 也仍然拒。
+
 
 #### 回调：不用谁去刷新，结论自己送过去
 
