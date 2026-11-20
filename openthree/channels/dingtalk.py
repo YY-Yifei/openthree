@@ -14,17 +14,19 @@
 
 **但「由智能体承担」不等于「对方什么都不该看见」**：一次任务可能跑十分钟，而聊天
 窗口里那时一个像素都不会变 —— 发消息的人分不清「在排队」「在思考」和「进程死了」。
-所以这个频道把状态显形成两样东西（与 qwenpaw 的钉钉频道同一套做法）：
+所以这个频道把状态显形成**一枚挂在用户那条消息上的「文字表情」**，随状态变化 ——
+👀已接收 / ⏳排队中 / 🤔处理中·<正在做什么> <已耗时> / ✅完成 / ☹️出错 / 🚫已取消。
+桥只有一条工作线程，`x` 这种串行是设计，不是故障 —— 所以「前面还有几条在排」也写在
+那枚表情里（`⏳排队中·前面还有 2 条`）。
 
-  * **一条即时回执**：收到就回「已接收，正在处理…」，并说清前面还有几条在排
-    （桥只有一条工作线程，`x` 这种串行是设计，不是故障）；
-  * **一枚「文字表情」**：挂在用户那条消息上，随状态变化 ——
-    👀已接收 / ⏳排队中 / 🤔处理中·<正在做什么> <已耗时> / ✅完成 / ☹️出错 / 🚫已取消。
+**状态只走表情，没有文字回执**：每条消息多一条与答复无关的聊天记录只是噪声，而
+「排队第几位」「正在调哪个工具」表情那一格写得下。答复仍是单独一条消息（`send_text`），
+与状态互不干扰。
 
 表情走开放平台 `POST /v1.0/robot/emotion/reply|recall`（`emotionType=2` 的文字表情
 能带一小段自定义文字，所以「在处理什么」写得下），令牌走 `/v1.0/oauth2/accessToken`。
 两者都是**尽力而为**：应用没开机器人权限、令牌拿不到、网络抖动 —— 按消息节流地记
-一句警告（同一条消息 `EMOTION_WARN_INTERVAL` 秒内只喊一次），回执与答复照常，
+一句警告（同一条消息 `EMOTION_WARN_INTERVAL` 秒内只喊一次），答复照常发出，
 一个字节都不受影响。
 
 换表情的顺序是**先挂新的、挂成功了才摘旧的**。反过来（先摘后挂）时「摘成功、挂
@@ -58,9 +60,6 @@ _AT_PREFIX = re.compile(r"^\s*@[^\s@]+\s*")
 # 文字表情的内置 id 与背景：钉钉规定的一组常量，换掉它表情就渲染不出来。
 TEXT_EMOTION_ID = "2659900"
 EMOTION_BACKGROUND = "im_bg_1"
-
-# 收到消息立刻回的那句话（配置项 `ack_text` 可改；显式留空 = 只靠表情，不发回执）。
-DEFAULT_ACK_TEXT = "已接收，正在处理…"
 
 # 同一个状态「纯刷新」的最小间隔（秒）：长任务里耗时在走，但没必要每秒刷一次。
 STATUS_MIN_INTERVAL = 20.0
@@ -210,8 +209,6 @@ class DingTalkChannel(Channel):
         # 表情接口要的是「机器人编码」；内建机器人就是 AppKey，所以留空即取它。
         self.robot_code = self.option("robot_code", "") or self.client_id
         self.status_reactions = self.option_bool("status_reactions", True)
-        # 没写这个键 = 用默认那句话；显式写空串 = 不回执（只靠表情）。
-        self.ack_text = str(self.options.get("ack_text", DEFAULT_ACK_TEXT) or "").strip()
         self._ws: Optional[WebSocket] = None
         self._ws_lock = threading.Lock()
         self._ping_stop = threading.Event()
@@ -391,8 +388,8 @@ class DingTalkChannel(Channel):
     def notify(self, msg: InboundMessage, state: str, detail: str = "") -> None:
         """桥告诉我们「这条消息现在到哪一步了」—— 只入队，立刻返回。
 
-        真正的两条请求（回执文本、表情）由 `_Status` 的后台线程发：调用这里的是
-        收消息线程和 ReAct 线程，谁都不该为「亮个灯」等一次网络往返。
+        真正的请求（那一枚表情）由 `_Status` 的后台线程发：调用这里的是收消息线程和
+        ReAct 线程，谁都不该为「亮个灯」等一次网络往返。
         """
         if state not in STATUS_FACE:
             return
@@ -511,7 +508,7 @@ def _clip(text: str, limit: int = FACE_LIMIT) -> str:
 
 
 class _Status:
-    """把「状态」变成钉钉里看得见的变化：一条即时回执 + 一枚当前状态的表情。
+    """把「状态」变成钉钉里看得见的变化：一枚挂在消息上的当前状态表情。
 
     为什么要有后台线程：`notify()` 是从收消息线程与 ReAct 线程里调到的，一次 HTTP
     往返（~200ms）会直接拖慢 ack 与下一步推理。所以这里只入队，真请求交给一条守护
@@ -519,8 +516,8 @@ class _Status:
     节流 —— 长任务里唯一能证明「还活着」的是耗时在往前走，但也没必要每秒刷一次。
 
     一个 msgId 到达终态后留一个**墓碑**（`_finished`）：那一轮的心跳线程可能还没睡醒，
-    它晚到的 `idle` 不该把同一条消息重新当成「刚开始处理」—— 那会让已经 ✅ 的消息
-    再收一次回执、表情又跳回 🤔。墓碑按时间淘汰，所以它不会无界增长。
+    它晚到的 `idle` 不该把同一条消息重新当成「刚开始处理」—— 那会把已经 ✅ 的消息
+    又点亮成 🤔。墓碑按时间淘汰，所以它不会无界增长。
 
     这个线程**不随 `channel.stop()` 停**：收工顺序是「先停频道、再停桥」，而桥会把
     手头那条跑完并把终态发出来 —— 在这里提前停掉，那条消息就永远停在 🤔，而答案
@@ -593,11 +590,8 @@ class _Status:
         info = self._seen.get(key)
         if info is None:
             info = {"at": now, "faces": [], "state": "", "detail": "", "sent": 0.0,
-                    "acked": False, "lost": False, "retry": 0}
+                    "lost": False, "retry": 0}
             self._seen[key] = info
-        if not info["acked"]:
-            info["acked"] = True
-            self._ack(msg, state, detail)
         face = _face(state, detail, now - info["at"]) if self.channel.can_react(msg) else ""
         if face:
             # **只有「同一件事的纯刷新」（耗时在走）才节流**；换了细节就立刻发 ——
@@ -678,25 +672,12 @@ class _Status:
         for key, _ in sorted(self._finished.items(), key=lambda kv: kv[1])[:excess]:
             self._finished.pop(key, None)
 
-    def _ack(self, msg: InboundMessage, state: str, detail: str) -> None:
-        """一条回执，每条消息只发一次 —— 而且只在「还在等」的时候发。
-
-        终态不补发：那时用户马上会收到正式答复（或错误说明），再叠一句「已接收」
-        只是噪声。排队时把「前面还有几条」说透，这才是「卡很久」最需要的那句话。
-        """
-        text = self.channel.ack_text
-        if not text or state in _TERMINAL_STATES:
-            return
-        if state == "queued" and detail:
-            text = f"{text}（{detail}，轮到你就开跑）"
-        self.channel.send_text(msg, text)
-
 
 def _msg_key(msg: InboundMessage) -> str:
     """一条消息一个键。
 
     有 `msgId` 就用它（表情接口要的正是它）。没有时用**对象身份**兜底 ——
-    同一对话里两条消息若共用一格，前一条的墓碑会把后一条的回执一起挡掉。
+    同一对话里两条消息若共用一格，前一条的墓碑会把后一条的表情状态一起挡掉。
     """
     return str(msg.msg_id or "") or f"{msg.conversation_id}|{msg.user_id}|{id(msg)}"
 

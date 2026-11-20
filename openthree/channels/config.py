@@ -100,9 +100,6 @@ _SPECS: Dict[str, ChannelSpec] = {
                        "🤔处理中·<正在做什么> <已耗时> / ✅完成 / ☹️出错 / 🚫已取消"
                        "（true/false，默认开）。要应用有机器人权限；发不出去只是"
                        "看不到表情，不影响收发"),
-            Field("ack_text", "ack_text", default="已接收，正在处理…",
-                  hint="收到消息立刻回的一句话（与最终答复是两条消息）；排队时自动"
-                       "补上「前面还有几条」。留空 = 不发回执，只靠表情"),
             Field("allow_from", "allow_from",
                   hint="允许的发送者 staffId，逗号分隔；留空 = 不限制"),
         ),

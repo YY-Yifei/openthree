@@ -900,7 +900,7 @@ def test_qr_render_respects_terminal_width():
     assert _qr.render_matrix(matrix, style="full", max_width=40, min_quiet=1) == ""
 
 
-# --- 钉钉：状态显形（即时回执 + 表情）----------------------------------
+# --- 钉钉：状态显形（表情）--------------------------------------------
 def _dt_msg(msg_id: str = "m-1", conv: str = "cid") -> InboundMessage:
     return InboundMessage(text="在吗", channel="ding", channel_type="dingtalk",
                           user_id="s1", conversation_id=conv, msg_id=msg_id,
@@ -944,16 +944,21 @@ def _wait_for(predicate, timeout: float = 5.0) -> bool:
     return predicate()
 
 
-def test_dingtalk_ack_text_and_received_emoji(monkeypatch):
-    """收到就回一句 + 挂「已接收」表情：两个请求都要真的发出来。"""
+def test_dingtalk_received_state_is_one_emoji_and_no_text(monkeypatch):
+    """收到状态 = 一枚「已接收」表情，**一条文字都不发**。
+
+    文字回执（「已接收，正在处理…」）已从这条路径上整个删掉：它与最终答复是两条
+    消息，纯噪声。这里同时锁住「表情真的发出去了」与「没有任何文字消息」。
+    """
     ch, calls = _fake_dingtalk(monkeypatch)
     try:
         ch.notify(_dt_msg(), "accepted")
-        assert _wait_for(lambda: calls["text"] and calls["emotion"])
+        assert _wait_for(lambda: calls["emotion"])
+        time.sleep(0.05)                     # 万一还残留发文字的路径，给它发生的窗口
     finally:
         ch.stop()
 
-    assert calls["text"] == ["已接收，正在处理…"]
+    assert calls["text"] == []               # 没有文字回执
     first = calls["emotion"][0]
     assert (first["action"], first["name"]) == ("reply", "👀已接收")
     assert first["token"] == "tk"                       # 令牌真的带上了
@@ -965,7 +970,7 @@ def test_dingtalk_ack_text_and_received_emoji(monkeypatch):
 
 
 def test_dingtalk_status_moves_from_running_to_done(monkeypatch):
-    """换状态 = **先挂新的、挂上了才摘旧的**；回执只发一次。
+    """换状态 = **先挂新的、挂上了才摘旧的**。
 
     顺序不能反：先摘后挂时「摘成功、挂失败」会让消息上一枚表情都不剩，而先挂后摘
     最坏只是短暂并存（甚至不并存 —— 同一位置本来就会被新表情替换）。
@@ -986,11 +991,11 @@ def test_dingtalk_status_moves_from_running_to_done(monkeypatch):
     assert names[0].startswith("🤔调用 run_shell")
     assert names[2] == names[0]                          # 摘的正是刚才那枚
     assert names[1] == "✅完成·用时 42s"                 # 新的先挂上，旧的才摘
-    assert len(calls["text"]) == 1                       # 终态不补发回执
+    assert calls["text"] == []                           # 整条路径上没有文字回执
 
 
 def test_dingtalk_status_survives_api_failure(monkeypatch):
-    """表情发不出去只是看不见状态：回执照发，`send_emotion` 只回 False、不抛。"""
+    """表情发不出去只是看不见状态：`send_emotion` 只回 False、不抛，也不补一条文字。"""
     ch, calls = _fake_dingtalk(monkeypatch)
 
     def boom(*args, **kwargs):
@@ -1002,13 +1007,13 @@ def test_dingtalk_status_survives_api_failure(monkeypatch):
         ch.notify(msg, "accepted")
         # 等到「警告只记一次」那个标记：它只在 `_apply` 走完表情那一步后才置位，
         # 于是后台线程确已停下 —— 不然测试结束后它会拿着**未打桩**的 post_json 去发真请求。
-        assert _wait_for(lambda: calls["text"] and ch._emotion_warned)
+        assert _wait_for(lambda: bool(ch._emotion_warned))
         assert ch.send_emotion(msg, "👀已接收") is False
     finally:
         ch.stop()
 
     assert calls["emotion"] == []
-    assert calls["text"] == ["已接收，正在处理…"]
+    assert calls["text"] == []          # 表情失败也不拿一条文字来兜底
 
 
 def _stateful_dingtalk(monkeypatch, **options):
@@ -1154,7 +1159,7 @@ def test_dingtalk_trim_waits_for_the_recall_attempt(monkeypatch):
 
     monkeypatch.setattr(ch, "send_emotion", fake_send)
     info = {"at": time.time(), "faces": ["A", "B", "C"], "state": "", "detail": "",
-            "sent": 0.0, "acked": True, "lost": False, "retry": 0}
+            "sent": 0.0, "lost": False, "retry": 0}
     ch._status._draw(_dt_msg(), info, "D", "running", "x", time.time())
 
     assert calls[0] == ("D", False)                                  # 先挂新的
@@ -1169,7 +1174,7 @@ def test_dingtalk_terminal_state_does_not_warn_when_reactions_are_off(monkeypatc
     真话必须由「这条消息在原理上能不能挂表情」（`can_react`）把关：否则关掉表情
     之后**每条消息收尾都会喊一句假话**，正好教人忽略这条警告。
     """
-    ch, st = _stateful_dingtalk(monkeypatch, status_reactions="false", ack_text="")
+    ch, st = _stateful_dingtalk(monkeypatch, status_reactions="false")
     warns = []
     monkeypatch.setattr(ch.log, "warning", lambda *a, **kw: warns.append(a[0] % a[1:]))
     msg = _dt_msg()
@@ -1226,8 +1231,8 @@ def test_dingtalk_emotion_warning_is_throttled_per_message(monkeypatch):
 
 
 def test_dingtalk_status_can_be_turned_off(monkeypatch):
-    """一个开关同时关掉回执与表情（`ack_text` 留空 + `status_reactions: false`）。"""
-    ch, calls = _fake_dingtalk(monkeypatch, status_reactions="false", ack_text="")
+    """`status_reactions: false` 关掉全部状态显形：一个请求都不发。"""
+    ch, calls = _fake_dingtalk(monkeypatch, status_reactions="false")
     msg = _dt_msg()
     try:
         ch.notify(msg, "accepted")
