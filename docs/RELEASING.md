@@ -852,6 +852,8 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.10.0 | `openthree-0.10.0.tar.gz` | 832,595 | `1dba0aef58c58c9422eda4e52edcb49b3dcaeeab15ade98ae1061edd8d22b9cf` |
 | 0.11.0 | `openthree-0.11.0-py3-none-any.whl` | 378,037 | `ea1e23dd12d58d6f57ae645030bf34beb655226e1668e38087fbc5e50217a39e` |
 | 0.11.0 | `openthree-0.11.0.tar.gz` | 865,153 | `1aeac945161984005a87c87c6fb1ddd4b778ed50eaaee6a105352a40cb2a3b23` |
+| 0.11.1 | `openthree-0.11.1-py3-none-any.whl` | 379,901 | `ad3aa6331cd31e731fb1f00fb7b45b51cb15e93d7f5bebc7ae2df84bccc40735` |
+| 0.11.1 | `openthree-0.11.1.tar.gz` | 870,586 | `a08eb09576a367c162fdc6742be82268093d0a0feddbcd5a341f2e3e2a2cfd4e` |
 
 ### 0.11.0 实跑记录（2026-11-19）
 
@@ -880,6 +882,49 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 > `~/.opencodereview/config.json`。与 `twine` / `git` 一模一样，一条前缀解决三个：
 > `set "HOME=C:\Users\95875" && set "USERPROFILE=C:\Users\95875" && set "PATH=C:\Users\95875\AppData\Roaming\npm;%PATH%" && <命令>`。
 > **不要**往 systemprofile 里复制密钥或 `.pypirc` —— 那会凭空多出一份要维护的凭据。
+
+### 0.11.1 实跑记录（2026-11-20）
+
+本版内容：**钉钉换表情不再把消息上的表情清空** —— 频道状态从一枚表情换到另一枚时，
+顺序由「摘旧 → 挂新」改成「挂新 → 挂上了才摘旧」。
+
+- **根因是一条顺序**：旧顺序里摘成功、挂失败时，消息上一枚表情都不剩；而 `sent` 照记，
+  同一事件的刷新被 20 秒节流吃光，终态那次再被墓碑挡掉 —— 于是「表情凭空消失」且日志无声。
+- **失败补挂一次就够**：挂失败置 `lost`，下一次刷新无视节流重试一次（`RETRY_LIMIT = 1`），
+  用完回到 `STATUS_MIN_INTERVAL` 的正常节奏 —— 缺着会补，坏令牌也不会把唯一的后台线程
+  （取令牌 10s + 表情 8s）堵死。
+- **终态帧必须说话**：终态之后墓碑挡掉所有过程态、`_seen` 记录立刻 pop，此刻不说就再没人说。
+  现在「没挂上 / 一枚都没有 / 旧表情没摘掉」都写进 `WARNING` 并带 `msgId`。
+- **警告不再只喊一次**：`_emotion_warned` 由 bool 改成 `{msgId: 时间}`，同一条消息 300 秒一次，
+  换一条消息立刻再喊，表按 200 条淘汰最旧；「挂不上」与「摘不下」分开说。
+- **关掉的功能不该报丢**：`notify()` 不看 `status_reactions`，桥对每条消息都报终态 ——
+  新增 `DingTalkChannel.can_react()`（开关 + `robot_code` + `msgId` + `conversationId`）作闸门，
+  否则关掉表情时每收一条消息就喊一次「没挂上」。
+- **裁剪排在摘除之后**：`faces` 的 `FACE_MEMORY = 3` 裁剪若早于摘除循环，本轮本可摘掉的
+  旧表情会被提前出账，从此没人碰、终态 `stale` 也数不到 → 永久残留且无声。
+- 测试 851 → **859**：7 条新增（含一个记「服务端此刻这条消息上挂着哪些表情」的假接口 ——
+  判「现场还剩几枚」只能看它，请求序列看不出来）+ 1 条改为锁新顺序。
+
+验收（仓库根实跑）：
+
+- `pyproject.toml` / `openthree/__init__.py:__version__` / `import openthree` 三处均为 `0.11.1` ✓
+- 全量 pytest → **859 passed / 0 failed**（138.17s）✓
+- `python -m build` → wheel 379,901 B / sdist 870,586 B（先清空 `dist/` 与 `openthree.egg-info`）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist **115 项**，越界路径 0（无 `.openthree/`、`config.yaml`、`identity.json`、
+  `limits.json`、`memory.jsonl`）；与 `git ls-files`（110）比对未跟踪 0 项 ✓
+- 密钥形态粗扫（`sk-` / `AKIA` / `ghp_` 长串）→ **NONE** ✓
+- `twine upload --non-interactive --disable-progress-bar` 一次成功 →
+  <https://pypi.org/project/openthree/0.11.1/> ✓
+- **双向核验**：`/pypi/openthree/0.11.1/json` 两个文件的 `size` 与 `digests.sha256`
+  与本地 `dist/` **全串一致**，`yanked` 均为 `False` ✓
+- **索引侧晚一步**：上传完成后第一次查 `/pypi/openthree/json`，`info.version` 仍是 `0.11.0`；
+  轮询到第 2 次（约 20 秒后）变 `0.11.1`。版本文件页先就绪、`latest` 字段后追 ——
+  CDN 缓存延迟，不是发布失败（0.6.1 记过同一现象的另一面：包还没出现在索引里）。
+
+**升级提示**：本版只改钉钉状态表情的挂/摘顺序与失败处理，**无配置项变更、无 CLI 变更**。
+观感上的差别是：从前「表情凭空消失」的那些时刻，现在最坏只会**多留一枚旧状态**，
+下一次刷新即纠正。`status_reactions: false` 下的行为不变（依旧不碰表情、不报警）。
 
 
 
