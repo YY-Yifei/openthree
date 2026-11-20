@@ -854,6 +854,8 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.11.0 | `openthree-0.11.0.tar.gz` | 865,153 | `1aeac945161984005a87c87c6fb1ddd4b778ed50eaaee6a105352a40cb2a3b23` |
 | 0.11.1 | `openthree-0.11.1-py3-none-any.whl` | 379,901 | `ad3aa6331cd31e731fb1f00fb7b45b51cb15e93d7f5bebc7ae2df84bccc40735` |
 | 0.11.1 | `openthree-0.11.1.tar.gz` | 870,586 | `a08eb09576a367c162fdc6742be82268093d0a0feddbcd5a341f2e3e2a2cfd4e` |
+| 0.11.2 | `openthree-0.11.2-py3-none-any.whl` | 379,507 | `3f6d6c19d2b26fd14817db30676ff1f5580918ed3c2a0cd6fec649c44a124915` |
+| 0.11.2 | `openthree-0.11.2.tar.gz` | 872,038 | `b50d5b1665b34f1b2ce55ef99e8a1e2b0a2f375d5ce070862499e5dd7fb8dc43` |
 
 ### 0.11.0 实跑记录（2026-11-19）
 
@@ -925,6 +927,53 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 **升级提示**：本版只改钉钉状态表情的挂/摘顺序与失败处理，**无配置项变更、无 CLI 变更**。
 观感上的差别是：从前「表情凭空消失」的那些时刻，现在最坏只会**多留一枚旧状态**，
 下一次刷新即纠正。`status_reactions: false` 下的行为不变（依旧不碰表情、不报警）。
+
+### 0.11.2 实跑记录（2026-11-20）
+
+本版内容：**钉钉的文字回执整条路径删掉，状态只在用户那条消息的表情上显形**。
+不是配置项关闭，是代码里不再有这条路径 —— 装上的包 `DEFAULT_ACK_TEXT` /
+`_Status._ack` / `ack_text` 三者都不存在。排队位次没丢：`⏳排队中·前面还有 N 条`
+本来就走表情 detail。
+
+- 删：`DEFAULT_ACK_TEXT`、`self.ack_text`、`_Status._ack()`、`info["acked"]`、
+  `channels/config.py` 的 `ack_text` 字段（向导与 `channel add` 不再问这个键）。
+- 留：`send_text`（发**最终答复**）与 `ack_payload`（钉钉 Stream 协议「3 秒内必须回」
+  的协议层 ack，与聊天回执无关）。
+- 旧配置里的 `ack_text:` 不报错、也不静默：`unknown_options()` 会列出它、
+  `is_ready()` 仍为 `True`，`channel show` 打一行「未知选项（会原样保留，但渠道不读它）」。
+  没有造兼容层。
+- 测试相应收紧（删除要留反面证据）：`received` 那条先等表情发出、再空转 50ms，
+  然后断言 `calls["text"] == []`；`running→done` 从 `1` 改成 `[]`；`survives_api_failure`
+  的「线程已停下」信号改看 `_emotion_warned`（文本调用已不存在）。
+
+验收（仓库根实跑）：
+
+- `pyproject.toml` / `openthree/__init__.py:__version__` / `import openthree` 三处均为 `0.11.2` ✓
+- 全量 pytest → **859 passed / 0 failed**（143.86s）✓
+- `python -m build` → wheel 379,507 B / sdist 872,038 B（先清空 `dist/` 与
+  `openthree.egg-info`；sdist 比 0.11.1 反而大 1,452 B —— 代码是删的，长出来的是
+  本文档里 0.11.1 那段记录）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist **115 项**，越界路径 0（无 `.openthree/`、`config.yaml`、`identity.json`、
+  `limits.json`、`memory.jsonl`）；与 `git ls-files`（110）比对未跟踪 0 项 ✓
+- 密钥形态粗扫（`sk-` / `AKIA` / `ghp_` 长串）→ **NONE** ✓
+- `twine upload --non-interactive --disable-progress-bar` 一次成功 →
+  <https://pypi.org/project/openthree/0.11.2/> ✓
+- **双向核验**：`/pypi/openthree/0.11.2/json` 两个文件的 `size` 与 `digests.sha256`
+  与本地 `dist/` **全串一致**，`yanked` 均为 `False` ✓
+- **索引侧仍晚一步**：用**版本页**核（`/pypi/openthree/0.11.2/json` 立刻正确），
+  `/pypi/openthree/json` 的 `info.version` 第 1 次仍 `0.11.1`、第 2 次（约 10 秒后）
+  变 `0.11.2` —— 与 0.11.1 记的是同一现象，别据此重传 ✓
+- **干净 venv**（`_live/venv0112`）从 `https://pypi.org/simple/` 实装 `0.11.2`，
+  在仓库之外的**中性 cwd** 探针：`__version__=0.11.2`、`__file__` 指向 site-packages、
+  `dingtalk` 里没有 `DEFAULT_ACK_TEXT` / `_Status._ack` / `ack_text` 字样、
+  配置字段为 `client_id, client_secret, require_mention, robot_code, status_reactions,
+  allow_from`（无 `ack_text`）、残留 `ack_text` 只进 `unknown_options()` 且
+  `is_ready()` 为 `True`、`can_react` / `_draw` 均在 ✓
+
+**升级提示**：这是用户可见行为的删除（钉钉不再回「已接收，正在处理…」），无 CLI 变更、
+无新增配置项。`status_reactions: false` 现在是**干净的全关**：一枚表情都不挂、也不发
+任何文字，只发最终答复。
 
 
 
