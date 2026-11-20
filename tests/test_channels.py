@@ -965,7 +965,11 @@ def test_dingtalk_ack_text_and_received_emoji(monkeypatch):
 
 
 def test_dingtalk_status_moves_from_running_to_done(monkeypatch):
-    """换状态 = 先摘旧表情再挂新的；回执只发一次。"""
+    """换状态 = **先挂新的、挂上了才摘旧的**；回执只发一次。
+
+    顺序不能反：先摘后挂时「摘成功、挂失败」会让消息上一枚表情都不剩，而先挂后摘
+    最坏只是短暂并存（甚至不并存 —— 同一位置本来就会被新表情替换）。
+    """
     ch, calls = _fake_dingtalk(monkeypatch)
     msg = _dt_msg()
     try:
@@ -978,10 +982,10 @@ def test_dingtalk_status_moves_from_running_to_done(monkeypatch):
 
     actions = [c["action"] for c in calls["emotion"]]
     names = [c["name"] for c in calls["emotion"]]
-    assert actions == ["reply", "recall", "reply"]
+    assert actions == ["reply", "reply", "recall"]
     assert names[0].startswith("🤔调用 run_shell")
-    assert names[1] == names[0]                          # 摘的正是刚才那枚
-    assert names[2] == "✅完成·用时 42s"
+    assert names[2] == names[0]                          # 摘的正是刚才那枚
+    assert names[1] == "✅完成·用时 42s"                 # 新的先挂上，旧的才摘
     assert len(calls["text"]) == 1                       # 终态不补发回执
 
 
@@ -1005,6 +1009,220 @@ def test_dingtalk_status_survives_api_failure(monkeypatch):
 
     assert calls["emotion"] == []
     assert calls["text"] == ["已接收，正在处理…"]
+
+
+def _stateful_dingtalk(monkeypatch, **options):
+    """同 `_fake_dingtalk`，但假接口**记着服务端那条消息上现在挂着哪几枚表情**。
+
+    判「摘成功、挂失败之后现场还剩几枚」只能看服务端的记账 —— 请求序列看不出
+    「摘之前到底挂上了没有」。`fail` 里放动作名（`reply` / `recall`）就让那种请求
+    失败，和真接口一样**失败即不生效**。
+    """
+    state = {"served": {}, "calls": [], "fail": set(), "text": []}
+
+    def fake_post_json(url, payload=None, **kwargs):
+        if url.endswith("/oauth2/accessToken"):
+            return {"accessToken": "tk", "expireIn": 7200}
+        action = url.rsplit("/", 1)[-1]
+        name = (payload or {}).get("emotionName")
+        msg_id = (payload or {}).get("openMsgId")
+        state["calls"].append((action, name))
+        if action in state["fail"]:
+            raise dt.HttpError("表情接口 500")
+        faces = state["served"].setdefault(msg_id, [])
+        if action == "reply":
+            if name not in faces:
+                faces.append(name)
+        elif name in faces:
+            faces.remove(name)
+        return {}
+
+    def fake_post_status(url, payload=None, **kwargs):
+        state["text"].append(((payload or {}).get("text") or {}).get("content"))
+        return 200, "{}"
+
+    monkeypatch.setattr(dt, "post_json", fake_post_json)
+    monkeypatch.setattr(dt, "post_json_status", fake_post_status)
+    opts = {"client_id": "cid", "client_secret": "sec"}
+    opts.update(options)
+    return DingTalkChannel("ding", opts), state
+
+
+def test_dingtalk_attach_failure_keeps_the_old_face(monkeypatch):
+    """换表情的顺序必须是**先挂新的、挂上了才摘旧的**。
+
+    反过来（先摘后挂）时「摘成功、挂失败」会让那条消息上一枚表情都不剩：摘是真
+    发生过的，而没挂上的那枚没有任何记账指向「该补挂」—— 用户看到的就是状态凭空
+    消失，之后连终态也不出现。核的是**服务端现场**（`served`），不是请求序列。
+    """
+    ch, st = _stateful_dingtalk(monkeypatch)
+    msg = _dt_msg()
+    try:
+        ch.notify(msg, "accepted")
+        assert _wait_for(lambda: st["served"].get("m-1") == ["👀已接收"])
+        st["fail"] = {"reply"}
+        ch.notify(msg, "running", "调用 run_shell")
+        assert _wait_for(lambda: len(st["calls"]) == 2)      # 新表情的请求确实发了
+        time.sleep(0.05)
+        assert st["served"]["m-1"] == ["👀已接收"]            # 旧的那枚还在
+        assert not [c for c in st["calls"] if c[0] == "recall"]
+    finally:
+        ch.status_reactions = False      # 别让后台线程在打桩撤掉后拿假 id 去发真请求
+        ch.stop()
+
+
+def test_dingtalk_failed_face_is_retried_but_not_in_a_hot_loop(monkeypatch):
+    """没挂上的表情要尽早补挂（同一件事的刷新也放行），但放行有上限。
+
+    没有补挂时：摘（或挂）失败一次之后，节流闸门会把这个 20 秒窗口里的每次心跳
+    都吃掉 —— 状态就一直缺着。没有上限时：一个坏令牌会把这条唯一的后台线程
+    （令牌 10s + 表情 8s）堵死，所有消息的亮灯都排在它后面。
+    """
+    ch, st = _stateful_dingtalk(monkeypatch)
+    msg = _dt_msg()
+    try:
+        st["fail"] = {"reply"}
+        ch.notify(msg, "running", "调用 run_shell")
+        assert _wait_for(lambda: len(st["calls"]) == 1)
+        # 同一事件再刷（正常会被 STATUS_MIN_INTERVAL 挡住）：必须放行这一次补挂
+        ch.notify(msg, "running", "调用 run_shell")
+        assert _wait_for(lambda: len(st["calls"]) == 2)
+        # 补挂已经用过：第三次回到正常节流，不再追加请求
+        ch.notify(msg, "running", "调用 run_shell")
+        time.sleep(0.2)
+        assert len(st["calls"]) == 2
+        # 网络恢复，「换了细节」的刷新（本来就不受节流）把表情补上
+        st["fail"] = set()
+        ch.notify(msg, "running", "调用 pytest")
+        assert _wait_for(lambda: any(f.startswith("🤔调用 pytest")
+                                     for f in st["served"].get("m-1", [])))
+    finally:
+        ch.status_reactions = False
+        ch.stop()
+
+
+def test_dingtalk_terminal_face_failure_says_so(monkeypatch):
+    """终态表情没挂上是**最静默**的一种：那条记录马上要 pop，此刻不说就没人再说。"""
+    ch, st = _stateful_dingtalk(monkeypatch)
+    warns = []
+    monkeypatch.setattr(ch.log, "warning", lambda *a, **kw: warns.append(a[0] % a[1:]))
+    msg = _dt_msg()
+    try:
+        ch.notify(msg, "accepted")
+        assert _wait_for(lambda: st["served"].get("m-1") == ["👀已接收"])
+        st["fail"] = {"reply"}
+        ch.notify(msg, "done", "用时 42s")
+        assert _wait_for(lambda: any("收尾" in w for w in warns))
+    finally:
+        ch.status_reactions = False
+        ch.stop()
+
+    text = "；".join(warns)
+    assert "终态表情「✅完成·用时 42s」没挂上" in text
+    assert "👀已接收" in text                 # 旧的那枚也没摘掉，一并说清
+
+
+def test_dingtalk_blank_message_is_named_when_nothing_was_ever_attached(monkeypatch):
+    """一枚都没挂上时，日志要明说「消息上现在一枚状态表情都没有」。"""
+    ch, st = _stateful_dingtalk(monkeypatch)
+    warns = []
+    monkeypatch.setattr(ch.log, "warning", lambda *a, **kw: warns.append(a[0] % a[1:]))
+    st["fail"] = {"reply"}
+    msg = _dt_msg()
+    try:
+        ch.notify(msg, "accepted")
+        assert _wait_for(lambda: st["calls"])
+        ch.notify(msg, "done", "用时 3s")
+        assert _wait_for(lambda: any("一枚状态表情都没有" in w for w in warns))
+    finally:
+        ch.status_reactions = False
+        ch.stop()
+
+
+def test_dingtalk_trim_waits_for_the_recall_attempt(monkeypatch):
+    """`FACE_MEMORY` 的裁剪必须在摘除循环**之后**。
+
+    「挂一直成功、摘一直失败」攒到超过上限时先裁一刀，本轮本来能摘掉的旧表情就被
+    提前从记账里丢掉：它留在消息上，终态的 `stale` 也数不到它 —— 日志里一个字都没有。
+    """
+    ch, _ = _stateful_dingtalk(monkeypatch)
+    calls = []
+
+    def fake_send(msg, name, recall=False):
+        calls.append((name, recall))
+        return True
+
+    monkeypatch.setattr(ch, "send_emotion", fake_send)
+    info = {"at": time.time(), "faces": ["A", "B", "C"], "state": "", "detail": "",
+            "sent": 0.0, "acked": True, "lost": False, "retry": 0}
+    ch._status._draw(_dt_msg(), info, "D", "running", "x", time.time())
+
+    assert calls[0] == ("D", False)                                  # 先挂新的
+    assert [c for c in calls if c[1]] == [("A", True), ("B", True), ("C", True)]
+    assert info["faces"] == ["D"]                                    # 摘掉的都出账
+
+
+def test_dingtalk_terminal_state_does_not_warn_when_reactions_are_off(monkeypatch):
+    """关掉表情时「没挂上」不是失败 —— 一个关掉的功能不会「丢」状态。
+
+    `notify()` 不看 `status_reactions`（桥对每条消息都会报终态），所以终态那几句
+    真话必须由「这条消息在原理上能不能挂表情」（`can_react`）把关：否则关掉表情
+    之后**每条消息收尾都会喊一句假话**，正好教人忽略这条警告。
+    """
+    ch, st = _stateful_dingtalk(monkeypatch, status_reactions="false", ack_text="")
+    warns = []
+    monkeypatch.setattr(ch.log, "warning", lambda *a, **kw: warns.append(a[0] % a[1:]))
+    msg = _dt_msg()
+    try:
+        ch.notify(msg, "accepted")
+        ch.notify(msg, "done", "用时 3s")
+        assert _wait_for(lambda: "m-1" in ch._status._finished)
+    finally:
+        ch.status_reactions = False
+        ch.stop()
+
+    assert st["calls"] == [] and st["text"] == []     # 一个请求都没发
+    assert warns == []                               # 也没有假话
+
+
+def test_dingtalk_message_without_ids_keeps_quiet(monkeypatch):
+    """没有 msgId / conversationId 的消息压根挂不了表情：不该每收一条就报「没挂上」。"""
+    ch, st = _stateful_dingtalk(monkeypatch)
+    warns = []
+    monkeypatch.setattr(ch.log, "warning", lambda *a, **kw: warns.append(a[0] % a[1:]))
+    msg = _dt_msg("", "")
+    try:
+        ch.notify(msg, "running", "调用 run_shell")
+        ch.notify(msg, "done", "用时 2s")
+        assert _wait_for(lambda: ch._status._finished)
+    finally:
+        ch.status_reactions = False
+        ch.stop()
+
+    assert st["calls"] == []
+    assert warns == []
+
+
+def test_dingtalk_emotion_warning_is_throttled_per_message(monkeypatch):
+    """失败要说真话，但同一条消息 5 分钟一次；**换一条消息要再喊一次**。
+
+    「整个进程只喊一次」正是这类丢失长期没被当成问题的原因：第一次失败之后的
+    每一种丢失都不留痕迹。
+    """
+    ch, _ = _stateful_dingtalk(monkeypatch)
+    warns = []
+    monkeypatch.setattr(ch.log, "warning", lambda *a, **kw: warns.append(a[0] % a[1:]))
+
+    def boom(*args, **kwargs):
+        raise dt.HttpError("500")
+
+    monkeypatch.setattr(dt, "post_json", boom)
+    assert ch.send_emotion(_dt_msg("m-1"), "👀已接收") is False
+    assert ch.send_emotion(_dt_msg("m-1"), "👀已接收") is False
+    assert len(warns) == 1                       # 同一条消息不刷屏
+    assert "m-1" in warns[0] and "挂不上" in warns[0]
+    assert ch.send_emotion(_dt_msg("m-2"), "👀已接收") is False
+    assert len(warns) == 2 and "m-2" in warns[1]  # 换一条消息，要再喊一次
 
 
 def test_dingtalk_status_can_be_turned_off(monkeypatch):

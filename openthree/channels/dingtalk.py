@@ -23,8 +23,14 @@
 
 表情走开放平台 `POST /v1.0/robot/emotion/reply|recall`（`emotionType=2` 的文字表情
 能带一小段自定义文字，所以「在处理什么」写得下），令牌走 `/v1.0/oauth2/accessToken`。
-两者都是**尽力而为**：应用没开机器人权限、令牌拿不到、网络抖动 —— 只记一次警告，
-回执与答复照常，一个字节都不受影响。
+两者都是**尽力而为**：应用没开机器人权限、令牌拿不到、网络抖动 —— 按消息节流地记
+一句警告（同一条消息 `EMOTION_WARN_INTERVAL` 秒内只喊一次），回执与答复照常，
+一个字节都不受影响。
+
+换表情的顺序是**先挂新的、挂成功了才摘旧的**。反过来（先摘后挂）时「摘成功、挂
+失败」会让那条消息上一枚表情都不剩：删是真发生过的，而没挂上的那枚没有任何记录
+指向「该补挂」—— 用户看到状态凭空消失，之后就什么都不再出现。先挂后摘的最坏结果
+是**残留一枚旧状态**：看得见，而且下一次刷新就会纠正它。
 """
 from __future__ import annotations
 
@@ -58,6 +64,14 @@ DEFAULT_ACK_TEXT = "已接收，正在处理…"
 
 # 同一个状态「纯刷新」的最小间隔（秒）：长任务里耗时在走，但没必要每秒刷一次。
 STATUS_MIN_INTERVAL = 20.0
+
+# 同一条消息的表情失败最多多久喊一次（秒）。第一次必定喊；之后的失败要等这么久
+# 才有下一条 —— 「整个进程只喊一次」会让后到的每一种丢失都静默（这类「表情凭空
+# 消失」长期没被当成问题是它最直接的原因），而每次都喊则会用一个坏令牌刷满日志。
+EMOTION_WARN_INTERVAL = 300.0
+
+# 上面那张「按消息节流」的表最多记多少条（超过按时间淘汰最旧的）：防无界增长。
+EMOTION_WARN_LIMIT = 200
 
 # 状态 → 表情前缀 / 一句话。键集合就是 `Channel.notify()` 允许的全部状态。
 STATUS_FACE = {
@@ -204,7 +218,8 @@ class DingTalkChannel(Channel):
         self._token = ""
         self._token_exp = 0.0
         self._token_lock = threading.Lock()
-        self._emotion_warned = False
+        self._emotion_warned: Dict[str, float] = {}
+        self._emotion_lock = threading.Lock()
         self._status = _Status(self)
 
     # --- 连接 ---------------------------------------------------------
@@ -414,7 +429,9 @@ class DingTalkChannel(Channel):
         """给 `msg` 那条消息挂 / 摘一枚文字表情；成功 True，失败 False（从不抛）。
 
         「不抛」是这里的关键：表情只是旁证，应用没开机器人权限、令牌过期、
-        网络抖动都不该让一条消息跑不通。第一次失败记一条警告，之后不再刷日志。
+        网络抖动都不该让一条消息跑不通。失败**要说真话**，但同一条消息
+        `EMOTION_WARN_INTERVAL` 秒内只喊一次（`_warn_emotion`）—— 一个坏令牌不该
+        刷满日志，可「整个进程只喊一次」又会让后来的每一种丢失都静默。
         """
         if not self.status_reactions:
             return False
@@ -441,10 +458,41 @@ class DingTalkChannel(Channel):
                       timeout=8.0)
             return True
         except Exception as exc:  # noqa: BLE001 - 表情失败只是看不见状态
-            if not self._emotion_warned:
-                self._emotion_warned = True
-                self.log.warning("表情状态发不出去（之后不再重复这条警告）：%s", exc)
+            self._warn_emotion(msg_id, exc, recall=recall)
             return False
+
+    def can_react(self, msg: InboundMessage) -> bool:
+        """这条消息**在原理上**能不能挂表情（开关打开、机器人码与两个 id 齐）。
+
+        与 `send_emotion` 的返回值别混：那里的 False 既可能是「试了但失败」，也可能是
+        「压根没试」（关掉了、缺 id）。「没挂上」这句真话只在真试过时才有意义 ——
+        一个关掉的功能不会「丢」状态，把「没开」报成「丢了」只会教人忽略这条警告。
+        """
+        return bool(self.status_reactions and self.robot_code
+                    and str(msg.msg_id or "") and str(msg.conversation_id or ""))
+
+    def _warn_emotion(self, msg_id: str, exc: BaseException, *, recall: bool = False) -> None:
+        """记一条**带消息 id** 的真话：同一条消息 `EMOTION_WARN_INTERVAL` 秒内一次。
+
+        为什么要带上 `msgId`：一句不带现场的通告无法回答「哪条消息丢状态了、
+        丢的是挂还是摘」。为什么要按消息节流：令牌坏掉时每条消息都会失败，
+        全局不节流会把日志刷满；而「整个进程只喊一次」则让第一次之后的每一种
+        丢失都静默 —— 那正是「表情凭空消失」长期没被当成问题的原因。
+        """
+        now = time.time()
+        key = msg_id or "-"
+        with self._emotion_lock:
+            last = self._emotion_warned.get(key)
+            if last is not None and now - last < EMOTION_WARN_INTERVAL:
+                return
+            self._emotion_warned[key] = now
+            excess = len(self._emotion_warned) - EMOTION_WARN_LIMIT
+            if excess > 0:
+                for old, _ in sorted(self._emotion_warned.items(),
+                                     key=lambda kv: kv[1])[:excess]:
+                    self._emotion_warned.pop(old, None)
+        self.log.warning("表情%s没发出去（消息 %s，同一条消息 %.0f 秒内不再重复）：%s",
+                         "摘不下" if recall else "挂不上", key, EMOTION_WARN_INTERVAL, exc)
 
     # --- 内部 ---------------------------------------------------------
     def _notice(self, text: str) -> None:
@@ -485,6 +533,11 @@ class _Status:
     #: 每条消息最多记「还没确认摘掉」的几枚表情。正常情况下一两枚就够；
     #: 这个上限防的是「摘一直失败而挂一直成功」时列表无界增长。
     FACE_MEMORY = 3
+
+    #: 一枚表情没挂上之后，最多**立即**补挂几次（不看节流）。超过就回到
+    #: `STATUS_MIN_INTERVAL` 的正常节奏 —— 令牌 10s + 表情 8s 的超时会把这条唯一
+    #: 的后台线程堵住，而所有消息的亮灯都排在它后面。
+    RETRY_LIMIT = 1
 
     def __init__(self, channel: "DingTalkChannel") -> None:
         self.channel = channel
@@ -540,50 +593,82 @@ class _Status:
         info = self._seen.get(key)
         if info is None:
             info = {"at": now, "faces": [], "state": "", "detail": "", "sent": 0.0,
-                    "acked": False}
+                    "acked": False, "lost": False, "retry": 0}
             self._seen[key] = info
         if not info["acked"]:
             info["acked"] = True
             self._ack(msg, state, detail)
-        face = _face(state, detail, now - info["at"])
-        if face and face not in info["faces"]:
+        face = _face(state, detail, now - info["at"]) if self.channel.can_react(msg) else ""
+        if face:
             # **只有「同一件事的纯刷新」（耗时在走）才节流**；换了细节就立刻发 ——
             # 否则第一步的「调用 run_shell」会被「处理中 0s」压住二十秒，
-            # 而那正是这次要治的症状。
+            # 而那正是这次要治的症状。上一枚没挂上时也放行：一条消息上一枚表情都
+            # 没有是**看不见**的错，趁早补挂；放行次数由 `RETRY_LIMIT` 封顶。
             same_event = (state, detail) == (info["state"], info["detail"])
-            if not same_event or now - info["sent"] >= STATUS_MIN_INTERVAL:
-                # 先摘掉还挂着的，再挂新的。**摘失败的那枚留在列表里**：下一次刷新
-                # 会再摘一次 —— 否则它就一直留在消息上，谁也不记得去碰它。
-                # 列表只留最近几枚（`FACE_MEMORY`）：万一「摘」一直失败而「挂」
-                # 一直成功，不至于每刷新一次就多攒一枚、每次都去试一遍 8 秒。
-                for old in list(info["faces"]):
-                    if self.channel.send_emotion(msg, old, recall=True):
-                        info["faces"].remove(old)
-                if self.channel.send_emotion(msg, face):
-                    info["faces"].append(face)
-                    del info["faces"][:-self.FACE_MEMORY]
-                # 记账**与这次成败无关**：失败也推进 `state` / `detail` / `sent`。
-                # 否则 `state` 永远停在 ""，节流闸门永远不生效 —— 此后每个进度事件
-                # 都会再打一轮令牌 + 表情请求，把这条唯一的后台线程（令牌超时 10s）
-                # 堵住，还可能撞上钉钉的限流。
-                info.update(state=state, detail=detail, sent=now)
+            retry = bool(info["lost"]) and info["retry"] <= self.RETRY_LIMIT
+            if not same_event or retry or now - info["sent"] >= STATUS_MIN_INTERVAL:
+                self._draw(msg, info, face, state, detail, now)
         if state in _TERMINAL_STATES:
+            # 两件事都值得说真话，而且**此刻不说就再没机会**：墓碑会挡住之后所有
+            # 过程态 `put`，`_seen` 这条记录下面就要 pop，没有任何后续刷新能纠正。
+            #   * 没挂上 —— 用户看到的最后一枚不是终态（甚至一枚都没有）；
+            #   * 没摘掉 —— 旧表情与 ✅ 并排，看起来像「完成了却还在跑」。
+            missing = bool(face) and face not in info["faces"]
             # 只算**旧**表情：刚挂上的那一枚终态表情（✅ / ☹️）本来就该留在消息上，
-            # 把它也算成「没摘掉」，这条警告就会在每一次正常收工时报一次反话 ——
-            # 真出问题的时候，没人会再信它。
+            # 把它也算成「没摘掉」，这条警告就会在每一次正常收工时报一次反话。
             stale = [f for f in info["faces"] if f != face]
-            if stale:
-                # 上面那一轮摘除没成，而**终态帧之后就没有下一次了**（墓碑会挡住
-                # 所有过程态 `put`）：这条记录一 pop，这几枚旧表情就永久留在用户
-                # 那条消息上，与 ✅ 并排 —— 恰好是「完成了却还像在跑」。
-                # 为它保留 `_seen` 条目换来的是无界增长（没有谁再来清理），
-                # 所以认下这个可见残留，但**留一句真话**在日志里。
+            if missing or stale:
+                bits = []
+                if missing:
+                    bits.append(f"终态表情「{face}」没挂上")
+                    if not info["faces"]:
+                        bits.append("消息上现在一枚状态表情都没有")
+                if stale:
+                    bits.append("旧表情没摘掉、会留在消息上：" + "、".join(stale))
                 self.channel.log.warning(
-                    "状态表情没摘掉，会留在消息 %s 上：%s",
-                    key, "、".join(stale))
+                    "状态没能在消息 %s 上收尾：%s（这条消息之后不再刷新）",
+                    key, "；".join(bits))
             self._seen.pop(key, None)
             self._finished[key] = now            # 墓碑：挡住晚到的心跳
             self._prune_finished()
+
+    def _draw(self, msg: InboundMessage, info: Dict[str, Any], face: str,
+              state: str, detail: str, now: float) -> None:
+        """把 `face` 画到消息上：**先挂新的，挂上了才摘旧的**。
+
+        这个顺序是这里唯一不能反的东西。反过来（先摘后挂）时，「摘成功、挂失败」
+        会让消息上一枚表情都不剩：摘是真发生过的（`info["faces"]` 也跟着删了），
+        而没挂上的那枚没有任何记账指向「该补挂」—— 用户看到状态凭空消失，
+        之后连终态也不出现，日志里也只有第一条失败（`_warn_emotion` 按消息节流）。
+        先挂后摘的最坏结果是残留一枚旧表情：看得见，下一次刷新就会纠正。
+        """
+        attached = face in info["faces"]
+        if not attached:
+            attached = self.channel.send_emotion(msg, face)
+            if attached:
+                info["faces"].append(face)
+                info["lost"] = False
+                info["retry"] = 0
+            else:
+                # 没挂上：表情列表原样留着（它们确实还在消息上），并记下「该补挂」。
+                info["lost"] = True
+                info["retry"] += 1
+        if attached:
+            for old in [f for f in info["faces"] if f != face]:
+                # **摘失败的那枚留在列表里**：下一次刷新会再摘一次 —— 否则它就一直
+                # 留在消息上，谁也不记得去碰它。
+                if self.channel.send_emotion(msg, old, recall=True):
+                    info["faces"].remove(old)
+            # 列表只留最近几枚（`FACE_MEMORY`）：万一「摘」一直失败而「挂」一直成功，
+            # 不至于每刷新一次就多攒一枚、每次都去试一遍 8 秒。
+            # **裁剪必须在摘除循环之后**：先裁会把本轮本来能摘掉的旧表情提前丢掉，
+            # 从此再没有一次刷新去碰它，终态的 `stale` 也数不到它 —— 它就永久留在
+            # 消息上，日志里一个字都没有。
+            del info["faces"][:-self.FACE_MEMORY]
+        # 记账**与这次成败无关**：失败也推进 `state` / `detail` / `sent`。
+        # 否则 `state` 永远停在 ""，节流闸门永远不生效 —— 此后每个进度事件都会
+        # 再打一轮令牌 + 表情请求。补挂由 `lost` / `retry` 单独负责，且有上限。
+        info.update(state=state, detail=detail, sent=now)
 
     def _prune_finished(self) -> None:
         """墓碑只用来挡「晚到的心跳」，留最近的若干条就够（按时间淘汰最旧的）。"""
