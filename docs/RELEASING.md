@@ -856,6 +856,8 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 | 0.11.1 | `openthree-0.11.1.tar.gz` | 870,586 | `a08eb09576a367c162fdc6742be82268093d0a0feddbcd5a341f2e3e2a2cfd4e` |
 | 0.11.2 | `openthree-0.11.2-py3-none-any.whl` | 379,507 | `3f6d6c19d2b26fd14817db30676ff1f5580918ed3c2a0cd6fec649c44a124915` |
 | 0.11.2 | `openthree-0.11.2.tar.gz` | 872,038 | `b50d5b1665b34f1b2ce55ef99e8a1e2b0a2f375d5ce070862499e5dd7fb8dc43` |
+| 0.12.0 | `openthree-0.12.0-py3-none-any.whl` | 400,151 | `27ced927e1b5633c392516ba5c950ee574b76a2efc912f3daccd7e2e0746f0f3` |
+| 0.12.0 | `openthree-0.12.0.tar.gz` | 902,718 | `d4694d41c16979ab58174a8f9e3dc1acbba2312bef0c17239668a2b24b8282b8` |
 
 ### 0.11.0 实跑记录（2026-11-19）
 
@@ -974,6 +976,71 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 **升级提示**：这是用户可见行为的删除（钉钉不再回「已接收，正在处理…」），无 CLI 变更、
 无新增配置项。`status_reactions: false` 现在是**干净的全关**：一枚表情都不挂、也不发
 任何文字，只发最终答复。
+
+### 0.12.0 实跑记录（2026-11-21）
+
+微信频道**收发图片双向**：出站 `attach_file` → `image_item` / `file_item`；入站
+`image_item` 下载 + AES 解密 → `.openthree/assets/` → `InboundMessage.images` →
+`Runtime.run(images=…)` 进模型的多模态 content。新增能力，按 minor 发。
+
+两个渠道的闸门各抽成**一份**（判据：两处各写一份，迟早有一处漏掉，而漏掉的那次
+看起来完全正常）：
+
+- `_outbound.py`：根白名单 / 密钥黑名单 / 体积 / 名字消毒（A2A 净删 143 行重复判定）。
+  微信侧单文件 **10 MiB**、A2A 仍 20 MiB —— 不是抄错，是同步发送里纯 Python 加密的代价。
+- `_inbound.py`：`assets_dir` / `usage` / `save_within_budget` / 条数 / 预算。一条最多
+  8 张、单张上限读 `OPENTHREE_MAX_IMAGE_BYTES`、`assets/` 到 512 MiB 后只拒新图。
+- 落盘锁按**目录**（`_lock_for()`，键是 resolve 后的路径）而不是按频道实例：两个频道
+  写的是同一个 `.openthree/assets/`，各持一把锁等于没锁。
+
+`ocr review`（10 文件 / 9 条）逐条对源码核过，9 条全部成立并已修：
+
+- **解密比加密慢 63 倍**：`_inv_mix_columns` 每列 16 次 `_mul`，实测 **34.85 s/MiB**
+  （加密 0.55），一张 10 MiB 的入站图会把长轮询线程按住六分钟。改成 4 张乘法表
+  （×9/×11/×13/×14）后 **1.84 s/MiB**（19×），FIPS-197 / SP 800-38A 向量仍全绿。
+- **`image_item.url` 回退是 SSRF**：它来自入站消息（不可信），而 `urlopen()` 会跟随
+  重定向 —— 一条消息就能让进程去 GET 内网 / 云 metadata。整条回退删掉，只认
+  `media.encrypt_query_param`（协议给的唯一正路）。
+- `_http` 的读写期断连（`ConnectionResetError` / `IncompleteRead`）原先冒成裸异常，
+  与「失败一律抛 `HttpError`」的模块承诺不符 ⇒ `request_json` / `post_bytes` /
+  `get_bytes` 各补一条兜底；收图那边再把 `except` 放宽到 `Exception`（承诺是
+  「一切失败都变成一句说明」，拦不住就等于把整条消息连同文字丢掉）。
+- `read_exact()` 把「读不出来」与「大小变了」折叠成同一个 `None`，两个渠道因此给出
+  不同措辞 ⇒ 改成返回 `(字节, 原因)`。
+- 删掉调不到的 `_assets_usage()`，以及 A2A 里两个「看着像别名、其实是导入时快照」的
+  常量（`MAX_IMAGES_PER_MESSAGE` / `ASSETS_BUDGET_BYTES`）：两处直接用 `_inbound.X`，
+  改一个地方就同时改到两个频道；a2a 的测试相应改成 patch `_inbound`。
+- 说明句不再套两层括号（`（1 张图片未接收（…））`），A2A 与微信都改。
+
+验收（仓库根实跑）：
+
+- 三处版本号均为 `0.12.0` ✓
+- 全量 pytest → **911 passed / 0 failed**（119.57s）；新增 `test_channels_wechat_inbound.py`
+  （协议形状 / 下载失败 / 解密失败 / 不泄漏凭证 / url 不下载 / 条数 / 单张上限 / 预算 /
+  run 接线）✓
+- `python -m build` → wheel 400,151 B / sdist 902,718 B（先清空 `dist/` 与
+  `openthree.egg-info`）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist **121 项**，越界路径 0；与 `git ls-files`（116）比对未跟踪 0 项；密钥形态 **NONE** ✓
+- `twine upload --non-interactive --disable-progress-bar` 一次成功 →
+  <https://pypi.org/project/openthree/0.12.0/> ✓
+- **双向核验**：`/pypi/openthree/0.12.0/json` 两个文件的 `size` 与 `digests.sha256`
+  与本地 `dist/` **全串一致**，`yanked` 均为 `False` ✓
+- **干净 venv**（`_live/venv0120`）从 `https://pypi.org/simple/` 实装 `0.12.0`，在仓库
+  之外的**中性 cwd**（`D:\projects`）跑 21 项探针全 PASS：`__file__` 指向 site-packages、
+  `_inbound` 常量与目录锁、`extract_images` / `_download_url` / `_decrypt_key` /
+  `_fetch_image` / `_inbound_images` / `_absorb_images` 均在、有 URL 无凭证时
+  `_download_url()` 回空串（SSRF 回退确实没了）、AES 往返在安装版上闭合、`allow_images`
+  在配置项里 ✓
+
+> 一处**发布后**才补的测试：`test_a_url_without_credential_is_never_downloaded` 是在
+> 上传之后写的 —— 探针里那条 SSRF 断言本是拿 docstring 做字符串匹配，写反了（文档里
+> 正解释「为什么不回退到 `image_item.url`」），改成行为断言后才发现仓库里缺这条回归
+> 守卫。所以 0.12.0 的 sdist 比该提交早一个测试文件；下一个版本自然追平。
+
+**升级提示**：无 CLI 变更；新增配置项 `allow_images`（默认 `true`，与 A2A 同名同义，
+`false` = 一张也不下载）。入站图片落 `.openthree/assets/`，那目录**只增不减**
+（模型改任务时会重读图片文件），到 512 MiB 后新图被拒、旧图不动，腾空间要手动清理。
 
 
 
