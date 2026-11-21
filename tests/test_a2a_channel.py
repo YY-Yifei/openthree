@@ -1945,7 +1945,7 @@ def test_a_message_with_too_many_images_keeps_only_the_cap(tmp_path):
 
     判据：被拒的那几张连 `assets/` 都不该留痕（否则「只收 N 张」只是一句文案）。
     """
-    from openthree.channels.a2a import MAX_IMAGES_PER_MESSAGE
+    from openthree.channels._inbound import MAX_IMAGES_PER_MESSAGE
 
     ch, seen = _img_channel(tmp_path)
     parts = [{"kind": "text", "text": "一堆图"}]
@@ -2010,7 +2010,7 @@ def test_the_assets_budget_stops_a_disk_fill(tmp_path, monkeypatch):
     判据：预算在**落盘之前**判；拒掉的那张一个字节都不写。
     """
     png = _png(4)
-    monkeypatch.setattr(a2a_mod, "ASSETS_BUDGET_BYTES", len(png) + 1)    # 只够放一张
+    monkeypatch.setattr(a2a_mod._inbound, "ASSETS_BUDGET_BYTES", len(png) + 1)    # 只够放一张
     ch, seen = _img_channel(tmp_path)
     _call(ch, "message/send", {"message": _file_msg([
         {"kind": "text", "text": "第一张"},
@@ -2040,7 +2040,7 @@ def test_a_deduped_image_is_not_charged_against_the_budget(tmp_path, monkeypatch
     ])})
     assert len(seen[-1].images) == 1
     used = sum(p.stat().st_size for p in _assets(tmp_path))
-    monkeypatch.setattr(a2a_mod, "ASSETS_BUDGET_BYTES", used)     # 正好用满
+    monkeypatch.setattr(a2a_mod._inbound, "ASSETS_BUDGET_BYTES", used)     # 正好用满
     _call(ch, "message/send", {"message": _file_msg([
         {"kind": "text", "text": "同一张再来一次"},
         {"kind": "file", "file": {"bytes": _b64(png)}},
@@ -2057,7 +2057,7 @@ def test_leftover_temp_files_do_not_eat_the_budget(tmp_path, monkeypatch):
     assets = tmp_path / ".openthree" / "assets"
     assets.mkdir(parents=True)
     (assets / "deadbeef.png.tmp-1234abcd").write_bytes(b"x" * 4096)
-    monkeypatch.setattr(a2a_mod, "ASSETS_BUDGET_BYTES", 120)      # 比碎片本身还小
+    monkeypatch.setattr(a2a_mod._inbound, "ASSETS_BUDGET_BYTES", 120)      # 比碎片本身还小
     ch, seen = _img_channel(tmp_path)
     _call(ch, "message/send", {"message": _file_msg([
         {"kind": "text", "text": "看图"},
@@ -2389,12 +2389,12 @@ def test_a_push_snapshot_carries_the_file_parts(tmp_path):
     assert any(p["kind"] == "file" for p in view["artifacts"][0]["parts"])
 
 
-def test_attach_file_is_registered_only_inside_an_a2a_process():
+def test_attach_file_is_registered_only_when_a_file_capable_channel_may_start():
     from openthree.builtins import installed_builtins
 
     assert "attach_file" not in installed_builtins()
-    assert "attach_file" in installed_builtins(a2a=True)
-    assert "finish" in installed_builtins(a2a=True)      # 常驻集不受影响
+    assert "attach_file" in installed_builtins(attach=True)
+    assert "finish" in installed_builtins(attach=True)      # 常驻集不受影响
 
 
 def test_the_a2a_gate_has_four_distinct_states(monkeypatch):
@@ -2426,23 +2426,38 @@ def test_the_a2a_gate_has_four_distinct_states(monkeypatch):
     assert cli_mod._a2a_flag(_Args(upgrade=True, interactive=True)) is False
 
 
-def test_declares_a2a_reads_channels_yaml(tmp_path):
+def test_declares_files_reads_channels_yaml(tmp_path):
+    """`attach_file` 的注册判据：声明了一个启用的、能把文件送回去的频道。
+
+    a2a 与 wechat 都算承载者；钉钉不算（它的回复只有文本）。至于「发不发得出去」，
+    那是各频道 `outbound_roots` 的判据 —— 工具调用时会老实说。
+    """
     from openthree.channels.config import ChannelConfig, ChannelsConfig
-    from openthree.channels.manager import declares_a2a
+    from openthree.channels.manager import declares_files
 
     class _WS:
         dir = tmp_path / ".openthree"
 
     ws = _WS()
     ws.dir.mkdir(parents=True, exist_ok=True)
-    assert declares_a2a(ws) is False                    # 没有配置 = 不声明
+    assert declares_files(ws) is False                   # 没有配置 = 不声明
     cfg = ChannelsConfig(path=ws.dir / "channels.yaml", channels=[])
     cfg.add(ChannelConfig(name="a2a", type="a2a", enabled=False))
     cfg.save()
-    assert declares_a2a(ws) is False                    # disabled 不算
+    assert declares_files(ws) is False                   # disabled 不算
     cfg.get("a2a").enabled = True
     cfg.save()
-    assert declares_a2a(ws) is True
+    assert declares_files(ws) is True
+
+    cfg.add(ChannelConfig(name="wx", type="wechat", enabled=True))
+    cfg.get("a2a").enabled = False
+    cfg.save()
+    assert declares_files(ws) is True                    # 微信也是承载者
+
+    cfg.remove("wx")
+    cfg.add(ChannelConfig(name="dd", type="dingtalk", enabled=True))
+    cfg.save()
+    assert declares_files(ws) is False                   # 钉钉不能出站文件
 
 
 def test_channel_credentials_are_never_sent(tmp_path):

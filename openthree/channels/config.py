@@ -78,6 +78,20 @@ _SPECS: Dict[str, ChannelSpec] = {
                   hint="token / 最近会话游标的落盘位置（默认 .openthree/channels/<名字>.json）"),
             Field("allow_from", "allow_from",
                   hint="允许的发送者 id，逗号分隔；留空 = 不限制"),
+            Field("allow_images", "allow_images", default="true",
+                  hint="收不收对方发来的图片（true/false，默认收）。收 = 图片从 CDN "
+                       "下载、AES 解密后落 .openthree/assets/ 并进模型的 content；"
+                       "关 = 一张也不下载，只在正文里说一句「本频道关掉了 allow_images」。"
+                       "单张上限由 OPENTHREE_MAX_IMAGE_BYTES 定（默认 10 MiB），"
+                       "一条消息最多收 8 张（_inbound.MAX_IMAGES_PER_MESSAGE）；"
+                       "assets/ 总量到 512 MiB 后只拒新图，腾空间要手动清理"),
+            Field("outbound_roots", "outbound_roots", default=".",
+                  hint="能发给对方的文件根目录（逗号分隔，默认 \".\" = 工作区；"
+                       "写 [] = 关掉出站文件，attach_file 调用时会回「这次答复发不出文件」）。"
+                       "路径先 resolve 再判是否在根内，符号链接逃逸拦得住；`.openthree/` 里的"
+                       "配置与密钥一律不发。智能体用 attach_file 把文件挂到答复上，"
+                       "图片按 magic bytes 认、其余当文件发；单文件 10 MiB（纯 Python 加密的"
+                       "代价，20 MiB 会卡住整条回复），一条最多 4 个、合计不超过 24 MiB"),
         ),
     ),
     "dingtalk": ChannelSpec(

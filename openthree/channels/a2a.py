@@ -45,7 +45,6 @@ import errno
 import json
 import os
 import queue
-import re
 import socketserver
 import sys
 import threading
@@ -62,8 +61,12 @@ from urllib.parse import urlsplit, urlunsplit
 from .. import __version__
 from .. import cancel
 from ..attach import MAX_OUTBOUND_FILES
-from ..multimodal import (ImageError, TMP_MARK, asset_dest, guess_mime, max_image_bytes,
-                          save_image_bytes, sniff_mime)
+from ..multimodal import guess_mime, max_image_bytes, sniff_mime
+from . import _inbound, _outbound
+from ._outbound import (DEFAULT_ROOTS as DEFAULT_OUTBOUND_ROOTS,
+                        MAX_FILE_BYTES as MAX_OUTBOUND_FILE_BYTES,
+                        MAX_TOTAL_BYTES as MAX_OUTBOUND_TOTAL_BYTES,
+                        MIME_FALLBACK as OUTBOUND_MIME_FALLBACK)
 from .base import Channel, InboundMessage
 
 # --- 默认值（默认值只住在这一处；`config._SPECS` 的 Field 只写 hint） --------
@@ -103,50 +106,25 @@ MAX_BODY_BYTES = 8 << 20        # 8 MiB：入站请求的硬闸（一张常见�
                                 # 的原图就到顶了，所以把 `OPENTHREE_MAX_IMAGE_BYTES` 调到
                                 # 6 MiB 以上不会多收任何图 —— 要收更大的图得改这个常量。
 SOCKET_TIMEOUT = 15.0           # 单连接读写超时（别让一个哑连接占着线程）
-# 一条消息最多收几张图。8 MiB 请求体里塞得下几万张「合法」小图（每张只需几十字节的
-# 真 magic bytes），而每张都会永久落 `assets/` 并进模型的 content —— 不设上限就是
-# 一条无需鉴权的请求放大成几百 MB 磁盘 + 一个几千 image part 的模型请求。
-MAX_IMAGES_PER_MESSAGE = 8
-# `assets/` 的总字节预算。这个目录只增不减（模型改任务时会重读图片文件，删旧文件
-# 等于抽掉 history 脚下的真源），而收图是个**无鉴权**入口：不设上限，任何能连上端口
-# 的人每次请求都能稳定塞进 ~8 MiB（内容改一个字节就绕开 sha1 去重）。CLI `--image`
-# 不查它 —— 那写的是本地可信用户自己的文件。
-ASSETS_BUDGET_BYTES = 512 << 20
+# 一条消息最多收几张图 / `assets/` 的总字节预算 —— 判定与数值都住在 `_inbound.py`
+# （微信也收图，两处各写一份「收几张、目录满没满」迟早有一处漏掉，而漏掉的那一次
+# 看起来完全正常，只是磁盘被慢慢填满）。这里**不留副本**：用到的两处直接写
+# `_inbound.X`，于是只改那一个地方就同时改到两个频道。
 TASK_LIMIT = 200                # 任务表最多留最近多少条（只在内存）
 REGISTER_INTERVAL = 60.0        # 心跳间隔
 REGISTER_BACKOFF = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0)
 TERMINAL_STATES = ("completed", "failed", "canceled")
 
 # --- 出站文件（把本地文件随答复发回给对方）---------------------------------
-# 单文件 20 MiB：base64 后 ≈26.7 MB，JSON 化后一个响应体 27 MB 上下。它会被复制
-# 三次（`_public()` 深拷贝、blocking 响应体、回调 POST），所以这是「够用」的上限，
-# 不是「随便用」的上限。体积账见 docs/a2a-outbound-files-plan.md §5。
-MAX_OUTBOUND_FILE_BYTES = 20 << 20
-# 一条消息最多附几个：`MAX_OUTBOUND_FILES` 从 `attach.py` 导入（工具要用它决定
-# 「还收不收」；两处各写一个 4，回执与行为迟早发散）。
-MAX_OUTBOUND_TOTAL_BYTES = 24 << 20     # 一条消息合计：一个 20 MiB 大文件 + 零头
+# 判定与数值都住在 `_outbound.py`（微信也能把文件发出去，两处各写一份「哪些文件
+# 不许发」，迟早有一处漏掉一条黑名单 —— 而漏掉的那次看起来完全正常，文件发出去
+# 了，只是它恰好是 `config.yaml`）。这里只 Import 别名。
+# 条数上限仍从 `attach.py` 拿（`MAX_OUTBOUND_FILES`）：工具要用它决定「还收不收」，
+# 两处各写一个 4，回执与行为迟早发散。
 # 任务表里**文件字节**的总预算：`TASK_LIMIT` 只管条数，对 20 MiB 的文件毫无约束
 # （200 条 × 27 MB base64 是 GB 级常驻内存）。超了就把最旧 task 的 file part 换成
 # 文本占位 —— 降级写在协议里，不是静默丢。
 MAX_TASK_FILE_BYTES = 256 << 20
-# 默认根 = 工作区（`outbound_roots: []` 是唯一关法）。默认监听 127.0.0.1；
-# 跨机是人的显式决定 —— 从那一刻起，任何连得上这个端口的人都能让你把根内的
-# 文件发出去（`--a2a-host` 的 help 与 config 的 hint 都写了这句）。
-DEFAULT_OUTBOUND_ROOTS = "."
-OUTBOUND_MIME_FALLBACK = "application/octet-stream"
-# 密钥黑名单。按**路径组件**判，不按子串：`report-api_key-summary.pdf` 不该被误杀，
-# 而 `.openthree/config.yaml` 无论根放宽到哪儿都该被拦。
-OUTBOUND_DENY_NAMES = frozenset({
-    "api_key", "api_key.txt", "id_rsa", "id_ed25519",
-})
-# `.env` / `.env.local` / `.env.production`：按前缀判，不枚举。
-OUTBOUND_DENY_NAME_PREFIXES = (".env",)
-# 工作区状态目录 `.openthree/` 下**唯一**允许外发的子树：收来的图（对方要看的往往
-# 就是它）。其余一律不发 —— 这是**反向白名单**而不是枚举：枚举会漏，最现实的例子是
-# 升级模式把被覆盖的旧文件 `copy2` 到 `.openthree/upgrade/<ts>/files/config.yaml`，
-# 那是 `config.yaml` 的副本、同样带着 llm.api_key，却不在任何一张枚举表里。反向规则
-# 让「新增的状态文件」默认是**不可外发**的，而不是悄悄可外发。
-OUTBOUND_ALLOW_PATH = ".openthree/assets"
 
 # --- 回调（push notifications）的参数 --------------------------------------
 # 单次 POST 的超时得罩得住一份 27 MB 的 Task：千兆 0.3 s、百兆 2.3 s、公网
@@ -786,14 +764,7 @@ def _clean_outbound_name(name: str, fallback: str = "download.bin") -> str:
     能伪造日志行。留一个纯文件名就够。
     """
     base = Path(str(name or "")).name or fallback
-    cleaned = "".join(c for c in base if c.isprintable() and c not in '\\/:*?"<>|')
-    cleaned = cleaned.strip().strip(".")
-    if cleaned:
-        return cleaned[:128]
-    # 回落值也要消毒：它通常是真实文件名，而 POSIX 的文件名可以只由一个换行或一个
-    # 反斜杠组成 —— 那正是这个函数要挡的东西。
-    alt = "".join(c for c in str(fallback or "") if c.isprintable() and c not in '\\/:*?"<>|')
-    return (alt.strip().strip(".") or "download.bin")[:128]
+    return _outbound.clean_name(base, fallback)
 
 
 def _task_file_bytes(task: Dict[str, Any]) -> int:
@@ -1089,10 +1060,6 @@ class A2aChannel(Channel):
         # 回调投递：一条 FIFO 工作线程 + 一个无界队列。线程**按需启动**（第一次有
         # 任务登记了回调地址时才起），因为 handle_rpc 在没有 run() 的测试里也会被调。
         self._push_lock = threading.Lock()
-        # 收图预算的「查用量 + 写盘」必须互斥：`ThreadingHTTPServer` 每条连接一个线程，
-        # 两边分开就是 check-then-act —— N 个并发请求读到同一个用量、全部通过检查、
-        # 再各写几 MB，唯一那条上限就被绕过去了。
-        self._assets_lock = threading.Lock()
         self._pusher: Optional[threading.Thread] = None
         self._push_stopped = False
         self._push_q: "queue.Queue[Any]" = queue.Queue()
@@ -1208,33 +1175,16 @@ class A2aChannel(Channel):
         两种写法都认；切完为空 = 关掉出站文件（`[]` 是唯一关法）。
         """
         raw = str(self.option("outbound_roots", DEFAULT_OUTBOUND_ROOTS) or "")
-        items = [x.strip() for x in re.split(r"[,;\[\]'\"]+", raw) if x.strip()]
-        if not items:
-            return []
-        base = self.workspace_root()
-        roots: List[Path] = []
-        for item in items:
-            # `expanduser()` 也在 try 里：`~nosuchuser` 抛 RuntimeError，漏掉它就会
-            # 从 `card()` 与 `send_text()` 里冒出去 —— 一条写错的配置不该让整条答复
-            # 变成 working 卡死。
-            try:
-                p = Path(item).expanduser()
-                if not p.is_absolute():
-                    p = base / p
-                roots.append(p.resolve())
-            except (OSError, RuntimeError, ValueError):
-                continue        # 单条路径解析不了不该让整个频道起不来
-        return roots
+        return _outbound.parse_roots(raw, self.workspace_root())
 
     def workspace_root(self) -> Path:
         """项目根（`.openthree` 的父目录）—— `outbound_roots` 与黑名单的相对路径基准。
 
-        **必须 resolve**：`_denied_outbound()` 拿它跟一个已经 resolve 过的绝对路径
+        **必须 resolve**：`_outbound.denied_reason()` 拿它跟一个已经 resolve 过的绝对路径
         比 `relative_to()`；基准是相对路径时那个调用抛 ValueError，整个 `.openthree`
         黑名单就被静默跳过 —— 一条安全闸的失效，不该取决于工作区是怎么传进来的。
         """
-        root = Path(self.workspace_dir) if self.workspace_dir else Path(".openthree")
-        return (root.parent if root.name == ".openthree" else root).resolve()
+        return _outbound.project_root(self.workspace_dir)
 
     @property
     def supports_files(self) -> bool:
@@ -1595,71 +1545,23 @@ class A2aChannel(Channel):
 
     # --- 入站图片 -----------------------------------------------------
     def assets_dir(self) -> Path:
-        """落盘目录：`.openthree/assets/` —— 与 CLI `--image` 同一个目录、同一条
-        命名规则（`save_image_bytes`）。同一张图因此只落一次盘：
-        `Workspace.stage_images()` 看到同名同内容时直接跳过。
-        """
-        root = Path(self.workspace_dir) if self.workspace_dir else Path(".openthree")
-        return root / "assets"
+        """落盘目录：`.openthree/assets/` —— 与微信、CLI `--image` 同一个目录。
 
-    def _assets_usage(self) -> int:
-        """`assets/` 现在占了多少字节（目录不存在 / 读不动都算 0）。
-
-        每次收图现扫一遍：收图是低频操作（一条消息最多 8 张），而缓存会与 CLI
-        `--image` 的写入不同步 —— 一个对不上的数字比一个慢一点的数字更糟。
+        目录怎么推导与 A2A 无关，所以它在 `_inbound.assets_dir()`（同一件事只写
+        一处）。名字相同意味着 `Workspace.stage_images()` 看到同名同内容时直接跳过。
         """
-        root = self.assets_dir()
-        if not root.exists():
-            return 0
-        try:
-            entries = list(root.iterdir())
-        except OSError:
-            # 目录在 exists() 与 iterdir() 之间被删、或没有读权限：如实当 0。
-            # 这里不是给运维报警的地方 —— 抛出去会把一条本来能跑的文本消息变成 -32603。
-            return 0
-        total = 0
-        for path in entries:
-            try:
-                # 跳过原子写的碎片（`<digest>.<ext>.tmp-xxxx`）：它只在写盘中途存在，
-                # 崩溃留下的残留不该永久吃掉对端的上传预算 —— 那是碎片，不是一张图。
-                if path.is_file() and TMP_MARK not in path.name:
-                    total += path.stat().st_size
-            except OSError:
-                pass
-        return total
+        return _inbound.assets_dir(self.workspace_dir)
 
     def _save_within_budget(self, data: bytes) -> Tuple[str, str]:
-        """在锁里检查预算并落盘，返回 `(路径, 未接收的原因)`。
+        """在锁里检查预算并落盘 —— 判据、锁与措辞都在 `_inbound.save_within_budget()`。
 
-        两件事必须闭在一起：**预算检查是 check-then-act**（读用量 → 写盘），
-        而收图跑在每条连接自己的线程上 —— 拆开的话 N 个并发请求读到同一个用量、
-        全部通过检查、再各写几 MB，唯一那条上限就被绕过去了。
-
-        去重命中的内容不该再占一次预算：`asset_dest()` 只算名字不写盘，命名规则与
-        `save_image_bytes` 是同一条（同一张图在目录里只有一个文件）。
+        预算用共享模块那个（**调用这一刻**读）：上限只有一份，`_inbound` 是它的家。
         """
-        with self._assets_lock:
-            try:
-                dest = asset_dest(self.assets_dir(), data)
-            except ImageError as exc:
-                return "", f"1 张图片未接收（{exc}）"
-            if ASSETS_BUDGET_BYTES and not dest.exists():
-                used = self._assets_usage()
-                if used + len(data) > ASSETS_BUDGET_BYTES:
-                    return "", (f"1 张图片未接收（图片目录已用 {used} 字节，上限 "
-                                f"{ASSETS_BUDGET_BYTES}；要腾空间请手动清理 assets/）")
-            try:
-                return str(save_image_bytes(self.assets_dir(), data)), ""
-            except (ImageError, OSError) as exc:
-                # ImageError 覆盖「认不出 / 太大 / 写不进去」，OSError 是兜底：这个函数
-                # 承诺「不抛异常」，一条存不下来的图不该把整条消息变成 -32603。
-                #
-                # note 会进 `history_text` → `tasks/get` → 模型上下文，所以本机绝对路径
-                # （`图片写入失败 D:\…\assets: …`，常含用户名）不能跟着走：细节留日志，
-                # 对外只把目录换成 `<assets>` —— 与「历史里不存本地路径」同一条判据。
-                self.log.warning("a2a 图片落盘失败：%s", exc)
-                reason = str(exc).replace(str(self.assets_dir()), "<assets>")
-                return "", f"1 张图片未接收（{reason}）"
+        path, why = _inbound.save_within_budget(self.assets_dir(), data)
+        if not path:
+            # 原因会进正文（→ 模型上下文），所以它不带本机路径；细节留在日志里。
+            self.log.warning("a2a 图片落盘失败：%s", why)
+        return path, why
 
     def save_inbound_image(self, file: Dict[str, str]) -> Tuple[str, str]:
         """把一条入站 file part 存成本地图片，返回 `(路径, 未接收的原因)`。
@@ -1741,35 +1643,13 @@ class A2aChannel(Channel):
             if not raw:
                 notes.append("（1 个附件没有发送：路径是空的）")
                 continue
-            try:
-                path = Path(raw).expanduser().resolve(strict=True)
-            except (OSError, RuntimeError, ValueError):
-                # `ValueError` 也要捕：含 NUL 的路径 `os.stat` 抛的是 ValueError 而不是
-                # OSError。漏掉它，异常会从 `send_text` 冒出去 —— 而桥的兜底会拿同一条
-                # msg 重入 `send_text` 再炸一次，这个 task 就永远停在 working。
-                notes.append(f"（{shown} 没有发送：读不到这个路径）")
-                continue
-            if not path.is_file():
-                notes.append(f"（{shown} 没有发送：不是普通文件）")
-                continue
-            denied = self._denied_outbound(path)
-            if denied:
-                notes.append(f"（{shown} 没有发送：{denied}）")
-                continue
-            if not self._within_outbound_roots(path, roots):
-                notes.append(f"（{shown} 没有发送：不在允许发送的目录内）")
-                continue
-            try:
-                size = path.stat().st_size
-            except OSError:
-                notes.append(f"（{shown} 没有发送：读不到文件大小）")
-                continue
-            if size <= 0:
-                notes.append(f"（{shown} 没有发送：空文件）")
-                continue
-            if size > MAX_OUTBOUND_FILE_BYTES:
-                notes.append(f"（{shown} 没有发送：{size} 字节超过单文件上限 "
-                             f"{MAX_OUTBOUND_FILE_BYTES}）")
+            # 解析 + 三道闸（密钥黑名单 / 根白名单 / 单文件体积）只有一份实现，住在
+            # `_outbound.py`：微信走的是同一个 `screen()`，于是两处的拒绝理由**逐字
+            # 相同** —— 收件人看到的那句话，不该因为文件是从哪个渠道发出去的而不同。
+            path, size, reason = _outbound.screen(
+                raw, roots, self.workspace_root(), max_bytes=MAX_OUTBOUND_FILE_BYTES)
+            if path is None:
+                notes.append(f"（{shown} 没有发送：{reason}）")
                 continue
             if len(parts) >= MAX_OUTBOUND_FILES:
                 notes.append(f"（{shown} 没有发送：一条消息最多附 "
@@ -1779,17 +1659,11 @@ class A2aChannel(Channel):
                 notes.append(f"（{shown} 没有发送：附件合计超过 "
                              f"{MAX_OUTBOUND_TOTAL_BYTES} 字节）")
                 continue
-            try:
-                # 只读 `size + 1` 字节。多读的那 1 字节就是「它在 stat 之后变了」的
-                # 证据，同时保证一次分配不超过单文件上限：`read_bytes()` 会按文件
-                # **现在**的大小分配 —— stat 与读之间的间隙够别人把它换成 2 GB。
-                with path.open("rb") as handle:
-                    data = handle.read(size + 1)
-            except OSError:
-                notes.append(f"（{shown} 没有发送：读不出来）")
-                continue
-            if len(data) != size:
-                notes.append(f"（{shown} 没有发送：文件在发送时被改动）")
+            # 只读 `size + 1` 字节（`read_exact` 里的判据）：一次分配不超过单文件上限，
+            # 而多出来的那 1 字节就是「它在 stat 之后变了」的证据。
+            data, why = _outbound.read_exact(path, size)
+            if data is None:
+                notes.append(f"（{shown} 没有发送：{why}）")
                 continue
             parts.append({
                 "kind": "file",
@@ -1801,45 +1675,6 @@ class A2aChannel(Channel):
             })
             total += len(data)
         return parts, notes
-
-    def _within_outbound_roots(self, path: Path, roots: Sequence[Path]) -> bool:
-        for root in roots:
-            try:
-                if path == root or path.is_relative_to(root):
-                    return True
-            except (OSError, ValueError):
-                continue
-        return False
-
-    def _denied_outbound(self, path: Path) -> str:
-        """命中黑名单就返回原因（空串 = 放行）。
-
-        两条规则，管的是两件事：
-
-        * **文件名**：`.env*` / `api_key` / 私钥 —— 按名字判，不管它在哪一层。
-          按组件判、不按子串：`report-api_key-summary.pdf` 不该被误杀。
-        * **工作区状态目录**：`.openthree/` 下除 `assets/` 外一律不发（反向白名单）。
-          枚举会漏 —— 升级模式把旧文件复制到 `.openthree/upgrade/<ts>/files/…`，
-          那是同一份 `config.yaml` 的副本，同样带着 llm.api_key，却不在任何一张
-          枚举表里。反向规则让「新增的状态文件」默认**不可外发**。
-        """
-        name = path.name.lower()
-        if name in OUTBOUND_DENY_NAMES:
-            return "命中密钥黑名单"
-        for prefix in OUTBOUND_DENY_NAME_PREFIXES:
-            if name == prefix or name.startswith(prefix + "."):
-                return "命中密钥黑名单（.env 里通常是密钥）"
-        try:
-            rel = path.relative_to(self.workspace_root())
-        except ValueError:
-            return ""
-        rel_text = rel.as_posix().lower()
-        if rel_text == ".openthree" or rel_text.startswith(".openthree/"):
-            if (rel_text == OUTBOUND_ALLOW_PATH
-                    or rel_text.startswith(OUTBOUND_ALLOW_PATH + "/")):
-                return ""
-            return "命中密钥黑名单（工作区状态不发）"
-        return ""
 
     # --- JSON-RPC -----------------------------------------------------
     def handle_rpc(self, raw: bytes, *, caller: str = "") -> Tuple[int, Dict[str, Any]]:
@@ -1905,17 +1740,17 @@ class A2aChannel(Channel):
                 notes.append(f"（{len(files)} 张图片未处理：本频道关掉了 allow_images）")
             else:
                 # 条数上限在**落盘之前**：超出的既不写盘也不进 content，只留一句说明。
-                accepted = files[:MAX_IMAGES_PER_MESSAGE]
+                accepted = files[:_inbound.MAX_IMAGES_PER_MESSAGE]
                 for item in accepted:
                     path, why = self.save_inbound_image(item)
                     if path:
                         images.append(path)
                     else:
-                        notes.append(f"（{why}）")
+                        notes.append(why)      # why 已是完整一句，不再套一层括号
                 extra = len(files) - len(accepted)
                 if extra > 0:
                     notes.append(f"（另有 {extra} 张图片未收：一条消息最多收 "
-                                 f"{MAX_IMAGES_PER_MESSAGE} 张）")
+                                 f"{_inbound.MAX_IMAGES_PER_MESSAGE} 张）")
         if not text and not images:
             raise _RpcError(-32602, "".join(notes) or "消息里没有可接收的内容")
         if notes:

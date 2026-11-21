@@ -5,6 +5,9 @@
     `GET ilink/bot/get_qrcode_status?qrcode=…` 直到 `confirmed`，拿 `bot_token` 与 `baseurl`
   * 收消息：`POST ilink/bot/getupdates`（服务端最多挂 35 秒，`get_updates_buf` 当游标）
   * 发消息：`POST ilink/bot/sendmessage`（要带回消息里的 `context_token`）
+  * 发图片 / 文件：`POST ilink/bot/getuploadurl` 登记 → 把 **AES-128-ECB 加密后**的
+    字节 POST 到 CDN → 从响应头 `x-encrypted-param` 取回落点 → 再用 `sendmessage`
+    发一条 `image_item` / `file_item`（同一个 `context_token`）
 
 所以它**不需要公网地址**，只要能出网 —— 这也是选它而不是公众号回调的原因。
 
@@ -13,12 +16,27 @@
 两种形态都由 `_qr` 统一成模块矩阵；后者需要本地编码（`_qrencode`）。
 PNG 同时落在 `.openthree/channels/<频道名>-qrcode.png`，事后重扫 / 转发都用得上。
 
-纯标准库实现，不依赖任何第三方 SDK；token 与游标落在
-`.openthree/channels/<频道名>.json`，重启不重复扫码。
+附件走 `attach_file`（与 A2A 同一个工具、同一套闸门）：智能体把文件挂到本轮那条
+`InboundMessage.attachments` 上，这里在**发完正文之后**逐张上传并发出。图片按
+magic bytes 认，认出来才用 `image_item` —— 微信按 item type 渲染，把非图片字节
+塞进去，对方看到的就是一张破图；其余一律当文件发（视频也在其中）。
+
+收到的图片走**反方向**的同一条链：`image_item` 里没有可直接用的 URL，只有
+`media.encrypt_query_param`（下载凭证）与 `aeskey`（hex），内容是 **AES-128-ECB
+加密**的。于是「收图」= 下载 → 解密 → 按 magic bytes 认类型 → 落
+`.openthree/assets/`（与 CLI `--image` 同一个目录、同一条命名规则）→ 把路径挂到
+`InboundMessage.images`，由桥交给 `Runtime.run(images=…)` 进模型的多模态 content。
+任何一步失败都只影响那一张图：文字那部分照跑，原因以一句话拼进正文 —— 对发消息的
+人来说「图没收到」和「你没看懂」是同一件事，不说清他只会以为机器人坏了。
+
+纯标准库实现，不依赖任何第三方 SDK（AES-128-ECB 在 `_aes.py`，出站闸门与 A2A
+共用在 `_outbound.py`）；token 与游标落在 `.openthree/channels/<频道名>.json`，
+重启不重复扫码。
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import secrets
 import threading
@@ -26,11 +44,14 @@ import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
-from ._http import HttpError, get_json, post_json
+from ..attach import MAX_OUTBOUND_FILES
+from ..multimodal import max_image_bytes, sniff_mime
+from ._http import HttpError, get_bytes, get_json, post_bytes, post_json
 from .base import Channel, InboundMessage
-from . import _qr
+from . import _aes, _inbound, _outbound, _qr
 
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
 CHANNEL_VERSION = "2.0.1"
@@ -40,6 +61,37 @@ DEFAULT_TIMEOUT = 15.0
 MAX_SEEN = 2000                # 去重集合上限（够覆盖一次重连的重复投递）
 TEXT_DEDUP_TTL = 30.0          # 同一用户 + 同一文本 30 秒内只处理一次
 MAX_TEXT_CHUNK = 1500          # 单条回复的最大字符数，长回答分多条发
+
+# --- 出站媒体（图片 / 文件）----------------------------------------------
+# 媒体不走 iLink 的 JSON 接口本身：先在 `getuploadurl` 登记，再把**加密后**的字节
+# POST 到 CDN，最后用 CDN 回的落点信息发一条 `image_item` / `file_item` 消息。
+# CDN 是另一个域名（不是 `base_url`），所以单独列出来。
+CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c"
+# 传一个 20 MiB 的文件要时间：加密后体积还会涨（PKCS#7 最多补一块），百兆上行
+# 也要十几秒。15 秒的默认超时会让大图**必然**失败，然后被当成「发不出去」。
+UPLOAD_TIMEOUT = 120.0
+MEDIA_IMAGE = 1                # `getuploadurl` 的 media_type
+MEDIA_FILE = 3
+# 单文件上限**比 A2A 那个（20 MiB）更小**，理由是这里多一道同步开销：加密是纯 Python
+# 的（AES 走 T 表，实测 ≈0.5–1.5 秒/MiB），而它跑在桥那**唯一一条**工作线程上 ——
+# 20 MiB 会让所有人的答复一起卡住半分钟。10 MiB 实测 4–6 秒，是「发一张图」该有的
+# 量级。这不是协议上限，是同步发送的工程上限。
+MAX_MEDIA_BYTES = 10 << 20
+# 微信按 **item type** 渲染：图片走 `image_item`(2)，其余走 `file_item`(4)。
+# 视频 `video_item`(5) 刻意不发 —— 它要额外的封面/时长字段，猜错就是一张黑框；
+# 视频当文件发，对方照样能看，没有第二种坏法。
+
+# --- 入站图片 -------------------------------------------------------------
+# 图片在 CDN 上是**加密**的：`image_item.media.encrypt_query_param` 是下载凭证
+# （不是 URL，要拼进 `/c2c/download?encrypted_query_param=`），`image_item.aeskey`
+# 是 16 字节密钥的 hex 形式。所以「收一张图」必然是一次网络往返 + 一次解密。
+#
+# 这两条超时都跑在**长轮询那条线程**上（收图是同步做的），所以它们同时是「这张图
+# 什么时候放弃」和「下一条消息最多晚多久被发现」：单张 20 秒是「一张手机原图」的
+# 量级，一条消息合计 45 秒是这条线程愿意为图片付出的上限 —— 再长的等待会让对方的
+# 下一条消息排在服务端队列里，而那个代价比少一张图大得多。
+IMAGE_TIMEOUT = 20.0
+IMAGE_DEADLINE = 45.0
 
 _ITEM_PLACEHOLDER = {
     "image_item": "[图片]",
@@ -89,7 +141,9 @@ def make_headers(bot_token: str = "") -> Dict[str, str]:
 def extract_text(item_list: List[Dict[str, Any]]) -> str:
     """把 `item_list` 压成一段文本：文本项直取，媒体项给占位符。
 
-    只做「够用」的提取 —— 频道这边不解析图片内容；智能体要图片可以自己拿 URL。
+    只做「够用」的提取：图片 / 视频 / 文件在这里只留一个占位符，**图片的真实内容**
+    由 `_absorb_images()` 下载后挂到 `InboundMessage.images`（占位符仍留着 —— 读文本
+    的人才知道这条消息带过一张图）。
     语音项如果自带 ASR 文本（`voice_item.text_item.text`）就用它，比占位符有用得多。
     """
     parts: List[str] = []
@@ -141,6 +195,42 @@ def parse_inbound(msg: Dict[str, Any], *, channel: str = "") -> Optional[Inbound
         reply_token=str(msg.get("context_token") or ""),
         raw=msg,
     )
+
+
+def extract_images(item_list: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """挑出 `item_list` 里的图片项，给出「下载 + 解密」要用的那几个值。
+
+    按**字段存在性**判（有 `image_item` 就是图），不看 `type` 判别符 —— 与 A2A 收
+    part 同一条判据：判别符是对方的一句话，字段才是我真要用的东西；两者不一致时
+    以字段为准，判别符写错了图也还能收下来。
+
+    只返回**引用**不下载：`parse_inbound()` 保持纯函数（可单独测、不联网），下载那一步
+    在频道里做（`WeChatChannel._inbound_images()`）。
+
+    两个密钥字段都带着，怎么选在 `_decrypt_key()`：
+      * `image_item.aeskey`：16 字节密钥的 **hex**
+      * `media.aes_key`：**base64**，里面可能是 16 字节原始密钥，也可能是一串 hex
+    """
+    out: List[Dict[str, str]] = []
+    for item in (item_list if isinstance(item_list, list) else []):
+        if not isinstance(item, dict):
+            continue
+        image = _as_dict(item.get("image_item"))
+        if not image:
+            continue
+        media = _as_dict(image.get("media"))
+        out.append({
+            "encrypt_query_param": str(media.get("encrypt_query_param") or ""),
+            "aeskey_hex": str(image.get("aeskey") or ""),
+            "aes_key": str(media.get("aes_key") or ""),
+        })
+    return out
+
+
+def _append_notes(text: str, notes: List[str]) -> str:
+    """把几句说明拼到消息正文后面（空的那几段直接不占位，不留空行）。"""
+    parts = [str(text or "").strip()] + [str(n or "").strip() for n in notes]
+    return "\n\n".join(p for p in parts if p).strip()
 
 
 def split_text(text: str, limit: int = MAX_TEXT_CHUNK) -> List[str]:
@@ -361,6 +451,8 @@ class WeChatChannel(Channel):
                     if self._duplicate(inbound):
                         continue
                     self._remember_context_token(inbound)
+                    # 收图放在去重**之后**：重连重复投递的同一条消息不该再下一次 CDN。
+                    self._absorb_images(inbound, raw_msg)
                 except Exception as exc:  # noqa: BLE001 - 坏消息不该停掉频道
                     self.log.warning("跳过一条读不懂的消息：%s", exc)
                     continue
@@ -401,37 +493,359 @@ class WeChatChannel(Channel):
             tokens[inbound.user_id] = inbound.reply_token
             self._save_state()
 
-    # --- 发 -----------------------------------------------------------
-    def send_text(self, msg: InboundMessage, text: str) -> None:
-        body_text = str(text or "").strip()
-        if not body_text:
+    # --- 入站图片 -------------------------------------------------------
+    @property
+    def allow_images(self) -> bool:
+        """收不收对方发来的图片（`allow_images`，默认收）。关掉就一个请求也不发。"""
+        return self.option_bool("allow_images", True)
+
+    def assets_dir(self) -> Path:
+        """收来的图落在哪儿 —— 与 A2A、CLI `--image` 同一个目录（`.openthree/assets/`）。"""
+        return _inbound.assets_dir(self.workspace_dir)
+
+    @staticmethod
+    def _download_url(spec: Dict[str, str]) -> str:
+        """把一条图片引用变成能 GET 的地址（空串 = 这条没带下载凭证）。
+
+        **只认 `media.encrypt_query_param`**，绝不回退到 `image_item.url`：后者来自
+        入站消息（不可信输入），而 `urlopen()` 会跟随重定向 —— 一条消息就能让进程
+        去 GET 内网 / 云 metadata 地址。A2A 那边是同一条判据（「URI 不下载，要图请
+        用 base64」）；微信这边凭证是协议给的唯一正路。
+
+        参数名里那个 d 不能少（`encrypted_query_param`）：它是 CDN 的固定拼法，
+        少一个字母就是 404，而 404 在日志里看起来和「图片过期了」一模一样。
+        """
+        enc = spec.get("encrypt_query_param") or ""
+        if not enc:
+            return ""
+        return f"{CDN_BASE}/download?encrypted_query_param={quote(enc, safe='')}"
+
+    @staticmethod
+    def _decrypt_key(spec: Dict[str, str]) -> bytes:
+        """这张图的 AES-128 密钥（空 = 内容没加密，别去解）。
+
+        `image_item.aeskey` 是 hex；`media.aes_key` 是 base64，而 base64 解出来可能是
+        16 字节原始密钥，也可能是一串 32 字符的 hex（官方 SDK 两种都发过）。
+
+        认不出就返回空：**宁可按「认不出类型」拒掉，也不拿错密钥去解** —— 解错的
+        AES 不会报错，只会得到一团垃圾，然后它以「不是图片」的名义被拒，真正的原因
+        （密钥不对）从此查不出来。
+        """
+        hex_key = (spec.get("aeskey_hex") or "").strip()
+        if hex_key:
+            try:
+                key = bytes.fromhex(hex_key)
+            except ValueError:
+                key = b""
+            if len(key) == 16:
+                return key
+        raw_b64 = (spec.get("aes_key") or "").strip()
+        if not raw_b64:
+            return b""
+        try:
+            raw = base64.b64decode(raw_b64, validate=True)
+        except (ValueError, TypeError):
+            return b""
+        if len(raw) == 16:
+            return raw
+        if len(raw) == 32:
+            try:
+                return bytes.fromhex(raw.decode("ascii"))
+            except (ValueError, UnicodeDecodeError):
+                return b""
+        return b""
+
+    def _fetch_image(self, spec: Dict[str, str], timeout: float) -> Tuple[Optional[bytes], str]:
+        """下载并按需解密一张图，返回 `(字节, 未收到的原因)`；成功时原因为空串。
+
+        大小闸在下载时而不是下载后：`get_bytes(max_bytes=…)` 读到超限就停，不为一张
+        被拒的图先读进几 MB 内存。
+
+        失败原因里**不带 URL** —— 它含 `encrypt_query_param`（一份下载凭证），而这句
+        话会进正文 → 模型上下文 → 可能原样回给对方。详情留给日志。
+        """
+        url = self._download_url(spec)
+        if not url:
+            return None, "1 张图片未接收（消息里没有下载凭证）"
+        limit = max_image_bytes()
+        try:
+            data = get_bytes(url, timeout=timeout,
+                             max_bytes=limit if limit > 0 else MAX_MEDIA_BYTES)
+        except Exception as exc:       # noqa: BLE001 - 收图失败不该连文字一起丢
+            # 只捕 `HttpError` 不够：`get_bytes()` 已经在里面把读正文的断连包成了
+            # `HttpError`，但调用栈上还有别的可能（内存、平台相关的 SSL 库抛法）。
+            # 这里放出去一个异常，`run()` 的兜底会 `continue` —— 用户连问题本身都
+            # 收不到。承诺是「一切失败都变成一句说明」，就按承诺捕。
+            self.log.warning("微信收图失败：%s", exc)     # 详情（含凭证）只进日志
+            status = getattr(exc, "status", 0)
+            code = f"，HTTP {status}" if status else ""
+            return None, f"1 张图片未接收（下载失败{code}）"
+        key = self._decrypt_key(spec)
+        if len(key) == 16:
+            try:
+                data = _aes.decrypt(data, key)
+            except ValueError as exc:      # 密文不是整块 / 补位不合法
+                return None, f"1 张图片未接收（解密失败：{exc}）"
+        return data, ""
+
+    def _inbound_images(self, specs: List[Dict[str, str]]) -> Tuple[List[str], List[str]]:
+        """下载 / 解密 / 落盘，返回 `(本地路径表, 说明)`。
+
+        闸门按**代价从便宜到贵**排：关掉收图 → 条数 → 单张大小 → 目录预算。被拒的
+        每一张各留一句原因，那些原因会拼进正文发回去 —— 对方不知道少了什么，只会
+        以为机器人没看懂。
+
+        时间也有一条闸（`IMAGE_DEADLINE`）：这段代码跑在**长轮询那条线程**上，8 张图
+        × 20 秒能把下一条消息的发现推迟将近三分钟；超了就把剩下的如实记为没收到。
+        """
+        accepted = specs[:_inbound.MAX_IMAGES_PER_MESSAGE]
+        paths: List[str] = []
+        notes: List[str] = []
+        deadline = time.monotonic() + IMAGE_DEADLINE
+        for index, spec in enumerate(accepted):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                notes.append(f"（另有 {len(accepted) - index} 张图片未接收：下载超时）")
+                break
+            data, why = self._fetch_image(spec, min(IMAGE_TIMEOUT, left))
+            if data is None:
+                notes.append(why)      # why 本身就是一句完整的话（不再套一层括号）
+                continue
+            path, why = _inbound.save_within_budget(self.assets_dir(), data)
+            if path:
+                paths.append(path)
+            else:
+                self.log.warning("微信收图落盘失败：%s", why)
+                notes.append(why)
+        extra = len(specs) - len(accepted)
+        if extra > 0:
+            notes.append(f"（另有 {extra} 张图片未接收：一条消息最多收 "
+                         f"{_inbound.MAX_IMAGES_PER_MESSAGE} 张）")
+        return paths, notes
+
+    def _absorb_images(self, inbound: InboundMessage, raw: Dict[str, Any]) -> None:
+        """把这条消息里的图片收下来挂到 `inbound.images`，失败写进正文。
+
+        **不抛异常**：收图是轮询线程上的额外工作，一张图失败不该把文字一起丢掉 ——
+        而「为什么没收到这张图」必须说出来，静默少一张图与丢消息是同一种感受。
+        """
+        specs = extract_images(_as_dict(raw).get("item_list") or [])
+        if not specs:
             return
+        if not self.allow_images:
+            inbound.text = _append_notes(inbound.text, [
+                f"（{len(specs)} 张图片未处理：本频道关掉了 allow_images）"])
+            return
+        paths, notes = self._inbound_images(specs)
+        if paths:
+            inbound.images = paths
+            self.log.info("收到 %d 张图片（共 %d 张）", len(paths), len(specs))
+        if notes:
+            inbound.text = _append_notes(inbound.text, notes)
+
+    # --- 出站媒体（图片 / 文件） ---------------------------------------
+    def workspace_root(self) -> Path:
+        """项目根（`.openthree` 的父目录）—— `outbound_roots` 与黑名单的基准。"""
+        return _outbound.project_root(self.workspace_dir)
+
+    @property
+    def outbound_roots(self) -> List[Path]:
+        """能发给对方的文件根目录（`outbound_roots`，默认 `"."` = 工作区）。
+
+        `[]` 是**唯一**的关法：那时 `supports_files` 为假，桥不会把这个回合发布
+        给 `attach_file`，工具会老实说「这次答复发不出文件」—— 而不是记下来再丢掉。
+        """
+        raw = self.option("outbound_roots", _outbound.DEFAULT_ROOTS)
+        return _outbound.parse_roots(raw, self.workspace_root())
+
+    @property
+    def supports_files(self) -> bool:
+        """能不能把文件送回去 —— 与 `outbound_roots` 同步（A2A 用的是同一条判据）。"""
+        return bool(self.outbound_roots)
+
+    def _outbound_media(self, msg: InboundMessage) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """把本轮附件过一遍闸门，返回 `(要发的媒体, 说明)`。
+
+        **不抛异常**：被拒的每一个各留一句原因，拼进正文一起发回去 —— 对收件人来说
+        「少了一张图」和「发失败」是同一件事，不说清他只会以为二维码没生成。
+
+        闸门在 `_outbound.py`（与 A2A 共用一份：黑名单只该有一处）。这里只补两件
+        微信特有的事：**类型按 magic bytes 定**（见模块说明），以及计数与合计。
+        """
+        pending = [a for a in (getattr(msg, "attachments", None) or ())
+                   if isinstance(a, dict)]
+        roots = self.outbound_roots
+        if not roots:
+            return [], ([f"（{len(pending)} 个附件没有发送：本频道关掉了出站文件）"]
+                        if pending else [])
+        root = self.workspace_root()
+        media: List[Dict[str, Any]] = []
+        notes: List[str] = []
+        total = 0
+        for item in pending:
+            raw = str(item.get("path") or "").strip()
+            shown = _outbound.clean_name(str(item.get("name") or ""),
+                                         Path(raw).name or "附件")
+            path, size, reason = _outbound.screen(raw, roots, root,
+                                                  max_bytes=MAX_MEDIA_BYTES)
+            if path is None:
+                notes.append(f"（{shown} 没有发送：{reason}）")
+                continue
+            if len(media) >= MAX_OUTBOUND_FILES:
+                notes.append(f"（{shown} 没有发送：一条答复最多发 "
+                             f"{MAX_OUTBOUND_FILES} 个文件）")
+                continue
+            if total + size > _outbound.MAX_TOTAL_BYTES:
+                notes.append(f"（{shown} 没有发送：附件合计超过 "
+                             f"{_outbound.MAX_TOTAL_BYTES} 字节）")
+                continue
+            data, why = _outbound.read_exact(path, size)
+            if data is None:
+                notes.append(f"（{shown} 没有发送：{why}）")
+                continue
+            # `sniff_mime()` 对认不出的内容返回 None（不是空串）：先兜成空串再判，
+            # 否则一个普通文本附件就会让整条答复在发送前抛异常。
+            kind = "image" if (sniff_mime(data) or "").startswith("image/") else "file"
+            media.append({"kind": kind, "name": shown, "data": data})
+            total += size
+        return media, notes
+
+    def _upload_media(self, data: bytes, media_type: int, user_id: str) -> Dict[str, Any]:
+        """把一份文件加密后传到微信 CDN，返回拼 `image_item` / `file_item` 要用的值。
+
+        协议（与 qwenpaw 的 wechat client 一致）：先 `getuploadurl` 登记
+        filekey / md5 / 原始大小 / 加密后大小 / AES 密钥，再把 **AES-128-ECB 加密后**
+        的字节 POST 到 CDN。「文件落在哪」由 CDN 用响应头 `x-encrypted-param` 告知，
+        正文可能是空的 —— 所以这条路要用 `post_bytes()` 而不是 `post_json()`。
+
+        **aes_key 有三种编码，三种都得写对**：调 API 用 hex（32 字符）；拼进消息用
+        `base64(hex)`；而真正拿去加密的是那 16 个原始字节。少写对一个，对面解不开，
+        而本地一切看起来都正常（长度对、不抛异常、图片是一块灰色）。
+        """
+        if not data:
+            raise RuntimeError("空文件不上传")
+        key_raw = secrets.token_bytes(16)
+        key_hex = key_raw.hex()
+        filekey = secrets.token_hex(16)
+        encrypted = _aes.encrypt(data, key_raw)
+        resp = self._post("ilink/bot/getuploadurl", {
+            "filekey": filekey,
+            "media_type": media_type,
+            "to_user_id": user_id,
+            "rawsize": len(data),
+            "rawfilemd5": hashlib.md5(data).hexdigest(),
+            "filesize": len(encrypted),
+            "aeskey": key_hex,
+            "no_need_thumb": True,
+            "base_info": {"channel_version": CHANNEL_VERSION},
+        })
+        url = str(resp.get("upload_full_url") or "").strip()
+        if not url:
+            param = str(resp.get("upload_param") or "").strip()
+            if not param:
+                raise RuntimeError(f"getuploadurl 没给上传地址（ret={_as_int(resp.get('ret'))}）")
+            url = (f"{CDN_BASE}/upload?encrypted_query_param={quote(param, safe='')}"
+                   f"&filekey={filekey}")
+        # 上传**不带** bot_token：授权信息已经在那串加密参数里，多带一个头会被 CDN 拒。
+        _status, headers, _body = post_bytes(
+            url, encrypted, headers={"Content-Type": "application/octet-stream"},
+            timeout=UPLOAD_TIMEOUT)
+        enc_param = str(headers.get("x-encrypted-param") or "").strip()
+        if not enc_param:
+            raise RuntimeError("CDN 没回 x-encrypted-param（那样发出去对方看到的是一片空白）")
+        return {
+            "encrypt_query_param": enc_param,
+            "aes_key": base64.b64encode(key_hex.encode()).decode(),
+            "size": len(encrypted),
+        }
+
+    def _send_media(self, user_id: str, context_token: str, item: Dict[str, Any]) -> bool:
+        """上传并发出一个附件；失败只记日志并返回 False（正文已经送到了）。"""
+        media_type = MEDIA_IMAGE if item["kind"] == "image" else MEDIA_FILE
+        try:
+            up = self._upload_media(item["data"], media_type, user_id)
+        except (HttpError, RuntimeError, OSError) as exc:
+            self.log.warning("附件上传失败（%s）：%s", item["name"], exc)
+            return False
+        media = {"encrypt_query_param": up["encrypt_query_param"],
+                 "aes_key": up["aes_key"],
+                 "encrypt_type": 1}
+        if item["kind"] == "image":
+            payload = {"type": 2, "image_item": {"media": media, "mid_size": up["size"]}}
+        else:
+            payload = {"type": 4, "file_item": {"media": media,
+                                                "file_name": item["name"],
+                                                "len": str(up["size"])}}
+        try:
+            resp = self._post("ilink/bot/sendmessage", {
+                "msg": {
+                    "from_user_id": "",
+                    "to_user_id": user_id,
+                    "client_id": str(uuid.uuid4()),
+                    "message_type": 2,       # 2 = BOT
+                    "message_state": 2,      # 2 = FINISH
+                    "context_token": context_token,
+                    "item_list": [payload],
+                },
+                "base_info": {"channel_version": CHANNEL_VERSION},
+            })
+        except HttpError as exc:
+            self.log.warning("附件发送失败（%s）：%s", item["name"], exc)
+            return False
+        if _as_int(resp.get("ret")) != 0:
+            self.log.warning("附件发送返回 ret=%s errmsg=%s",
+                             resp.get("ret"), resp.get("errmsg") or resp.get("err_msg"))
+            return False
+        return True
+
+    # --- 发 -----------------------------------------------------------
+    def send_text(self, msg: InboundMessage, text: str) -> Optional[bool]:
         context_token = (msg.reply_token
                          or self._context_tokens().get(msg.user_id, ""))
         if not context_token:
             self.log.warning("没有 context_token，无法回复 %s", msg.user_id)
-            return
-        for chunk in split_text(body_text):
-            try:
-                resp = self._post("ilink/bot/sendmessage", {
-                    "msg": {
-                        "from_user_id": "",
-                        "to_user_id": msg.user_id,
-                        "client_id": str(uuid.uuid4()),
-                        "message_type": 2,       # 2 = BOT
-                        "message_state": 2,      # 2 = FINISH
-                        "context_token": context_token,
-                        "item_list": [{"type": 1, "text_item": {"text": chunk}}],
-                    },
-                    "base_info": {"channel_version": CHANNEL_VERSION},
-                }, timeout=DEFAULT_TIMEOUT)
-            except HttpError as exc:
-                self.log.warning("发送失败：%s", exc)
-                return
-            if _as_int(resp.get("ret")) != 0:
-                self.log.warning("发送返回 ret=%s errmsg=%s",
-                                 resp.get("ret"), resp.get("errmsg") or resp.get("err_msg"))
-                return
+            # 没有它就一条消息都发不出去（连附件也不行，媒体循环在下面）。
+            # 回 None 会让桥记成 ✅，而对方那边一片安静。
+            return False
+        # 附件先过闸门：被拒的原因要拼进正文一起发出去，否则对方永远不知道少了什么。
+        # 顺序也是刻意的 —— **正文在前、图片在后**：一条只有图片的消息没有上下文，
+        # 而 explanation 往往就写在正文里。
+        media, notes = self._outbound_media(msg)
+        body_text = "\n".join(x for x in [str(text or "").strip(), *notes] if x).strip()
+        if body_text:
+            for chunk in split_text(body_text):
+                try:
+                    resp = self._post("ilink/bot/sendmessage", {
+                        "msg": {
+                            "from_user_id": "",
+                            "to_user_id": msg.user_id,
+                            "client_id": str(uuid.uuid4()),
+                            "message_type": 2,       # 2 = BOT
+                            "message_state": 2,      # 2 = FINISH
+                            "context_token": context_token,
+                            "item_list": [{"type": 1, "text_item": {"text": chunk}}],
+                        },
+                        "base_info": {"channel_version": CHANNEL_VERSION},
+                    }, timeout=DEFAULT_TIMEOUT)
+                except HttpError as exc:
+                    self.log.warning("发送失败：%s", exc)
+                    # 一个字都没送到 = 明确没送到。回 None 会让桥记成 ✅，而对方
+                    # 那边一片安静 —— 这正是「报告说成功、用户什么都没收到」。
+                    return False
+                if _as_int(resp.get("ret")) != 0:
+                    self.log.warning("发送返回 ret=%s errmsg=%s",
+                                     resp.get("ret"), resp.get("errmsg") or resp.get("err_msg"))
+                    return False
+        sent = 0
+        for item in media:
+            if self._send_media(msg.user_id, context_token, item):
+                sent += 1
+        # 只有媒体、且一个都没发出去 = 这次答复**什么都没送到**。必须回 `False`：
+        # `Channel.send_text` 的契约里 False 就是「明确没送到」，桥据此把终态记成
+        # 「答复没发出去」而不是 ✅ —— 否则对方那边一片安静，报告里却写着成功。
+        if media and not body_text and not sent:
+            return False
+        return None
 
     def stop(self) -> None:
         self._stop.set()

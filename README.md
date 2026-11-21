@@ -660,7 +660,7 @@ openthree channel add --type dingtalk --name ding \
 
 | 类型 | 收消息 | 发消息 | 要准备什么 |
 | --- | --- | --- | --- |
-| `wechat` | iLink Bot 长轮询（`ilink/bot/getupdates`） | `ilink/bot/sendmessage` | 不用公网地址；首次启动把二维码**直接打在控制台**上，扫码即登录，token 落到 `.openthree/channels/<频道名>.json` |
+| `wechat` | iLink Bot 长轮询（`ilink/bot/getupdates`） | `ilink/bot/sendmessage`（文本 + 图片 / 文件） | 不用公网地址；首次启动把二维码**直接打在控制台**上，扫码即登录，token 落到 `.openthree/channels/<频道名>.json` |
 | `dingtalk` | 机器人 Stream 模式（WebSocket） | 官方下发的 `sessionWebhook` | 钉钉开放平台自建应用的 AppKey / AppSecret；同样不用公网地址 |
 | `a2a` | 本进程起的 A2A 服务端（JSON-RPC `POST /a2a`） | 写进对方那个 task 的 `artifacts` | 不用公网地址；`openthree -A2A` 一条命令，默认注册到本机 OACP |
 
@@ -673,6 +673,46 @@ PNG 解成模块矩阵，用半块字符（`█ ▀ ▄`）画在控制台上，
 字符集按输出流编码自己退让 —— GBK 控制台有 `█` 却没有 `▀`、`▄`，就退成每行一个模块行；
 连方块字符都不认（`ascii`）时退成 `##`。PNG 仍旧落在
 `.openthree/channels/<频道名>-qrcode.png`，事后重扫 / 转发都用得上。
+
+### 微信：图片与文件收发双向
+
+回程不只是文字。智能体调 `attach_file` 把本地文件挂到本轮答复上，微信频道在**正文发完
+之后**逐张上传并发出 —— 与 A2A 用的是同一个工具、同一套闸门
+（`openthree/channels/_outbound.py`：根白名单、密钥黑名单、一条最多 4 个、合计 24 MiB）。
+于是「哪些文件能发出去」在两个渠道里是同一个答案，而不是两份。**单文件上限两边不同**：
+A2A 是 20 MiB（base64 进 JSON 响应的账），微信是 10 MiB —— 它还要在同步发送里做纯
+Python 的 AES 加密，20 MiB 会把整条回复卡住半分钟。
+
+**收进来的图片也进模型**（不是 `[图片]` 占位符）。`image_item` 里没有能直接用的 URL，
+只有 `media.encrypt_query_param`（下载凭证）与 `aeskey`（hex），内容是 AES-128-ECB
+加密的 —— 所以「收图」是一次下载 + 一次解密：落到 `.openthree/assets/`（与 CLI
+`--image` 同一个目录、同一条去重命名），路径挂到 `InboundMessage.images`，由桥交给
+`Runtime.run(images=…)` 进多模态 content。于是你在微信里发一张报错截图，智能体就能
+**看见**它，和你把图拖进 `-i` 是同一件事。
+
+收图的三条闸门与 A2A 共用一份（`openthree/channels/_inbound.py`）：一条消息最多 **8 张**、
+单张上限读 `OPENTHREE_MAX_IMAGE_BYTES`（默认 10 MiB）、`assets/` 总量到 512 MiB 后
+只拒新图。**任何一步失败都只影响那一张图**：文字照跑，原因以一句话拼进正文（「1 张图片
+未接收（下载失败，HTTP 500）」）—— 对发消息的人来说「图没收到」和「你没看懂」是同一
+件事。失败原因里**不带 URL**：那含一份下载凭证，而这句话会进模型上下文。
+
+媒体要先过 iLink 的上传通道：`getuploadurl` 登记 → 用 **AES-128-ECB** 加密 → POST 到
+微信 CDN → 从响应头 `x-encrypted-param` 取回落点 → 再发一条 `image_item` / `file_item`。
+AES 是**自己实现**的（`openthree/channels/_aes.py`，对过 FIPS-197 与 SP 800-38A 的测试
+向量），因为 openthree 的依赖只有 PyYAML / json_repair —— 不该为了发一张图让你去装
+pycryptodome。同一份实现也用来解**收进来的**图。
+
+类型按 **magic bytes** 认、不看后缀：认出是图片才走 `image_item`（微信按 item type 渲染，
+塞错就是一张破图），其余一律当文件发（视频也在其中）。被闸门拒掉的附件，原因会拼进
+正文一起发回来 —— 「少了一张图」和「发失败」对收件人是同一件事。
+
+```yaml
+- name: wx
+  type: wechat
+  options:
+    allow_images: true       # 收不收对方发来的图，默认收；false = 一张也不下载
+    outbound_roots: .        # 能发的根目录，默认 "." = 工作区；写 [] 关掉出站文件
+```
 
 ### 钉钉：长任务里也看得见「在干什么」
 

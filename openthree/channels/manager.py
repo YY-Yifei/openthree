@@ -257,23 +257,26 @@ def has_configured_channels(ws: Any) -> bool:
     return bool(cfg.ready())
 
 
-def declares_a2a(ws: Any) -> bool:
-    """工作区里是否**声明了**一个启用的 a2a 频道 —— 决定要不要注册 `attach_file`。
+# 能把文件随答复送回去的频道类型。新增一个这样的频道时，在这里加一行 ——
+# 它决定 `attach_file` 在不在工具集里（注册期一次判定，见 `installed_builtins`），
+# **不**决定文件发不发得出去：那由频道自己的 `outbound_roots` 决定，工具调用时
+# 会老实回一句「这次答复发不出文件」。
+FILE_CAPABLE_TYPES = frozenset({"a2a", "wechat"})
 
-    与 `has_configured_channels` 并列，判据不同：那个问「有没有能自动起的频道」，
-    用的是 `cfg.ready()`；a2a 一条必填项都没有（`is_ready()` 恒为真），拿它判
-    等于「有就真」。这里只问「有没有一条 `type == "a2a"` 且 `enabled` 的声明」。
 
-    判的是**会起**而不是**已起**：`Runtime.__init__` 装配工具集时频道还没装配
-    （`cli` 之后才把配置交给 manager）。精确到「已起」就得让工具集在进程中途变化，
-    system 前缀每步都变 —— 代价远高于「`--only wechat` 时工具在却没有承载者」，
-    而后者只让工具调用时老实回一句「这次发不出文件」。
+def declares_files(ws: Any) -> bool:
+    """工作区里是否声明了一个启用的、能把文件送回去的频道。
+
+    判「会起」而不是「已起」：装配工具集时频道还没装配（`cli` 之后才把配置交给
+    manager）。精确到「已起」就得让工具集在进程中途变化，system 前缀每步都变 ——
+    代价远高于「`--only wechat` 时工具在却没有承载者」，而后者只让工具调用时老实回
+    一句「这次发不出文件」。
     """
     try:
         cfg = ChannelsConfig.load(config_path(ws.dir))
     except Exception:  # noqa: BLE001 - 配置坏了由启动路径去报，这里只回答「有没有」
         return False
-    return any(c.type == "a2a" and c.enabled for c in cfg.channels)
+    return any(c.type in FILE_CAPABLE_TYPES and c.enabled for c in cfg.channels)
 
 
 def describe_config(ws: Any) -> str:  # pragma: no cover - 仅调试用
@@ -283,6 +286,6 @@ def describe_config(ws: Any) -> str:  # pragma: no cover - 仅调试用
 
 __all__ = [
     "ChannelManager", "ChannelManagerError", "Status", "instantiate",
-    "load_manager", "has_configured_channels", "declares_a2a", "describe_config",
-    "apply_extra",
+    "load_manager", "has_configured_channels", "declares_files",
+    "describe_config", "apply_extra",
 ]
