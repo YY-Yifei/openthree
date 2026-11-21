@@ -180,6 +180,22 @@ def test_missing_credential_is_refused_without_any_request(chan, monkeypatch):
     assert "没有下载凭证" in inbound.text
 
 
+def test_a_url_without_credential_is_never_downloaded(chan, monkeypatch):
+    """SSRF 的反面证据：`image_item.url` 来自入站消息，**一个请求都不许发**。
+
+    这条地址是云 metadata 的典型形状 —— 回退到它等于让一条消息指挥本机去 GET 任意
+    地址（`urlopen` 还会跟随重定向）。凭证才是协议给的正路。
+    """
+    def boom(url, timeout=0.0, max_bytes=0):       # pragma: no cover - 不该被调用
+        raise AssertionError(f"不该发请求：{url}")
+
+    monkeypatch.setattr(wx, "get_bytes", boom)
+    inbound = _emit(chan, _raw_image(credential="",
+                                     url="http://169.254.169.254/latest/meta-data"))
+    assert inbound.images == []
+    assert "没有下载凭证" in inbound.text
+
+
 def test_text_message_is_untouched(chan, monkeypatch):
     """纯文本消息：一次下载都不发，一个说明都不加。"""
     def boom(url, timeout=0.0, max_bytes=0):       # pragma: no cover
