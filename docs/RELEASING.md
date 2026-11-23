@@ -1043,6 +1043,66 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 （模型改任务时会重读图片文件），到 512 MiB 后新图被拒、旧图不动，腾空间要手动清理。
 
 
+### 0.13.0 实跑记录（2026-11-23）
+
+钉钉频道**入站图片**：`downloadCode` → `/v1.0/robot/messageFiles/download` 换一次性
+`downloadUrl` → GET → `.openthree/assets/` → `InboundMessage.images` →
+`Runtime.run(images=…)`。纯图片消息与富文本里的图片项都认；`robot_code` 同时服务于
+表情与换地址。新增配置项 `allow_images`（默认 `true`，与微信同名同义）。按 minor 发。
+
+三条实现判据（动这块代码前先读）：
+
+- **只 GET 我们自己换回来的那个地址**，且再按 scheme 只放行 http(s)。回调查里的地址字段
+  一个都不碰 —— 不是因为信道不可信，而是 `get_bytes()` 走 `urlopen()`，它对 `file://`
+  是照读的：一个被污染的地址就能把本机文件读进 `assets/` 再送进模型。
+- **read loop 只 ack / 解析 / 入队**。钉钉推一帧只等 3 秒，换地址加下载动辄几秒；
+  塞进去会让后续帧的 ack 一起被拖后，于是**重投同一条消息**。取图在一条专门线程上按
+  FIFO 消费 —— 桥只有一条工作线程，入队顺序就是对话顺序。
+- 闸门与微信共用 `_inbound.collect_images()`：8 张 / `OPENTHREE_MAX_IMAGE_BYTES` /
+  512 MiB / 整条 45 秒。失败只影响那一张，原因一句进正文且不带地址与凭证。
+
+`ocr review`（4 文件 / 2 条）逐条对源码核过，两条都成立并已修：
+
+- `extract_text()` 给任何「有凭证、没文本」的富文本项都写 `[图片]`，而 `extract_images()`
+  会跳过声明成非图片的项（`type: "file"`）⇒ 正文悬着一个永远等不到「未接收」说明的
+  `[图片]`。改成按声明的类型写 `[附件]`。
+- `_fetch_image()` 的两跳各拿一份完整 `timeout`（单张最长 40s），而 `collect_images()`
+  的 deadline 只在**两张之间**检查 ⇒ 最后一张能把 45 秒拖成约 65 秒。改成两跳共用一份
+  预算，并在 `collect_images()` 的 docstring 里把这条契约写明（`timeout` 是整张图的）。
+
+验收（仓库根实跑）：
+
+- 三处版本号均为 `0.13.0` ✓
+- 全量 pytest → **936 passed / 0 failed**（141.54s）；新增
+  `tests/test_channels_dingtalk_inbound.py`（24 条：协议形状 / 换地址形状 / 只认自己的
+  地址 / `file://` 拒绝 / 失败措辞不泄漏凭证 / 条数 / 单张上限 / 预算 / 占位符判据 /
+  两跳共用预算 / read loop 不入网 / 交付保序）
+- `python -m build` → wheel **407,784 B** / sdist **919,196 B**（先清空 `dist/` 与
+  `openthree.egg-info`）✓
+- `python -m twine check dist/*` → **两个 PASSED** ✓
+- sdist **129 项**，越界路径 0（无 `.openthree/`、`config.yaml`、`identity.json`、
+  `limits.json`、`memory.jsonl`）；与 `git ls-files`（117）比对：sdist 里唯一不是 git
+  跟踪文件的是它自己生成的 `PKG-INFO` / `setup.cfg` ✓
+- `twine upload --non-interactive --disable-progress-bar` 一次成功 →
+  <https://pypi.org/project/openthree/0.13.0/> ✓
+- **双向核验**：`/pypi/openthree/0.13.0/json` 两个文件的 `size` 与 `digests.sha256`
+  与本地 `dist/` **全串一致**，`yanked` 均为 `False` ✓
+- **干净 venv**（`_live/venv0130`）从 PyPI 实装 `0.13.0`，在仓库之外的中性 cwd 跑
+  26 项探针全 PASS：`__file__` 在 site-packages、`IMAGE_TIMEOUT/IMAGE_DEADLINE` 为
+  20/45、`extract_images` / `_fetch_image` / `_absorb_images` / `_resolve_download_url`
+  / `_download_target` 均在、纯图片摘出凭证、richText 的文件项不当图收且正文说「附件」、
+  `file://` 被拒而 https 放行、配置项里有 `allow_images` 且默认 `true` ✓
+
+两条记账（下次别重踩）：`tarfile.getnames()` 的**目录项没有尾部斜杠**，按
+`endswith("/")` 过滤会把 `docs` / `openthree` 这类目录算成「sdist 里未跟踪的文件」——
+不是越界，是脚本自己看错了。探针也不许「随便挑一个大写名字当配置表」：第一版就是这么
+取到了别的对象、报了一次假失败，改成指名叫准 `config._SPECS["dingtalk"]`。
+
+**升级提示**：无 CLI 变更；钉钉新增 `allow_images`（默认 `true`，`false` = 一个请求都
+不发）。收图需要应用有**机器人权限**并配好 `robot_code`（不是 `client_id`）；换不到
+下载地址时正文会说「换不到下载地址」，不会静默少一张图。
+
+
 
 
 
