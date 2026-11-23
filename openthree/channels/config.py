@@ -116,6 +116,15 @@ _SPECS: Dict[str, ChannelSpec] = {
                        "看不到表情，不影响收发"),
             Field("allow_from", "allow_from",
                   hint="允许的发送者 staffId，逗号分隔；留空 = 不限制"),
+            Field("allow_images", "allow_images", default="true",
+                  hint="收不收对方发来的图片（true/false，默认收）。收 = 对方发的图"
+                       "真的进模型（多模态），与把图拖进 CLI `--image` 是同一件事；"
+                       "关 = 图下载都不下载，只在正文里说一句「本频道关掉了 "
+                       "allow_images」。单张上限由 OPENTHREE_MAX_IMAGE_BYTES 定；"
+                       "一条消息最多收 8 张（MAX_IMAGES_PER_MESSAGE）；assets/ 总量"
+                       "到 512 MiB（ASSETS_BUDGET_BYTES）后只拒新图，腾空间要手动"
+                       "清理。**要应用有机器人权限**，并配好 robot_code（不是 "
+                       "client_id）—— 换不到下载地址时正文会说「换不到下载地址」"),
         ),
     ),
     # A2A：把 openthree 挂到 A2A 网络上，别的智能体来派任务。

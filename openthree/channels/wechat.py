@@ -227,12 +227,6 @@ def extract_images(item_list: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     return out
 
 
-def _append_notes(text: str, notes: List[str]) -> str:
-    """把几句说明拼到消息正文后面（空的那几段直接不占位，不留空行）。"""
-    parts = [str(text or "").strip()] + [str(n or "").strip() for n in notes]
-    return "\n\n".join(p for p in parts if p).strip()
-
-
 def split_text(text: str, limit: int = MAX_TEXT_CHUNK) -> List[str]:
     """按行切分长文本（尽量不把一句话劈开），每段不超过 limit。"""
     text = str(text or "")
@@ -591,37 +585,13 @@ class WeChatChannel(Channel):
     def _inbound_images(self, specs: List[Dict[str, str]]) -> Tuple[List[str], List[str]]:
         """下载 / 解密 / 落盘，返回 `(本地路径表, 说明)`。
 
-        闸门按**代价从便宜到贵**排：关掉收图 → 条数 → 单张大小 → 目录预算。被拒的
-        每一张各留一句原因，那些原因会拼进正文发回去 —— 对方不知道少了什么，只会
-        以为机器人没看懂。
-
-        时间也有一条闸（`IMAGE_DEADLINE`）：这段代码跑在**长轮询那条线程**上，8 张图
-        × 20 秒能把下一条消息的发现推迟将近三分钟；超了就把剩下的如实记为没收到。
+        循环、条数、时间与预算闸都在 `_inbound.collect_images()`；这里只提供
+        「把这一张下载下来并解密」（`_fetch_image`）—— 微信的凭证本身就是地址
+        参数，钉钉要多一步换地址，两边差别只在这一步。
         """
-        accepted = specs[:_inbound.MAX_IMAGES_PER_MESSAGE]
-        paths: List[str] = []
-        notes: List[str] = []
-        deadline = time.monotonic() + IMAGE_DEADLINE
-        for index, spec in enumerate(accepted):
-            left = deadline - time.monotonic()
-            if left <= 0:
-                notes.append(f"（另有 {len(accepted) - index} 张图片未接收：下载超时）")
-                break
-            data, why = self._fetch_image(spec, min(IMAGE_TIMEOUT, left))
-            if data is None:
-                notes.append(why)      # why 本身就是一句完整的话（不再套一层括号）
-                continue
-            path, why = _inbound.save_within_budget(self.assets_dir(), data)
-            if path:
-                paths.append(path)
-            else:
-                self.log.warning("微信收图落盘失败：%s", why)
-                notes.append(why)
-        extra = len(specs) - len(accepted)
-        if extra > 0:
-            notes.append(f"（另有 {extra} 张图片未接收：一条消息最多收 "
-                         f"{_inbound.MAX_IMAGES_PER_MESSAGE} 张）")
-        return paths, notes
+        return _inbound.collect_images(self.assets_dir(), specs, self._fetch_image,
+                                       deadline=IMAGE_DEADLINE, timeout=IMAGE_TIMEOUT,
+                                       log=self.log)
 
     def _absorb_images(self, inbound: InboundMessage, raw: Dict[str, Any]) -> None:
         """把这条消息里的图片收下来挂到 `inbound.images`，失败写进正文。
@@ -633,7 +603,7 @@ class WeChatChannel(Channel):
         if not specs:
             return
         if not self.allow_images:
-            inbound.text = _append_notes(inbound.text, [
+            inbound.text = _inbound.append_notes(inbound.text, [
                 f"（{len(specs)} 张图片未处理：本频道关掉了 allow_images）"])
             return
         paths, notes = self._inbound_images(specs)
@@ -641,7 +611,7 @@ class WeChatChannel(Channel):
             inbound.images = paths
             self.log.info("收到 %d 张图片（共 %d 张）", len(paths), len(specs))
         if notes:
-            inbound.text = _append_notes(inbound.text, notes)
+            inbound.text = _inbound.append_notes(inbound.text, notes)
 
     # --- 出站媒体（图片 / 文件） ---------------------------------------
     def workspace_root(self) -> Path:

@@ -14,8 +14,9 @@
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..multimodal import TMP_MARK, ImageError, asset_dest, save_image_bytes
 
@@ -86,6 +87,66 @@ def _lock_for(directory: Path) -> threading.Lock:
         if lock is None:
             lock = _locks[key] = threading.Lock()
         return lock
+
+
+def append_notes(text: str, notes: List[str]) -> str:
+    """把几句说明拼到消息正文后面（空的那几段直接不占位，不留空行）。
+
+    收图失败的原因必须回到发消息的人眼前 —— 静默少一张图与「机器人没看懂」
+    是同一种感受。拼法（两个换行、丢掉空段）只许有这一处：微信与钉钉都靠它，
+    两边措辞不同步的时候，没人分得清是哪个频道丢的图。
+    """
+    parts = [str(text or "").strip()] + [str(n or "").strip() for n in notes]
+    return "\n\n".join(p for p in parts if p).strip()
+
+
+def collect_images(directory: Path, specs: List[Any],
+                   fetch: Callable[[Any, float], Tuple[Optional[bytes], str]],
+                   *, deadline: float, timeout: float,
+                   log: Any = None) -> Tuple[List[str], List[str]]:
+    """按序收下 `specs` 里的每一张图，返回 `(本地路径表, 说明)`。
+
+    闸门按**代价从便宜到贵**排：条数 → 单张大小（由 `fetch` 里的
+    `get_bytes(max_bytes=…)` 在下载时就挡住）→ `assets/` 预算。被拒的每一张各留
+    一句原因，那些原因会拼进正文发回去 —— 对方不知道少了什么，只会以为机器人
+    没看懂。
+
+    时间也有上界（`deadline` 秒）：这段代码跑在频道自己的收图线程上，而 8 张图 ×
+    单张超时足以把下一条消息的交付推迟几分钟；超了就把剩下的如实记为没收到。
+
+    `fetch` 由频道提供（条目, 本次超时 → `(字节, 原因)`）：钉钉要先拿 `downloadCode`
+    换地址，微信的凭证本身就是地址参数，两边不同的只是这一步。循环、条数、预算
+    与措辞只该有这一份 —— 两个频道各写一遍，迟早一边多收一张、或者一边把「超时」
+    说成「失败」。**这个超时是整张图的预算，不是每一跳一份**：本函数只在两张之间
+    检查 `deadline`，`fetch` 内部若多跳各拿一份，上界就变成了 deadline + timeout。
+    """
+    accepted = specs[:MAX_IMAGES_PER_MESSAGE]
+    paths: List[str] = []
+    notes: List[str] = []
+    expire = time.monotonic() + deadline
+    for index, spec in enumerate(accepted):
+        left = expire - time.monotonic()
+        if left <= 0:
+            notes.append(f"（另有 {len(accepted) - index} 张图片未接收：下载超时）")
+            break
+        data, why = fetch(spec, min(timeout, left))
+        if data is None:
+            notes.append(why)      # why 本身就是一句完整的话（不再套一层括号）
+            continue
+        path, why = save_within_budget(directory, data)
+        if path:
+            paths.append(path)
+        elif log is not None:
+            # 原因会进正文（对方看得见），日志里再留一份带上下文的 —— 排查时
+            # 「第几张、为什么」比正文里那句无主语的话有用得多。
+            log.warning("收图落盘失败（第 %d/%d 张）：%s", index + 1, len(accepted), why)
+        if not path:
+            notes.append(why)
+    extra = len(specs) - len(accepted)
+    if extra > 0:
+        notes.append(f"（另有 {extra} 张图片未接收：一条消息最多收 "
+                     f"{MAX_IMAGES_PER_MESSAGE} 张）")
+    return paths, notes
 
 
 def save_within_budget(directory: Path, data: bytes,

@@ -739,14 +739,54 @@ pycryptodome。同一份实现也用来解**收进来的**图。
   options:
     client_id: 你的AppKey
     client_secret: 你的AppSecret
-    robot_code: dingxxxx        # 表情接口要的机器人编码；留空 = client_id
+    robot_code: dingxxxx        # 机器人编码：表情与换下载地址都要；留空 = client_id
     status_reactions: true      # 表情状态；false = 完全不显示进度（只发最终答复）
+    allow_images: true          # 收不收对方发来的图，默认收；false = 一个请求都不发
 ```
 
 这层状态不占 ReAct 的任何一行：`Progress` 把「第几步 / 正在调哪个工具 / 等了多少秒」
 旁路给频道（`Runtime.run(observer=…)`），生命周期（排队 / 开跑 / 完成 / 出错 / 取消）
 由桥自己通知（`Channel.notify`）。两个钩子在 `Channel` 基类上默认是空的，所以微信与
 A2A 的行为一个字节没变 —— 它们只是不订阅。
+
+#### 收进来的图也进模型
+
+与微信同一个结论、不同的一条路：钉钉的图片消息里**没有**能直接下载的地址，只有一个
+`downloadCode`。所以收一张图是两跳 —— 拿凭证去开放平台换一次性的 `downloadUrl`
+（`POST /v1.0/robot/messageFiles/download`，带 accessToken，body 里要 `robotCode`），
+再 GET 那个地址。落 `.openthree/assets/`（与微信、CLI `--image` 同一个目录、同一条去重
+命名），路径挂到 `InboundMessage.images`，由桥交给 `Runtime.run(images=…)` 进多模态
+content。于是你在钉钉里发一张报错截图，智能体就能**看见**它。
+
+**能被 GET 的只有我们自己那次换地址调用的响应。** 回调里出现的任何地址字段一律不碰，
+且 `downloadUrl` 还要再过一道 scheme 闸（只放行 http(s)）—— 不是因为信道不可信（推送
+本身有签名），而是 `get_bytes()` 走的是 `urlopen()`，它对 `file://` 是照读的：一个被
+污染的地址会把本机任意文件读进 `assets/` 再送进模型。拦一下几乎不要钱。
+
+**read loop 绝不跑慢网络。** 钉钉是推送式：推一帧、只等 3 秒 ack。换地址 + 下载动辄
+几秒，塞进 read loop 就意味着后续帧的 ack 一起被拖后 —— 钉钉会认为没收到，于是**重投
+同一条消息**。所以 read loop 只到「入队」为止，取图由一条专门线程按 FIFO 消费：连发两条
+消息不会因为图大图小而乱序进桥，而桥只有一条工作线程，入队顺序就是对话顺序。
+
+纯图片消息（`msgtype == "picture"`）与富文本里夹着的图片项都认。凭证按**字段存在性**
+摘（`downloadCode` / `pictureDownloadCode`），不看 `type` 声称什么：判别符会撒谎，字段
+不会 —— 但「明确声明成别的类型」（`type: "file"`）仍然算数。富文本里的文件 / 视频不摘：
+它们在正文里各自留着自己的占位符，把 PDF 当图下下来再被 magic bytes 拒掉，说明会变成
+「不是图片」，对发文件的人莫名其妙。只发图、不配文字的富文本消息也不会变成空消息 ——
+图片项在正文里留一个 `[图片]` 占位符。
+
+闸门与微信共用一份（`openthree/channels/_inbound.py` 的 `collect_images`）：一条消息最多
+**8 张**、单张上限读 `OPENTHREE_MAX_IMAGE_BYTES`（默认 10 MiB，且大小闸在**下载时**就
+生效，不为一张会被拒的图先读进几 MB）、`assets/` 总量到 512 MiB 后只拒新图、一条消息
+收图总时长 **45 秒**（单张 20 秒）。任何一步失败都只影响那一张：文字照跑，原因以一句话
+拼进正文（「1 张图片未接收（换不到下载地址，HTTP 400）」「另有 3 张图片未接收：下载
+超时」）。失败原因里**不带地址、不带凭证** —— 这句话会进模型上下文，而 `downloadCode`
+本身就是一次下载许可；详情只进日志。
+
+`robot_code` 在这里不只是表情接口要的：换 `downloadUrl` 也用它。留空回落到 `client_id`
+的那份值**不一定被接受** —— 换不到时正文会说「换不到下载地址」，而不是静默少一张图。
+**应用需要机器人权限。** `allow_images: false` 则一个请求都不发，只在正文里说一句
+「本频道关掉了 allow_images」。
 
 
 ### A2A：让别的智能体来派任务

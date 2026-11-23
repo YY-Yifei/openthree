@@ -37,16 +37,20 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
 import socket
 import threading
 import time
-from typing import Any, Dict, Optional
-from urllib.parse import quote_plus
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote_plus, urlsplit
 
-from ._http import HttpError, post_json, post_json_status
+from ..multimodal import max_image_bytes
+from ._http import HttpError, get_bytes, post_json, post_json_status
 from ._ws import WebSocket, WebSocketError
 from .base import Channel, InboundMessage
+from . import _inbound
 
 OPEN_API = "https://api.dingtalk.com"
 OPEN_CONNECTION_API = f"{OPEN_API}/v1.0/gateway/connections/open"
@@ -56,6 +60,16 @@ EMOTION_RECALL_API = f"{OPEN_API}/v1.0/robot/emotion/recall"
 BOT_TOPIC = "/v1.0/im/bot/messages/get"
 TEXT_CHUNK = 4000
 _AT_PREFIX = re.compile(r"^\s*@[^\s@]+\s*")
+
+# --- 入站图片 -------------------------------------------------------------
+# 钉钉的图片消息里**没有**能直接下载的地址，只有一个 `downloadCode`。要先把码换成
+# 一次性的 `downloadUrl`（开放平台接口，要 accessToken），再 GET 那个地址。
+MESSAGE_FILE_DOWNLOAD_API = f"{OPEN_API}/v1.0/robot/messageFiles/download"
+
+# 单次「换地址 / 下载」的超时，以及一条消息收图的总时长。总时长必须有上界：收图
+# 跑在专门的收图线程上（不是 read loop），但 8 张慢图不该让后面排队的消息无限等。
+IMAGE_TIMEOUT = 20.0
+IMAGE_DEADLINE = 45.0
 
 # 文字表情的内置 id 与背景：钉钉规定的一组常量，换掉它表情就渲染不出来。
 TEXT_EMOTION_ID = "2659900"
@@ -146,11 +160,25 @@ def extract_text(data: Dict[str, Any]) -> str:
     msgtype = str(data.get("msgtype") or "").lower()
     if msgtype == "text":
         return str((data.get("text") or {}).get("content") or "").strip()
-    if msgtype == "richText" or msgtype == "richtext":
+    if msgtype == "richtext":
         parts = []
         for item in (data.get("content") or {}).get("richText") or []:
-            if isinstance(item, dict) and item.get("text"):
+            if not isinstance(item, dict):
+                continue
+            if item.get("text"):
                 parts.append(str(item["text"]))
+            elif _download_code(item):
+                # 有凭证但没文本：按**声明的类型**决定占位符，判据与
+                # `extract_images()` 同一份。声明成非图片的项（`type: "file"`）
+                # 那边不收，这边就别说「图片」—— 说了却没有对应的图、也不会
+                # 有「未接收」的说明，读起来就是丢了一张图。
+                declared = str(item.get("type") or item.get("msgType") or "").lower()
+                if declared and not any(t in declared for t in _PICTURE_TYPES):
+                    parts.append("[附件]")
+                else:
+                    # 不留占位符的话，「只发了一张图、没配文字」的富文本消息
+                    # 就成了空消息、整条被丢 —— 而它其实有东西要看。
+                    parts.append("[图片]")
         return "".join(parts).strip()
     if msgtype in ("audio", "voice"):
         recognition = str((data.get("content") or {}).get("recognition") or "").strip()
@@ -163,6 +191,70 @@ def extract_text(data: Dict[str, Any]) -> str:
         name = str((data.get("content") or {}).get("fileName") or "").strip()
         return f"[文件] {name}".strip()
     return ""
+
+
+#: 钉钉回调里承载下载凭证的字段名：纯图片消息用 `downloadCode`，富文本里的图片项
+#: 也可能写成 `pictureDownloadCode`（官方两个版本都发过）。
+_DOWNLOAD_CODE_KEYS = ("downloadCode", "download_code",
+                       "pictureDownloadCode", "picture_download_code")
+
+#: 明确声明成图片的类型名。判别符只在「明确说不是图」时才起作用 —— 字段才是要用的
+#: 东西（A2A / 微信同一条判据）。
+_PICTURE_TYPES = ("picture", "image", "img")
+
+
+def _download_code(item: Dict[str, Any]) -> str:
+    """这一项里的下载凭证（没有就是空串）。"""
+    for key in _DOWNLOAD_CODE_KEYS:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def extract_images(data: Dict[str, Any]) -> List[Dict[str, str]]:
+    """把一条钉钉消息里的图片摘出来，每张只带一份下载凭证。
+
+    **这里只摘凭证、一个请求都不发**：回调里没有能直接用的地址（要拿
+    `downloadCode` 去开放平台换），而 `parse_callback_data()` 是纯函数 —— 测试
+    可以直接调它。下载在频道的收图线程上做。
+
+    两种承载方式都认：
+      * 纯图片 —— `msgtype == "picture"`，凭证在 `content.downloadCode`；
+      * 富文本 —— `content.richText` 里夹着的图片项，凭证可能在
+        `pictureDownloadCode`。
+
+    富文本里**别的**媒体（文件 / 视频）不摘：它们在正文里各自留着自己的占位符，
+    而把一个 PDF 当图片下下来再被 magic bytes 拒掉，说明会变成「不是图片」——
+    对发文件的人莫名其妙。说明是要发回去给人看的，所以宁可少说也不说错。
+    """
+    if not isinstance(data, dict):
+        return []
+    content = data.get("content")
+    if not isinstance(content, dict):
+        return []
+    msgtype = str(data.get("msgtype") or "").lower()
+    if msgtype == "picture":
+        # **没有凭证也返回一条**：正文里已经留着 `[图片]` 占位符了，那就必须说清
+        # 「这张图没收到」—— 少一张图的静默与丢消息是同一种感受（微信同一条判据）。
+        return [{"download_code": _download_code(content)}]
+    if msgtype != "richtext":
+        return []
+    out: List[Dict[str, str]] = []
+    for item in content.get("richText") or []:
+        if not isinstance(item, dict):
+            continue
+        declared = str(item.get("type") or item.get("msgType") or "").lower()
+        is_picture = (not declared) or any(t in declared for t in _PICTURE_TYPES)
+        code = _download_code(item)
+        if code:
+            # 有凭证、又没被明确声明成别的（`type: "file"`）⇒ 收。判别符会撒谎，
+            # 字段不会；但「明确说不是图」这一句仍然算数。
+            if is_picture:
+                out.append({"download_code": code})
+        elif declared and any(t in declared for t in _PICTURE_TYPES):
+            out.append({"download_code": ""})     # 声明是图却没凭证：要报没收到
+    return out
 
 
 def parse_callback_data(data: Dict[str, Any], *, channel: str = "",
@@ -218,6 +310,10 @@ class DingTalkChannel(Channel):
         self._emotion_warned: Dict[str, float] = {}
         self._emotion_lock = threading.Lock()
         self._status = _Status(self)
+        # 收到的消息按序排在这里，由一条收图线程消费（见 `_enqueue`）：read loop
+        # 只 ack / 解析 / 入队，绝不在 3 秒的 ack 窗口里做慢网络。
+        self._inbox: "queue.Queue[Optional[Tuple[InboundMessage, Dict[str, Any]]]]" = queue.Queue()
+        self._inbox_thread: Optional[threading.Thread] = None
 
     # --- 连接 ---------------------------------------------------------
     def open_connection(self) -> Dict[str, Any]:
@@ -341,7 +437,175 @@ class DingTalkChannel(Channel):
         if not self.allowed(inbound.user_id):
             self.log.info("忽略未授权的发送者：%s", inbound.user_id)
             return
-        self.emit(inbound)
+        self._enqueue(inbound, data)
+
+    # --- 收图线程（read loop 绝不跑慢网络） -----------------------------
+    def _enqueue(self, inbound: InboundMessage, data: Dict[str, Any]) -> None:
+        """把「解析好的消息 + 原始回调」交给收图线程，按序。
+
+        钉钉是推送式：服务端推一帧，只等 3 秒的 ack。收一张图（换地址 + 下载）
+        动辄几秒，把这段塞进 read loop 就意味着后续帧的 ack 一起被拖后 —— 钉钉
+        会认为没收到，于是**重投同一条消息**。所以 read loop 只到入队为止，
+        慢的部分在一条专门线程上做。
+
+        队列是 FIFO、只有一个消费者，所以连发的两条消息不会因为图大图小而乱序
+        进桥 —— 桥只有一条工作线程，入队顺序就是对话顺序。
+        """
+        self._start_inbox()          # 幂等：线程活着就什么都不做
+        self._inbox.put((inbound, data))
+
+    def _start_inbox(self) -> None:
+        """确保收图线程活着（重连不重启它：它只认队列，与连接无关）。"""
+        if self._inbox_thread is not None and self._inbox_thread.is_alive():
+            return
+        self._inbox_thread = threading.Thread(
+            target=self._inbox_loop, name=f"channel-{self.name}-inbox", daemon=True)
+        self._inbox_thread.start()
+
+    def _inbox_loop(self) -> None:
+        while True:
+            item = self._inbox.get()
+            try:
+                if item is None:          # 收工哨兵（`stop()` 投的）
+                    return
+                inbound, data = item
+                try:
+                    self._absorb_images(inbound, data)
+                except Exception as exc:  # noqa: BLE001 - 一张图不能吃掉整条消息
+                    self.log.warning("收图失败（正文照常处理）：%s", exc)
+                try:
+                    self.emit(inbound)
+                except Exception as exc:  # noqa: BLE001 - 单条交付失败不该终止线程
+                    self.log.warning("交付消息失败：%s", exc)
+            finally:
+                self._inbox.task_done()
+
+    # --- 入站图片 -------------------------------------------------------
+    @property
+    def allow_images(self) -> bool:
+        """收不收对方发来的图片（`allow_images`，默认收）。关掉就一个请求都不发。"""
+        return self.option_bool("allow_images", True)
+
+    def assets_dir(self) -> Path:
+        """收来的图落在哪儿 —— 与 A2A、微信、CLI `--image` 同一个目录（`assets/`）。"""
+        return _inbound.assets_dir(self.workspace_dir)
+
+    @staticmethod
+    def _download_target(url: str) -> str:
+        """换回来的 `downloadUrl` 能不能 GET（空串 = 不能用）。
+
+        **只放行 http(s)**：`get_bytes()` 走 `urlopen()`，而它对 `file://` 是照读
+        的 —— 一个被污染的地址就能把本机任意文件读进 `assets/` 再送进模型。这个
+        地址来自**我们自己那次 API 调用的响应**，不是消息内容（所以不存在「一条
+        消息让进程去 GET 内网」那种入口），但拦一下几乎不要钱。
+        """
+        try:
+            parts = urlsplit(str(url or ""))
+        except ValueError:
+            return ""
+        if parts.scheme in ("http", "https") and parts.netloc:
+            return str(url)
+        return ""
+
+    def _resolve_download_url(self, code: str, timeout: float) -> str:
+        """把 `downloadCode` 换成一次性的 `downloadUrl`（空串 = 换不到）。
+
+        这是钉钉比微信多出来的那一跳：微信的凭证本身就是地址参数，钉钉要拿
+        accessToken 去开放平台换。`robotCode` 得是真的机器人编码（`dingxxxx`）；
+        内建机器人留空时回落到 client_id 的那份值**不一定被接受** —— 换不到就
+        如实说「换不到下载地址」，不拿同一个错值再试一次（重试只会把真正的
+        原因埋深一层）。
+        """
+        headers = {"x-acs-dingtalk-access-token": self.access_token()}
+        data = post_json(MESSAGE_FILE_DOWNLOAD_API,
+                         {"downloadCode": code, "robotCode": self.robot_code},
+                         headers=headers, timeout=timeout)
+        return str((data or {}).get("downloadUrl") or "")
+
+    def _fetch_image(self, spec: Dict[str, str],
+                     timeout: float) -> Tuple[Optional[bytes], str]:
+        """换地址 → 下载一张图，返回 `(字节, 未收到的原因)`；成功时原因为空串。
+
+        大小闸在下载时而不是下载后：`get_bytes(max_bytes=…)` 读到超限就停，不为
+        一张会被拒的图先读进几 MB 内存。
+
+        `timeout` 是**整张图**的预算（换地址 + 下载共用一份），不是每一跳一份：
+        `collect_images()` 的 deadline 只在两张之间检查，多跳各拿一份就把上界
+        变成了「deadline + timeout」。
+
+        失败原因里**不带地址、不带凭证** —— 这句话会进正文 → 模型上下文 → 可能
+        原样回给对方，而 `downloadCode` 本身就是一次下载许可。详情只进日志。
+        """
+        code = str(spec.get("download_code") or "")
+        if not code:
+            return None, "1 张图片未接收（消息里没有下载凭证）"
+        if not self.robot_code:
+            return None, "1 张图片未接收（没有配置 robot_code，换不到下载地址）"
+        started = time.monotonic()
+        try:
+            url = self._resolve_download_url(code, timeout)
+        except Exception as exc:       # noqa: BLE001 - 收图失败不该连文字一起丢
+            # 捕到 `Exception` 而不是只捕 `HttpError`：`post_json()` 已经把网络那
+            # 几种包成 `HttpError`，但调用栈上还有别的可能（令牌响应解析、内存、
+            # 平台 SSL 抛法）。放一个出去，收图线程的兜底会跳过这条消息 ——
+            # 用户连问题本身都收不到。承诺是「一切失败都变成一句说明」。
+            self.log.warning("钉钉换下载地址失败：%s", exc)    # 详情（含凭证）只进日志
+            status = getattr(exc, "status", 0)
+            return None, (f"1 张图片未接收（换不到下载地址，HTTP {status}）" if status
+                          else "1 张图片未接收（换不到下载地址）")
+        target = self._download_target(url)
+        if not target:
+            return None, "1 张图片未接收（下载地址不可用）"
+        # 两跳共用**一份**预算（`collect_images()` 给出的是整张图的 `timeout`）：
+        # 各拿一份的话，`deadline` 只在两张之间检查，最后一张能把上界拖成
+        # deadline + timeout —— 而那条上界的存在理由就是「别让排队的消息等」。
+        left = timeout - (time.monotonic() - started)
+        if left <= 0:
+            return None, "1 张图片未接收（换下载地址超时）"
+        limit = max_image_bytes()
+        try:
+            data = get_bytes(target, timeout=left,
+                             max_bytes=limit if limit > 0 else _inbound.ASSETS_BUDGET_BYTES)
+        except Exception as exc:       # noqa: BLE001
+            self.log.warning("钉钉收图下载失败：%s", exc)
+            status = getattr(exc, "status", 0)
+            return None, (f"1 张图片未接收（下载失败，HTTP {status}）" if status
+                          else "1 张图片未接收（下载失败）")
+        if not data:
+            return None, "1 张图片未接收（下载到的是空内容）"
+        return data, ""
+
+    def _inbound_images(self, specs: List[Dict[str, str]]) -> Tuple[List[str], List[str]]:
+        """换地址 / 下载 / 落盘，返回 `(本地路径表, 说明)`。
+
+        循环、条数、时间与预算闸都在 `_inbound.collect_images()`；这里只提供
+        「把这一张拿下来」（`_fetch_image`）—— 钉钉比微信多的那一步是换地址。
+        """
+        return _inbound.collect_images(self.assets_dir(), specs, self._fetch_image,
+                                       deadline=IMAGE_DEADLINE, timeout=IMAGE_TIMEOUT,
+                                       log=self.log)
+
+    def _absorb_images(self, inbound: InboundMessage, data: Dict[str, Any]) -> None:
+        """把这条消息里的图片收下来挂到 `inbound.images`，失败写进正文。
+
+        **不抛异常**：收图是收图线程上的额外工作，一张图失败不该把文字一起丢掉
+        —— 而「为什么没收到这张图」必须说出来，静默少一张图与丢消息是同一种感受。
+        图片按 magic bytes 认类型落在 `assets/`，桥原样交给 `Runtime.run(images=…)`
+        —— 与把图拖进 CLI `--image` 是同一条路。
+        """
+        specs = extract_images(data)
+        if not specs:
+            return
+        if not self.allow_images:
+            inbound.text = _inbound.append_notes(inbound.text, [
+                f"（{len(specs)} 张图片未处理：本频道关掉了 allow_images）"])
+            return
+        paths, notes = self._inbound_images(specs)
+        if paths:
+            inbound.images = paths
+            self.log.info("收到 %d 张图片（共 %d 张）", len(paths), len(specs))
+        if notes:
+            inbound.text = _inbound.append_notes(inbound.text, notes)
 
     # --- 发 -----------------------------------------------------------
     def send_text(self, msg: InboundMessage, text: str) -> bool:
@@ -373,6 +637,9 @@ class DingTalkChannel(Channel):
     def stop(self) -> None:
         self._stop.set()
         self._ping_stop.set()
+        # 哨兵排在队列**末尾**：已经收到的消息会先被收图、交付，然后线程才退出 ——
+        # 与「先停频道、再停桥，桥把手头那条跑完」同一个顺序。
+        self._inbox.put(None)
         # **不停**状态工作线程：收工顺序是「先停频道、再停桥」，桥会把手头那条跑完
         # 并把终态发出来；在这儿停掉，那条消息就会永远停在 🤔，而答案其实送到了。
         # 它是守护线程，进程退出时自然结束。
