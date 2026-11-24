@@ -1102,6 +1102,49 @@ sha256 与体积取自 PyPI JSON API（`https://pypi.org/pypi/openthree/<ver>/js
 不发）。收图需要应用有**机器人权限**并配好 `robot_code`（不是 `client_id`）；换不到
 下载地址时正文会说「换不到下载地址」，不会静默少一张图。
 
+### 0.13.1 实跑记录（2026-11-24）
+
+`openthree/tool.py` 的 schema 生成补全 + 堵死所有「毒化 schema」的入口。修复按 patch 发。
+
+用户可见面没有 API 变化；修的是「写了合法 Python、工具却在模型那里静默出错」这一类：
+
+- **注解翻译只认了一半**：`_json_type` 只匹配 `typing.Union`，而 PEP 604 的 `X | None`
+  的 origin 是 `types.UnionType` ⇒ 一路掉进 `{"type":"string"}` 兜底：不报错，只让模型
+  传错类型，到 Python 里才 `TypeError`。同批补上 `tuple/set/frozenset/Sequence/Iterable`
+  → `array`、`Literal[1,2]` 保留 type、`Annotated` 看 base、`Any` 不约束。
+- **schema 里一个不可序列化的值就能让整步失败**：`json.dumps(schema)` 抛 `TypeError` 时，
+  死的是**那一步的 LLM 请求**，不是工具报错。三个入口全堵：默认值（`Path`→字符串、
+  `Enum`→value、容器递归，转不了就省略 `default`）、`enum` 取值（`Literal[b"x"]` 或成员
+  是 `Path` 的 `Enum`；转得动保留约束，转不动只留 type）、非有限 `float`（`json.dumps`
+  默认放过，而 requests 用 `allow_nan=False` 序列化请求体 ⇒ 整个请求 `ValueError`）。
+- `registry.py` 的约定改成只按**参数名**判 `kernel` 注入：注入键就是 `"kernel"`，旧
+  docstring 写「或注解为 Kernel」会让人照它写出被悄悄吞掉的参数。
+
+验收（仓库根实跑）：
+
+- 两处版本号均为 `0.13.1` ✓（`pyproject.toml` 与 `openthree/__init__.py`，脚本核对，
+  源码无残留 `0.13.0` 字面量）
+- 全量 pytest → **956 passed / 0 failed**、exit=0（新增 `tests/test_tool_schema.py` 20 条：
+  先写断言跑红 —— 改前精确红 11 条 —— 再改到全绿）
+- 对照 `origin/main` 的旧 `tool.py` 单独加载逐字节比：**38 个内置工具 schema 完全一致、
+  0 处差异** ✓（提交信息初稿写「39」，实测 `installed_builtins()` 是 38，已更正）
+- `python -m build` → wheel **410,550 B** / sdist **926,771 B**；`twine check`
+  **两个 PASSED** ✓
+- **双向核验**：`/pypi/openthree/0.13.1/json` 两个文件的 `size` 与 `digests.sha256` 与本地
+  `dist/` **全串一致**，`yanked` 均为 `False` ✓
+- **干净 venv**（`_live/venv0131`）从 PyPI 实装，中性 cwd 跑 15 项探针全 PASS：`__file__`
+  在 site-packages、`int|None`→`integer`、`int|str`→`anyOf`、`Sequence[int]` 与
+  `tuple[str,...]`→`array`、`Path(".")` 默认值→`"."`、`NaN` 默认值被省略、`Enum(Path)`→
+  `enum: ["a","b"]`、`Literal[bytes]` 有 type 无 enum、名为 `kernel` 的参数被注入而
+  「注解是 Kernel、名字不是」的不被吞、38 个内置工具全部可按 `allow_nan=False` 序列化 ✓
+
+记账（同类坑的第二次）：探针第一版用**整字典相等**去比 `{"type":"string","enum":["a","b"]}`，
+忘了 `build_tool` 会另加 `description`，报了一次假失败。探针断言只比它真正关心的键 ——
+与 0.13.0 记的那两条同源：**探针自己也是代码，也会错；假失败要先怀疑探针。**
+
+**升级提示**：无 CLI / API 变更。若你曾用 `Path`、`Enum`、`Literal` 或 `X | None` 作工具
+参数注解，升级后这些工具给模型的 schema 才第一次正确。
+
 
 
 
